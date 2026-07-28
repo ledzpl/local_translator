@@ -1,0 +1,505 @@
+import "./styles.css";
+import {
+  DEFAULT_SETTINGS,
+  MODEL_ID,
+  createRequestId,
+  type DevicePreference,
+  type EngineStatus,
+  type ExtensionSettings,
+  type ModelPreference,
+  type PageTranslationStatus,
+  type TranslationResponse,
+  type UiProgressMessage
+} from "../shared/protocol";
+import { LANGUAGE_OPTIONS } from "../shared/languages";
+import {
+  M2M100_MODEL_ID,
+  MODEL_DEFINITIONS,
+  SMALL100_MODEL_ID
+} from "../shared/models";
+
+const app = document.querySelector<HTMLElement>("#app");
+if (!app) throw new Error("앱 루트를 찾을 수 없습니다.");
+const isExtensionRuntime =
+  typeof chrome !== "undefined" && Boolean(chrome.runtime?.id);
+const EXTENSION_RELOAD_MESSAGE =
+  "확장 프로그램이 업데이트되었습니다. chrome://extensions에서 온글 번역을 새로고침해 주세요.";
+
+app.innerHTML = `
+  <header class="header">
+    <div>
+      <div class="eyebrow"><span class="pulse"></span> LOCAL AI TRANSLATOR</div>
+      <h1>온글<span>.</span></h1>
+    </div>
+    <div class="privacy-pill">서버 전송 없음</div>
+  </header>
+
+  <section class="page-card">
+    <div class="page-card-heading">
+      <div class="page-icon">WEB</div>
+      <div>
+        <span class="kicker">CURRENT PAGE</span>
+        <h2>페이지 안에서 번역</h2>
+      </div>
+    </div>
+    <p id="page-status">본문 원문 아래에 한국어를 순서대로 표시합니다.</p>
+    <div class="page-actions">
+      <button id="page-translate-button" type="button">페이지 안에 한국어 표시</button>
+      <button id="page-restore-button" type="button" hidden>번역 지우기</button>
+      <button id="extension-reload-button" type="button" hidden>확장 새로고침</button>
+    </div>
+  </section>
+
+  <section class="translator-card">
+    <label class="field-label" for="source-text">번역할 텍스트</label>
+    <textarea id="source-text" maxlength="5000" placeholder="텍스트를 붙여넣거나 웹페이지에서 선택하세요."></textarea>
+    <div class="input-footer">
+      <select id="source-language" aria-label="원문 언어"></select>
+      <span id="character-count">0 / 5,000</span>
+    </div>
+    <button id="translate-button" class="primary-button" type="button">
+      <span>한국어로 번역</span>
+      <span aria-hidden="true">→</span>
+    </button>
+  </section>
+
+  <section id="result-card" class="result-card" hidden>
+    <div class="result-heading">
+      <span>한국어</span>
+      <button id="copy-button" type="button">복사</button>
+    </div>
+    <div id="result-text" class="result-text"></div>
+    <div id="result-meta" class="result-meta"></div>
+  </section>
+
+  <section class="engine-card">
+    <div class="engine-row">
+      <div class="engine-icon">AI</div>
+      <div class="engine-copy">
+        <strong id="engine-title">로컬 모델 대기 중</strong>
+        <span id="engine-detail">첫 번역 때 약 620MB 모델을 한 번 내려받습니다.</span>
+      </div>
+      <span id="engine-state" class="engine-state idle">대기</span>
+    </div>
+    <div id="progress-track" class="progress-track" hidden>
+      <div id="progress-bar" class="progress-bar"></div>
+    </div>
+  </section>
+
+  <section class="settings">
+    <div class="section-title">
+      <div>
+        <span class="kicker">YOUTUBE</span>
+        <h2>자막 번역</h2>
+      </div>
+      <label class="switch">
+        <input id="youtube-enabled" type="checkbox" />
+        <span></span>
+      </label>
+    </div>
+
+    <label class="setting-row">
+      <div><strong>자막 자동 켜기</strong><span>YouTube 원문 자막을 자동으로 활성화</span></div>
+      <input id="auto-captions" type="checkbox" />
+    </label>
+    <label class="setting-row">
+      <div><strong>원문 함께 보기</strong><span>원문 위에 한국어 자막 표시</span></div>
+      <input id="show-original" type="checkbox" />
+    </label>
+    <label class="setting-row range-row">
+      <div><strong>한국어 자막 크기</strong><span id="subtitle-size-value">28px</span></div>
+      <input id="subtitle-size" type="range" min="18" max="42" step="1" />
+    </label>
+  </section>
+
+  <details class="advanced">
+    <summary>엔진 설정</summary>
+    <label>
+      번역 모델
+      <select id="model-preference">
+        <option value="small100">SMaLL-100 — 빠른 기본 모델</option>
+        <option value="m2m100">M2M100 — 호환성 폴백</option>
+      </select>
+    </label>
+    <label>
+      실행 장치
+      <select id="device-preference">
+        <option value="wasm">WASM — 기본, 호환성 우선</option>
+        <option value="auto">자동 — WebGPU 우선</option>
+        <option value="webgpu">WebGPU — 실험적 GPU 가속</option>
+      </select>
+    </label>
+    <p id="model-setting-detail">SMaLL-100 · 약 620MB · int8 WASM · Chrome 캐시에 보관</p>
+  </details>
+
+  <footer>
+    선택한 텍스트는 우클릭 또는 <kbd>⌥</kbd><kbd>⇧</kbd><kbd>K</kbd>로 바로 번역
+  </footer>
+`;
+
+const elements = {
+  source: getElement<HTMLTextAreaElement>("source-text"),
+  sourceLanguage: getElement<HTMLSelectElement>("source-language"),
+  characterCount: getElement<HTMLElement>("character-count"),
+  translate: getElement<HTMLButtonElement>("translate-button"),
+  resultCard: getElement<HTMLElement>("result-card"),
+  resultText: getElement<HTMLElement>("result-text"),
+  resultMeta: getElement<HTMLElement>("result-meta"),
+  copy: getElement<HTMLButtonElement>("copy-button"),
+  engineTitle: getElement<HTMLElement>("engine-title"),
+  engineDetail: getElement<HTMLElement>("engine-detail"),
+  engineState: getElement<HTMLElement>("engine-state"),
+  progressTrack: getElement<HTMLElement>("progress-track"),
+  progressBar: getElement<HTMLElement>("progress-bar"),
+  youtubeEnabled: getElement<HTMLInputElement>("youtube-enabled"),
+  autoCaptions: getElement<HTMLInputElement>("auto-captions"),
+  showOriginal: getElement<HTMLInputElement>("show-original"),
+  subtitleSize: getElement<HTMLInputElement>("subtitle-size"),
+  subtitleSizeValue: getElement<HTMLElement>("subtitle-size-value"),
+  modelPreference: getElement<HTMLSelectElement>("model-preference"),
+  devicePreference: getElement<HTMLSelectElement>("device-preference"),
+  modelSettingDetail: getElement<HTMLElement>("model-setting-detail"),
+  pageStatus: getElement<HTMLElement>("page-status"),
+  pageTranslate: getElement<HTMLButtonElement>("page-translate-button"),
+  pageRestore: getElement<HTMLButtonElement>("page-restore-button"),
+  extensionReload: getElement<HTMLButtonElement>("extension-reload-button")
+};
+
+for (const language of LANGUAGE_OPTIONS) {
+  const option = document.createElement("option");
+  option.value = language.code;
+  option.textContent = language.label;
+  elements.sourceLanguage.append(option);
+}
+
+void initialize();
+
+async function initialize(): Promise<void> {
+  if (!isExtensionRuntime) {
+    applySettings(DEFAULT_SETTINGS);
+    updateEngineStatus({ state: "idle", modelId: MODEL_ID });
+    return;
+  }
+
+  const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS) as ExtensionSettings;
+  applySettings(settings);
+
+  const [selection, status, pageStatus] = await Promise.all([
+    chrome.runtime.sendMessage({
+      target: "background",
+      type: "GET_ACTIVE_SELECTION"
+    }).catch(() => ({ text: "" })),
+    chrome.runtime.sendMessage({
+      target: "background",
+      type: "GET_ENGINE_STATUS"
+    }).catch(() => ({ state: "idle", modelId: MODEL_ID })),
+    chrome.runtime.sendMessage({
+      target: "background",
+      type: "GET_PAGE_TRANSLATION_STATUS"
+    }).catch(() => null)
+  ]);
+
+  if (selection?.text) {
+    elements.source.value = selection.text;
+    updateCharacterCount();
+  }
+  updateEngineStatus(status as EngineStatus);
+  updatePageStatus(normalizePageStatus(pageStatus, EXTENSION_RELOAD_MESSAGE));
+}
+
+elements.source.addEventListener("input", updateCharacterCount);
+elements.translate.addEventListener("click", () => void translate());
+elements.source.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") void translate();
+});
+elements.copy.addEventListener("click", () => void copyResult());
+elements.pageTranslate.addEventListener("click", () => void handlePageTranslation());
+elements.pageRestore.addEventListener("click", () => void restorePageTranslation());
+elements.extensionReload.addEventListener("click", () => chrome.runtime.reload());
+
+elements.youtubeEnabled.addEventListener("change", saveSettings);
+elements.autoCaptions.addEventListener("change", saveSettings);
+elements.showOriginal.addEventListener("change", saveSettings);
+elements.subtitleSize.addEventListener("input", () => {
+  elements.subtitleSizeValue.textContent = `${elements.subtitleSize.value}px`;
+  saveSettings();
+});
+elements.sourceLanguage.addEventListener("change", saveSettings);
+elements.modelPreference.addEventListener("change", () => void resetEngineForSettings());
+elements.devicePreference.addEventListener("change", () => void resetEngineForSettings());
+
+if (isExtensionRuntime) {
+  chrome.runtime.onMessage.addListener((message: UiProgressMessage) => {
+    if (message?.target === "ui" && message.type === "ENGINE_PROGRESS") {
+      updateEngineStatus(message.status);
+    }
+  });
+  window.setInterval(() => {
+    if (elements.pageTranslate.dataset.state === "translating") {
+      void refreshPageStatus();
+    }
+  }, 900);
+}
+
+async function handlePageTranslation(): Promise<void> {
+  if (!isExtensionRuntime) {
+    updatePageStatus({
+      ...idlePageStatus(),
+      state: "error",
+      error: "확장 프로그램으로 설치한 뒤 사용할 수 있습니다."
+    });
+    return;
+  }
+  const type =
+    elements.pageTranslate.dataset.state === "translating"
+      ? "STOP_PAGE_TRANSLATION"
+      : "START_PAGE_TRANSLATION";
+  elements.pageTranslate.disabled = true;
+  const status = await chrome.runtime.sendMessage({ target: "background", type })
+    .catch(() => null);
+  elements.pageTranslate.disabled = false;
+  updatePageStatus(normalizePageStatus(status, EXTENSION_RELOAD_MESSAGE));
+}
+
+async function restorePageTranslation(): Promise<void> {
+  if (!isExtensionRuntime) return;
+  const status = await chrome.runtime.sendMessage({
+    target: "background",
+    type: "RESTORE_PAGE_TRANSLATION"
+  }).catch(() => idlePageStatus());
+  updatePageStatus(normalizePageStatus(status));
+}
+
+async function refreshPageStatus(): Promise<void> {
+  const status = await chrome.runtime.sendMessage({
+    target: "background",
+    type: "GET_PAGE_TRANSLATION_STATUS"
+  }).catch(() => null);
+  if (status) updatePageStatus(status as PageTranslationStatus);
+}
+
+async function translate(): Promise<void> {
+  const text = elements.source.value.trim();
+  if (!text) {
+    elements.source.focus();
+    elements.source.classList.add("shake");
+    window.setTimeout(() => elements.source.classList.remove("shake"), 400);
+    return;
+  }
+
+  setBusy(true);
+  elements.resultCard.hidden = false;
+  elements.resultText.className = "result-text loading-lines";
+  elements.resultText.textContent = "브라우저에서 번역하고 있어요…";
+  elements.resultMeta.textContent = "";
+
+  if (!isExtensionRuntime) {
+    setBusy(false);
+    elements.resultText.className = "result-text error";
+    elements.resultText.textContent = "번역은 Chrome에 확장 프로그램을 로드한 뒤 사용할 수 있습니다.";
+    return;
+  }
+
+  const response = await chrome.runtime.sendMessage({
+    target: "background",
+    type: "TRANSLATE",
+    requestId: createRequestId(),
+    text,
+    sourceLanguage: elements.sourceLanguage.value,
+    origin: "popup"
+  }) as TranslationResponse;
+
+  setBusy(false);
+  elements.resultText.className = response.ok ? "result-text" : "result-text error";
+  if (response.ok) {
+    elements.resultText.textContent = response.translation;
+    const device = response.device === "webgpu" ? "WebGPU" : response.device === "wasm" ? "WASM" : "번역 생략";
+    elements.resultMeta.textContent = `${device} · ${(response.elapsedMs / 1000).toFixed(1)}초`;
+  } else {
+    elements.resultText.textContent = response.error;
+    elements.resultMeta.textContent = "엔진 설정이나 인터넷 연결을 확인해 주세요.";
+  }
+}
+
+async function copyResult(): Promise<void> {
+  const text = elements.resultText.textContent ?? "";
+  if (!text) return;
+  await navigator.clipboard.writeText(text);
+  elements.copy.textContent = "복사됨";
+  window.setTimeout(() => {
+    elements.copy.textContent = "복사";
+  }, 1200);
+}
+
+function updateCharacterCount(): void {
+  elements.characterCount.textContent = `${elements.source.value.length.toLocaleString()} / 5,000`;
+}
+
+function setBusy(busy: boolean): void {
+  elements.translate.disabled = busy;
+  elements.translate.querySelector("span")!.textContent = busy ? "번역 중…" : "한국어로 번역";
+}
+
+function applySettings(settings: ExtensionSettings): void {
+  elements.youtubeEnabled.checked = settings.youtubeEnabled;
+  elements.autoCaptions.checked = settings.autoEnableCaptions;
+  elements.showOriginal.checked = settings.showOriginalCaptions;
+  elements.subtitleSize.value = String(settings.subtitleSize);
+  elements.subtitleSizeValue.textContent = `${settings.subtitleSize}px`;
+  elements.sourceLanguage.value = settings.sourceLanguage;
+  elements.modelPreference.value = settings.modelPreference;
+  elements.devicePreference.value = settings.devicePreference;
+  updateModelSettingDetail();
+}
+
+async function saveSettings(): Promise<void> {
+  const settings: ExtensionSettings = {
+    youtubeEnabled: elements.youtubeEnabled.checked,
+    autoEnableCaptions: elements.autoCaptions.checked,
+    showOriginalCaptions: elements.showOriginal.checked,
+    subtitleSize: Number(elements.subtitleSize.value),
+    sourceLanguage: elements.sourceLanguage.value,
+    modelPreference: elements.modelPreference.value as ModelPreference,
+    devicePreference: elements.devicePreference.value as DevicePreference
+  };
+  if (isExtensionRuntime) await chrome.storage.sync.set(settings);
+}
+
+async function resetEngineForSettings(): Promise<void> {
+  updateModelSettingDetail();
+  await saveSettings();
+  if (isExtensionRuntime) {
+    await chrome.runtime.sendMessage({ target: "background", type: "RESET_ENGINE" });
+  }
+  updateEngineStatus({
+    state: "idle",
+    modelId: MODEL_DEFINITIONS[
+      elements.modelPreference.value as ModelPreference
+    ].id
+  });
+}
+
+function updateModelSettingDetail(): void {
+  const preference = elements.modelPreference.value as ModelPreference;
+  const definition = MODEL_DEFINITIONS[preference];
+  const usesSmall100 = preference === "small100";
+  elements.devicePreference.disabled = usesSmall100;
+  elements.modelSettingDetail.textContent =
+    `${definition.label} · ${definition.downloadSize} · ${definition.deviceNote} · Chrome 캐시에 보관`;
+}
+
+function updateEngineStatus(status: EngineStatus): void {
+  const stateLabel = {
+    idle: "대기",
+    loading: "준비 중",
+    ready: "준비됨",
+    error: "오류"
+  }[status.state];
+  elements.engineState.textContent = stateLabel;
+  elements.engineState.className = `engine-state ${status.state}`;
+  elements.progressTrack.hidden = status.state !== "loading";
+  const progress = status.progress ?? 0;
+  const isIndeterminate = status.state === "loading" && progress <= 0;
+  elements.progressBar.classList.toggle("indeterminate", isIndeterminate);
+  elements.progressBar.style.width =
+    isIndeterminate ? "35%" : `${Math.round(progress * 100)}%`;
+  const modelLabel = modelLabelFromId(status.modelId);
+
+  if (status.state === "loading") {
+    elements.engineTitle.textContent =
+      progress > 0
+        ? `${modelLabel} 준비 중 ${Math.round(progress * 100)}%`
+        : `${modelLabel} 준비 중`;
+    elements.engineDetail.textContent = status.file
+      ? shortenFile(status.file)
+      : "첫 실행에만 모델 파일을 내려받습니다.";
+  } else if (status.state === "ready") {
+    elements.engineTitle.textContent = `${modelLabel} 준비 완료`;
+    const runtime =
+      `${status.device === "webgpu" ? "WebGPU" : "WASM"}로 브라우저 안에서 실행 중`;
+    elements.engineDetail.textContent = status.fallbackFromModelId
+      ? `SMaLL-100 로드 실패로 M2M100 폴백 · ${runtime}`
+      : runtime;
+  } else if (status.state === "error") {
+    elements.engineTitle.textContent = "모델을 준비하지 못했어요";
+    elements.engineDetail.textContent = status.error ?? "다시 번역을 시도해 주세요.";
+  } else {
+    elements.engineTitle.textContent = "로컬 모델 대기 중";
+    const selected =
+      MODEL_DEFINITIONS[elements.modelPreference.value as ModelPreference];
+    elements.engineDetail.textContent =
+      `첫 번역 때 ${selected.downloadSize} 모델을 한 번 내려받습니다.`;
+  }
+}
+
+function modelLabelFromId(modelId: string): string {
+  if (modelId === SMALL100_MODEL_ID) return MODEL_DEFINITIONS.small100.label;
+  if (modelId === M2M100_MODEL_ID) return MODEL_DEFINITIONS.m2m100.label;
+  return "로컬 모델";
+}
+
+function updatePageStatus(status: PageTranslationStatus): void {
+  elements.pageTranslate.dataset.state = status.state;
+  elements.pageRestore.hidden = status.state === "idle";
+  elements.extensionReload.hidden = status.error !== EXTENSION_RELOAD_MESSAGE;
+  elements.pageTranslate.textContent =
+    status.state === "translating"
+      ? "번역 중지"
+      : status.state === "idle"
+        ? "페이지 안에 한국어 표시"
+        : "다시 번역";
+
+  if (status.state === "translating") {
+    elements.pageStatus.textContent =
+      `${status.completed + status.failed} / ${status.total}개 문장을 번역하고 있어요.`;
+  } else if (status.state === "complete" && status.total === 0) {
+    elements.pageStatus.textContent = "번역할 외국어 본문을 찾지 못했습니다.";
+  } else if (status.state === "complete") {
+    elements.pageStatus.textContent =
+      `${status.completed}개 문장을 원문 아래에 표시했습니다.`;
+  } else if (status.state === "stopped") {
+    elements.pageStatus.textContent =
+      `${status.completed}개 문장까지 표시하고 중지했습니다.`;
+  } else if (status.state === "error") {
+    elements.pageStatus.textContent = status.error ?? "페이지 번역에 실패했습니다.";
+  } else {
+    elements.pageStatus.textContent = "본문 원문 아래에 한국어를 순서대로 표시합니다.";
+  }
+}
+
+function idlePageStatus(): PageTranslationStatus {
+  return {
+    state: "idle",
+    total: 0,
+    completed: 0,
+    failed: 0
+  };
+}
+
+function normalizePageStatus(
+  value: unknown,
+  error?: string
+): PageTranslationStatus {
+  if (
+    value &&
+    typeof value === "object" &&
+    "state" in value &&
+    typeof value.state === "string"
+  ) {
+    return value as PageTranslationStatus;
+  }
+  return error
+    ? { ...idlePageStatus(), state: "error", error }
+    : idlePageStatus();
+}
+
+function shortenFile(file: string): string {
+  const name = file.split("/").at(-1) ?? file;
+  return name.length > 38 ? `${name.slice(0, 35)}…` : name;
+}
+
+function getElement<T extends HTMLElement>(id: string): T {
+  const element = document.getElementById(id);
+  if (!element) throw new Error(`${id} 요소를 찾을 수 없습니다.`);
+  return element as T;
+}

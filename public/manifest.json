@@ -1,0 +1,58 @@
+{
+  "manifest_version": 3,
+  "name": "온글 번역 — 브라우저 로컬 AI",
+  "short_name": "온글 번역",
+  "version": "0.1.0",
+  "description": "웹 페이지 본문, 선택한 텍스트와 YouTube 자막을 서버 전송 없이 브라우저 안에서 한국어로 번역합니다.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "activeTab",
+    "contextMenus",
+    "offscreen",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://huggingface.co/*",
+    "https://*.huggingface.co/*",
+    "https://*.hf.co/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "온글 번역",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
+  },
+  "commands": {
+    "translate-selection": {
+      "suggested_key": {
+        "default": "Alt+Shift+K",
+        "mac": "Alt+Shift+K"
+      },
+      "description": "선택한 텍스트를 한국어로 번역"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co;"
+  }
+}

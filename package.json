@@ -1,0 +1,30 @@
+{
+  "name": "ongeul-local-translator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "브라우저 안에서 실행되는 한국어 번역 Chrome 확장 프로그램",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "vite",
+    "test": "vitest run",
+    "test:extension": "node scripts/smoke-extension.mjs",
+    "test:extension:model": "node scripts/smoke-extension.mjs --with-model",
+    "test:extension:model:m2m100": "node scripts/smoke-extension.mjs --with-model --m2m100",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run typecheck && npm run test && npm run build && node scripts/verify-build.mjs"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "3.8.1",
+    "onnxruntime-web": "1.22.0-dev.20250409-89f8206ba4"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.2.2",
+    "esbuild": "0.28.1",
+    "playwright-core": "1.62.0",
+    "typescript": "7.0.2",
+    "vite": "8.1.5",
+    "vitest": "4.1.10"
+  }
+}
