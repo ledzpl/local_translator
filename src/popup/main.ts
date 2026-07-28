@@ -2,14 +2,18 @@ import "./styles.css";
 import {
   DEFAULT_SETTINGS,
   MODEL_ID,
+  TTS_MODEL_ID,
   createRequestId,
   type DevicePreference,
   type EngineStatus,
   type ExtensionSettings,
   type ModelPreference,
   type PageTranslationStatus,
+  type SpeakResponse,
+  type TtsStatus,
   type TranslationResponse,
-  type UiProgressMessage
+  type UiProgressMessage,
+  type UiTtsProgressMessage
 } from "../shared/protocol";
 import { LANGUAGE_OPTIONS } from "../shared/languages";
 import {
@@ -66,7 +70,10 @@ app.innerHTML = `
   <section id="result-card" class="result-card" hidden>
     <div class="result-heading">
       <span>한국어</span>
-      <button id="copy-button" type="button">복사</button>
+      <div class="result-actions">
+        <button id="speak-button" type="button">▶ 듣기</button>
+        <button id="copy-button" type="button">복사</button>
+      </div>
     </div>
     <div id="result-text" class="result-text"></div>
     <div id="result-meta" class="result-meta"></div>
@@ -83,6 +90,15 @@ app.innerHTML = `
     </div>
     <div id="progress-track" class="progress-track" hidden>
       <div id="progress-bar" class="progress-bar"></div>
+    </div>
+    <div class="engine-row speech-row">
+      <div class="engine-icon">VO</div>
+      <div class="engine-copy">
+        <strong id="tts-title">한국어 음성 AI 대기 중</strong>
+        <span id="tts-detail">첫 듣기 때 약 40MB 모델을 내려받습니다.</span>
+      </div>
+      <span id="tts-state" class="engine-state idle">대기</span>
+      <button id="tts-stop-button" class="tts-stop-button" type="button" hidden>정지</button>
     </div>
   </section>
 
@@ -146,11 +162,16 @@ const elements = {
   resultText: getElement<HTMLElement>("result-text"),
   resultMeta: getElement<HTMLElement>("result-meta"),
   copy: getElement<HTMLButtonElement>("copy-button"),
+  speak: getElement<HTMLButtonElement>("speak-button"),
   engineTitle: getElement<HTMLElement>("engine-title"),
   engineDetail: getElement<HTMLElement>("engine-detail"),
   engineState: getElement<HTMLElement>("engine-state"),
   progressTrack: getElement<HTMLElement>("progress-track"),
   progressBar: getElement<HTMLElement>("progress-bar"),
+  ttsTitle: getElement<HTMLElement>("tts-title"),
+  ttsDetail: getElement<HTMLElement>("tts-detail"),
+  ttsState: getElement<HTMLElement>("tts-state"),
+  ttsStop: getElement<HTMLButtonElement>("tts-stop-button"),
   youtubeEnabled: getElement<HTMLInputElement>("youtube-enabled"),
   autoCaptions: getElement<HTMLInputElement>("auto-captions"),
   showOriginal: getElement<HTMLInputElement>("show-original"),
@@ -164,6 +185,8 @@ const elements = {
   pageRestore: getElement<HTMLButtonElement>("page-restore-button"),
   extensionReload: getElement<HTMLButtonElement>("extension-reload-button")
 };
+let currentTranslation = "";
+let currentTtsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
 
 for (const language of LANGUAGE_OPTIONS) {
   const option = document.createElement("option");
@@ -184,7 +207,7 @@ async function initialize(): Promise<void> {
   const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS) as ExtensionSettings;
   applySettings(settings);
 
-  const [selection, status, pageStatus] = await Promise.all([
+  const [selection, status, pageStatus, ttsStatus] = await Promise.all([
     chrome.runtime.sendMessage({
       target: "background",
       type: "GET_ACTIVE_SELECTION"
@@ -196,14 +219,19 @@ async function initialize(): Promise<void> {
     chrome.runtime.sendMessage({
       target: "background",
       type: "GET_PAGE_TRANSLATION_STATUS"
-    }).catch(() => null)
+    }).catch(() => null),
+    chrome.runtime.sendMessage({
+      target: "background",
+      type: "GET_TTS_STATUS"
+    }).catch(() => ({ state: "idle", modelId: TTS_MODEL_ID }))
   ]);
 
   if (selection?.text) {
     elements.source.value = selection.text;
     updateCharacterCount();
   }
-  updateEngineStatus(status as EngineStatus);
+  updateEngineStatus(normalizeEngineStatus(status));
+  updateTtsStatus(normalizeTtsStatus(ttsStatus));
   updatePageStatus(normalizePageStatus(pageStatus, EXTENSION_RELOAD_MESSAGE));
 }
 
@@ -213,6 +241,8 @@ elements.source.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key === "Enter") void translate();
 });
 elements.copy.addEventListener("click", () => void copyResult());
+elements.speak.addEventListener("click", () => void toggleSpeech());
+elements.ttsStop.addEventListener("click", () => void stopSpeech());
 elements.pageTranslate.addEventListener("click", () => void handlePageTranslation());
 elements.pageRestore.addEventListener("click", () => void restorePageTranslation());
 elements.extensionReload.addEventListener("click", () => chrome.runtime.reload());
@@ -229,9 +259,13 @@ elements.modelPreference.addEventListener("change", () => void resetEngineForSet
 elements.devicePreference.addEventListener("change", () => void resetEngineForSettings());
 
 if (isExtensionRuntime) {
-  chrome.runtime.onMessage.addListener((message: UiProgressMessage) => {
+  chrome.runtime.onMessage.addListener((
+    message: UiProgressMessage | UiTtsProgressMessage
+  ) => {
     if (message?.target === "ui" && message.type === "ENGINE_PROGRESS") {
       updateEngineStatus(message.status);
+    } else if (message?.target === "ui" && message.type === "TTS_PROGRESS") {
+      updateTtsStatus(message.status);
     }
   });
   window.setInterval(() => {
@@ -288,6 +322,9 @@ async function translate(): Promise<void> {
   }
 
   setBusy(true);
+  currentTranslation = "";
+  elements.speak.disabled = true;
+  await stopSpeech();
   elements.resultCard.hidden = false;
   elements.resultText.className = "result-text loading-lines";
   elements.resultText.textContent = "브라우저에서 번역하고 있어요…";
@@ -312,6 +349,8 @@ async function translate(): Promise<void> {
   setBusy(false);
   elements.resultText.className = response.ok ? "result-text" : "result-text error";
   if (response.ok) {
+    currentTranslation = response.translation;
+    elements.speak.disabled = false;
     elements.resultText.textContent = response.translation;
     const device = response.device === "webgpu" ? "WebGPU" : response.device === "wasm" ? "WASM" : "번역 생략";
     elements.resultMeta.textContent = `${device} · ${(response.elapsedMs / 1000).toFixed(1)}초`;
@@ -319,6 +358,113 @@ async function translate(): Promise<void> {
     elements.resultText.textContent = response.error;
     elements.resultMeta.textContent = "엔진 설정이나 인터넷 연결을 확인해 주세요.";
   }
+}
+
+async function toggleSpeech(): Promise<void> {
+  if (isTtsActive(currentTtsStatus)) {
+    await stopSpeech();
+    return;
+  }
+  if (!currentTranslation || !isExtensionRuntime) return;
+
+  updateTtsStatus({
+    state: "loading",
+    modelId: TTS_MODEL_ID,
+    progress: 0,
+    file: "한국어 음성 모델 준비 중"
+  });
+  const response = await chrome.runtime.sendMessage({
+    target: "background",
+    type: "SPEAK_KOREAN",
+    text: currentTranslation
+  }).catch((error) => ({
+    ok: false,
+    error: error instanceof Error ? error.message : String(error)
+  })) as SpeakResponse;
+  if (!response?.ok) {
+    updateTtsStatus({
+      state: "error",
+      modelId: TTS_MODEL_ID,
+      error: response.error ?? "한국어 음성을 시작하지 못했습니다."
+    });
+  }
+}
+
+async function stopSpeech(): Promise<void> {
+  if (!isExtensionRuntime || !isTtsActive(currentTtsStatus)) return;
+  await chrome.runtime.sendMessage({
+    target: "background",
+    type: "STOP_SPEAKING"
+  }).catch(() => undefined);
+  updateTtsStatus({ state: "idle", modelId: TTS_MODEL_ID });
+}
+
+function updateTtsStatus(status: TtsStatus): void {
+  currentTtsStatus = status;
+  const active = isTtsActive(status);
+  const stateLabel = {
+    idle: "대기",
+    loading: "준비 중",
+    synthesizing: "생성 중",
+    playing: "재생 중",
+    error: "오류"
+  }[status.state];
+  elements.ttsState.textContent = stateLabel;
+  elements.ttsState.className = `engine-state ${status.state}`;
+  elements.ttsStop.hidden = !active;
+  elements.speak.textContent = active ? "■ 정지" : "▶ 듣기";
+
+  if (status.state === "loading") {
+    const percent = status.progress && status.progress > 0
+      ? ` ${Math.round(status.progress * 100)}%`
+      : "";
+    elements.ttsTitle.textContent = `한국어 음성 AI 준비 중${percent}`;
+    elements.ttsDetail.textContent = status.file
+      ? shortenFile(status.file)
+      : "모델을 Chrome 캐시에 저장하고 있습니다.";
+  } else if (status.state === "synthesizing") {
+    elements.ttsTitle.textContent = "한국어 음성 생성 중";
+    elements.ttsDetail.textContent = status.file ?? "번역 결과를 음성으로 바꾸고 있습니다.";
+  } else if (status.state === "playing") {
+    elements.ttsTitle.textContent = "한국어 번역을 읽고 있어요";
+    elements.ttsDetail.textContent = status.file ?? "브라우저 안에서 생성한 음성을 재생 중입니다.";
+  } else if (status.state === "error") {
+    elements.ttsTitle.textContent = "음성을 만들지 못했어요";
+    elements.ttsDetail.textContent = status.error ?? "다시 듣기를 눌러 주세요.";
+  } else {
+    elements.ttsTitle.textContent = "한국어 음성 AI 대기 중";
+    elements.ttsDetail.textContent = "첫 듣기 때 약 40MB 모델을 내려받습니다.";
+  }
+}
+
+function isTtsActive(status: TtsStatus): boolean {
+  return status.state === "loading" ||
+    status.state === "synthesizing" ||
+    status.state === "playing";
+}
+
+function normalizeTtsStatus(value: unknown): TtsStatus {
+  if (
+    value &&
+    typeof value === "object" &&
+    "state" in value &&
+    typeof value.state === "string"
+  ) {
+    return value as TtsStatus;
+  }
+  return { state: "idle", modelId: TTS_MODEL_ID };
+}
+
+function normalizeEngineStatus(value: unknown): EngineStatus {
+  if (
+    value &&
+    typeof value === "object" &&
+    "state" in value &&
+    typeof value.state === "string"
+  ) {
+    return value as EngineStatus;
+  }
+  return { state: "idle", modelId: MODEL_ID };
 }
 
 async function copyResult(): Promise<void> {

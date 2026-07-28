@@ -6,6 +6,7 @@ import {
 export const CONTEXT_MENU_ID = "ongeul-translate-selection";
 export const OFFSCREEN_PATH = "offscreen.html";
 export const MODEL_ID = MODEL_DEFINITIONS.small100.id;
+export const TTS_MODEL_ID = "Xenova/mms-tts-kor";
 
 export type DevicePreference = "auto" | "webgpu" | "wasm";
 export type RuntimeDevice = "webgpu" | "wasm";
@@ -87,6 +88,31 @@ export interface UiProgressMessage {
   status: EngineStatus;
 }
 
+export interface TtsStatus {
+  state: "idle" | "loading" | "synthesizing" | "playing" | "error";
+  modelId: string;
+  progress?: number;
+  file?: string;
+  error?: string;
+}
+
+export interface UiTtsProgressMessage {
+  target: "ui";
+  type: "TTS_PROGRESS";
+  status: TtsStatus;
+}
+
+export interface SpeakRequest {
+  target: "background";
+  type: "SPEAK_KOREAN";
+  text: string;
+}
+
+export interface SpeakResponse {
+  ok: boolean;
+  error?: string;
+}
+
 export interface PageTranslationStatus {
   state: "idle" | "translating" | "complete" | "stopped" | "error";
   total: number;
@@ -97,17 +123,23 @@ export interface PageTranslationStatus {
 
 export type BackgroundMessage =
   | TranslateRequest
+  | SpeakRequest
   | { target: "background"; type: "GET_ACTIVE_SELECTION" }
   | { target: "background"; type: "START_PAGE_TRANSLATION" }
   | { target: "background"; type: "GET_PAGE_TRANSLATION_STATUS" }
   | { target: "background"; type: "STOP_PAGE_TRANSLATION" }
   | { target: "background"; type: "RESTORE_PAGE_TRANSLATION" }
   | { target: "background"; type: "GET_ENGINE_STATUS" }
+  | { target: "background"; type: "GET_TTS_STATUS" }
+  | { target: "background"; type: "STOP_SPEAKING" }
   | { target: "background"; type: "RESET_ENGINE" };
 
 export type OffscreenMessage =
   | TranslateOffscreenRequest
+  | { target: "offscreen"; type: "SPEAK_KOREAN_OFFSCREEN"; text: string }
   | { target: "offscreen"; type: "GET_ENGINE_STATUS_OFFSCREEN" }
+  | { target: "offscreen"; type: "GET_TTS_STATUS_OFFSCREEN" }
+  | { target: "offscreen"; type: "STOP_SPEAKING_OFFSCREEN" }
   | { target: "offscreen"; type: "RESET_ENGINE_OFFSCREEN" };
 
 export type ContentMessage =

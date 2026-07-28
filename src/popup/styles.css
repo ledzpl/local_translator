@@ -259,6 +259,21 @@ select {
   cursor: pointer;
 }
 
+.result-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.result-actions #speak-button {
+  color: #ddff44;
+  font-weight: 800;
+}
+
+.result-actions button:disabled {
+  cursor: wait;
+  opacity: .55;
+}
+
 .result-text {
   margin-top: 10px;
   color: #fff;
@@ -289,6 +304,28 @@ select {
   grid-template-columns: 34px 1fr auto;
   gap: 10px;
   align-items: center;
+}
+
+.speech-row {
+  grid-template-columns: 34px 1fr auto auto;
+  margin-top: 11px;
+  padding-top: 11px;
+  border-top: 1px solid #292d2b;
+}
+
+.tts-stop-button {
+  border: 0;
+  border-radius: 8px;
+  padding: 5px 7px;
+  background: #343936;
+  color: #d9ddd8;
+  font-size: 9px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.tts-stop-button[hidden] {
+  display: none;
 }
 
 .engine-icon {
@@ -338,6 +375,12 @@ select {
 .engine-state.error {
   background: rgba(255, 91, 82, .12);
   color: #ff958c;
+}
+
+.engine-state.synthesizing,
+.engine-state.playing {
+  background: rgba(221, 255, 68, .12);
+  color: #ddff44;
 }
 
 .progress-track {

@@ -11,6 +11,8 @@
     "test:extension": "node scripts/smoke-extension.mjs",
     "test:extension:model": "node scripts/smoke-extension.mjs --with-model",
     "test:extension:model:m2m100": "node scripts/smoke-extension.mjs --with-model --m2m100",
+    "test:extension:tts": "node scripts/smoke-extension.mjs --with-tts",
+    "test:extension:page-tts": "node scripts/smoke-extension.mjs --with-page-tts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "verify": "npm run typecheck && npm run test && npm run build && node scripts/verify-build.mjs"

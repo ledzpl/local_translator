@@ -4,15 +4,19 @@ import {
   Tensor,
   env,
   pipeline,
+  type TextToAudioPipeline,
   type TranslationPipeline
 } from "@huggingface/transformers";
 import {
   MODEL_ID,
+  TTS_MODEL_ID,
   type DevicePreference,
   type EngineStatus,
   type ModelPreference,
   type OffscreenMessage,
   type RuntimeDevice,
+  type SpeakResponse,
+  type TtsStatus,
   type TranslateOffscreenRequest,
   type TranslationResponse
 } from "../shared/protocol";
@@ -24,6 +28,7 @@ import {
   createSmall100InputIds
 } from "../shared/models";
 import { chunkText, friendlyError } from "../shared/text";
+import { chunkKoreanSpeech, prepareKoreanForTts } from "../shared/tts";
 
 type Small100Tokenizer = Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>>;
 type Small100Model = Awaited<ReturnType<typeof AutoModelForSeq2SeqLM.from_pretrained>>;
@@ -50,6 +55,12 @@ let loadedModelPreference: ModelPreference | null = null;
 let status: EngineStatus = { state: "idle", modelId: MODEL_ID };
 let translationQueue: Promise<unknown> = Promise.resolve();
 const translationCache = new LruCache<string>(220);
+let ttsEngine: TextToAudioPipeline | null = null;
+let ttsEnginePromise: Promise<TextToAudioPipeline> | null = null;
+let ttsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
+let speechRun = 0;
+let audioContext: AudioContext | null = null;
+let activeAudioSource: AudioBufferSourceNode | null = null;
 
 chrome.runtime.onMessage.addListener(
   (
@@ -72,6 +83,23 @@ chrome.runtime.onMessage.addListener(
       return false;
     }
 
+    if (message.type === "SPEAK_KOREAN_OFFSCREEN") {
+      startSpeech(message.text);
+      sendResponse({ ok: true } satisfies SpeakResponse);
+      return false;
+    }
+
+    if (message.type === "GET_TTS_STATUS_OFFSCREEN") {
+      sendResponse(ttsStatus);
+      return false;
+    }
+
+    if (message.type === "STOP_SPEAKING_OFFSCREEN") {
+      stopSpeech();
+      sendResponse({ ok: true } satisfies SpeakResponse);
+      return false;
+    }
+
     if (message.type === "RESET_ENGINE_OFFSCREEN") {
       void resetEngine().then(() => sendResponse(status));
       return true;
@@ -80,6 +108,147 @@ chrome.runtime.onMessage.addListener(
     return undefined;
   }
 );
+
+function startSpeech(text: string): void {
+  stopSpeech(false);
+  const run = speechRun;
+  const chunks = chunkKoreanSpeech(text);
+  ttsStatus = {
+    state: "loading",
+    modelId: TTS_MODEL_ID,
+    progress: ttsEngine ? 1 : 0,
+    file: ttsEngine ? "음성 생성 준비 중" : "한국어 음성 모델 준비 중"
+  };
+  broadcastTtsStatus();
+  void runSpeech(chunks, run);
+}
+
+async function runSpeech(chunks: string[], run: number): Promise<void> {
+  try {
+    const synthesizer = await getTtsEngine();
+    if (run !== speechRun) return;
+
+    for (let index = 0; index < chunks.length; index += 1) {
+      const input = prepareKoreanForTts(chunks[index]!);
+      if (!input) continue;
+      ttsStatus = {
+        state: "synthesizing",
+        modelId: TTS_MODEL_ID,
+        progress: index / chunks.length,
+        file: `${index + 1} / ${chunks.length} 구간 음성 생성 중`
+      };
+      broadcastTtsStatus();
+
+      const output = await synthesizer(input, {});
+      if (run !== speechRun) return;
+      ttsStatus = {
+        state: "playing",
+        modelId: TTS_MODEL_ID,
+        progress: (index + 1) / chunks.length,
+        file: `${index + 1} / ${chunks.length} 구간 재생 중`
+      };
+      broadcastTtsStatus();
+      await playAudio(output.audio, output.sampling_rate, run);
+      if (run !== speechRun) return;
+    }
+
+    ttsStatus = { state: "idle", modelId: TTS_MODEL_ID, progress: 1 };
+    broadcastTtsStatus();
+  } catch (error) {
+    if (run !== speechRun) return;
+    ttsStatus = {
+      state: "error",
+      modelId: TTS_MODEL_ID,
+      error: friendlyError(error)
+    };
+    broadcastTtsStatus();
+  }
+}
+
+async function getTtsEngine(): Promise<TextToAudioPipeline> {
+  if (ttsEngine) return ttsEngine;
+  if (ttsEnginePromise) return ttsEnginePromise;
+
+  ttsEnginePromise = pipeline("text-to-speech", TTS_MODEL_ID, {
+    device: "wasm",
+    dtype: "q8",
+    progress_callback: (progress: Record<string, unknown>) => {
+      if (ttsEngine || progress.status === "ready") return;
+      ttsStatus = {
+        state: "loading",
+        modelId: TTS_MODEL_ID,
+        progress: getTtsProgress(progress),
+        file: typeof progress.file === "string"
+          ? progress.file
+          : ttsStatus.file
+      };
+      broadcastTtsStatus();
+    }
+  }).then((loaded) => {
+    ttsEngine = loaded;
+    return loaded;
+  }).catch((error) => {
+    ttsEnginePromise = null;
+    throw error;
+  });
+  return ttsEnginePromise;
+}
+
+async function playAudio(
+  samples: Float32Array,
+  sampleRate: number,
+  run: number
+): Promise<void> {
+  audioContext ??= new AudioContext();
+  await audioContext.resume();
+  if (run !== speechRun) return;
+
+  const buffer = audioContext.createBuffer(1, samples.length, sampleRate);
+  buffer.copyToChannel(new Float32Array(samples), 0);
+  const source = audioContext.createBufferSource();
+  source.buffer = buffer;
+  source.connect(audioContext.destination);
+  activeAudioSource = source;
+  await new Promise<void>((resolve) => {
+    source.onended = () => {
+      if (activeAudioSource === source) activeAudioSource = null;
+      resolve();
+    };
+    source.start();
+  });
+}
+
+function stopSpeech(broadcast = true): void {
+  speechRun += 1;
+  if (activeAudioSource) {
+    activeAudioSource.stop();
+    activeAudioSource = null;
+  }
+  ttsStatus = { state: "idle", modelId: TTS_MODEL_ID };
+  if (broadcast) broadcastTtsStatus();
+}
+
+function getTtsProgress(progress: Record<string, unknown>): number {
+  if (typeof progress.progress === "number") {
+    return Math.max(0, Math.min(1, progress.progress / 100));
+  }
+  if (
+    typeof progress.loaded === "number" &&
+    typeof progress.total === "number" &&
+    progress.total > 0
+  ) {
+    return Math.max(0, Math.min(1, progress.loaded / progress.total));
+  }
+  return ttsStatus.progress ?? 0;
+}
+
+function broadcastTtsStatus(): void {
+  void chrome.runtime.sendMessage({
+    target: "ui",
+    type: "TTS_PROGRESS",
+    status: ttsStatus
+  }).catch(() => undefined);
+}
 
 async function translate(request: TranslateOffscreenRequest): Promise<TranslationResponse> {
   const started = performance.now();

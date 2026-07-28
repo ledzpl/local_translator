@@ -1,9 +1,12 @@
 import {
   DEFAULT_SETTINGS,
+  TTS_MODEL_ID,
   createRequestId,
   type ContentMessage,
   type ExtensionSettings,
   type PageTranslationStatus,
+  type SpeakResponse,
+  type TtsStatus,
   type TranslationResponse
 } from "../shared/protocol";
 import { LruCache } from "../shared/cache";
@@ -203,9 +206,13 @@ class InPageTranslator {
   };
   private toolbarHost: HTMLElement | null = null;
   private generation = 0;
+  private speechButton: HTMLButtonElement | null = null;
+  private speechPollTimer: number | null = null;
+  private speechRequest = 0;
 
   start(): PageTranslationStatus {
     if (this.status.state === "translating") return this.getStatus();
+    this.stopActiveSpeech();
     this.removeTranslations();
     const blocks = this.collectBlocks();
     this.generation += 1;
@@ -233,6 +240,7 @@ class InPageTranslator {
 
   restore(): PageTranslationStatus {
     this.generation += 1;
+    this.stopActiveSpeech();
     this.removeTranslations();
     this.toolbarHost?.remove();
     this.toolbarHost = null;
@@ -329,12 +337,106 @@ class InPageTranslator {
     host.lang = "ko";
     host.setAttribute("translate", "no");
     const shadow = host.attachShadow({ mode: "open" });
+    const speak = createElement("button", "speak", "▶ 듣기");
+    speak.type = "button";
+    speak.dataset.state = "idle";
+    speak.setAttribute("aria-label", "한국어 번역 듣기");
+    speak.addEventListener("click", () => this.toggleSpeech(speak, translation));
     shadow.append(
       createStyle(PAGE_TRANSLATION_STYLES),
       createElement("span", "label", "KO"),
+      speak,
       createElement("span", "text", translation)
     );
     element.append(host);
+  }
+
+  private toggleSpeech(button: HTMLButtonElement, translation: string): void {
+    if (this.speechButton === button && isActiveTtsButton(button)) {
+      this.stopActiveSpeech();
+      return;
+    }
+
+    this.resetSpeechButton();
+    this.speechRequest += 1;
+    const request = this.speechRequest;
+    this.speechButton = button;
+    updatePageSpeechButton(button, {
+      state: "loading",
+      modelId: TTS_MODEL_ID,
+      file: "한국어 음성 모델 준비 중"
+    });
+    void chrome.runtime.sendMessage({
+      target: "background",
+      type: "SPEAK_KOREAN",
+      text: translation
+    }).then((response: SpeakResponse | null) => {
+      if (request !== this.speechRequest || response?.ok) return;
+      updatePageSpeechButton(button, {
+        state: "error",
+        modelId: TTS_MODEL_ID,
+        error: response?.error ?? "음성을 시작하지 못했습니다."
+      });
+    }).catch((error) => {
+      if (request !== this.speechRequest) return;
+      updatePageSpeechButton(button, {
+        state: "error",
+        modelId: TTS_MODEL_ID,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
+    this.pollSpeechStatus(request);
+  }
+
+  private pollSpeechStatus(request: number): void {
+    if (this.speechPollTimer) window.clearTimeout(this.speechPollTimer);
+    const poll = async (): Promise<void> => {
+      if (request !== this.speechRequest || !this.speechButton?.isConnected) return;
+      try {
+        const status = await chrome.runtime.sendMessage({
+          target: "background",
+          type: "GET_TTS_STATUS"
+        }) as TtsStatus | null;
+        if (request !== this.speechRequest || !this.speechButton) return;
+        if (status?.state) updatePageSpeechButton(this.speechButton, status);
+        if (!status || status.state === "idle") {
+          this.resetSpeechButton();
+          return;
+        }
+        if (status.state === "error") {
+          this.speechPollTimer = null;
+          return;
+        }
+      } catch {
+        if (request !== this.speechRequest || !this.speechButton) return;
+      }
+      this.speechPollTimer = window.setTimeout(() => void poll(), 300);
+    };
+    this.speechPollTimer = window.setTimeout(() => void poll(), 120);
+  }
+
+  private stopActiveSpeech(): void {
+    const wasActive = Boolean(this.speechButton);
+    this.speechRequest += 1;
+    if (this.speechPollTimer) window.clearTimeout(this.speechPollTimer);
+    this.speechPollTimer = null;
+    this.resetSpeechButton();
+    if (wasActive) {
+      void chrome.runtime.sendMessage({
+        target: "background",
+        type: "STOP_SPEAKING"
+      }).catch(() => undefined);
+    }
+  }
+
+  private resetSpeechButton(): void {
+    if (this.speechButton?.isConnected) {
+      updatePageSpeechButton(this.speechButton, {
+        state: "idle",
+        modelId: TTS_MODEL_ID
+      });
+    }
+    this.speechButton = null;
   }
 
   private ensureToolbar(): void {
@@ -580,6 +682,40 @@ function createStyle(css: string): HTMLStyleElement {
   return style;
 }
 
+function isActiveTtsButton(button: HTMLButtonElement): boolean {
+  return button.dataset.state === "loading" ||
+    button.dataset.state === "synthesizing" ||
+    button.dataset.state === "playing";
+}
+
+function updatePageSpeechButton(
+  button: HTMLButtonElement,
+  status: TtsStatus
+): void {
+  button.dataset.state = status.state;
+  button.classList.toggle("active", isActiveTtsButton(button));
+  button.classList.toggle("error", status.state === "error");
+  if (status.state === "loading") {
+    const percent = status.progress && status.progress > 0
+      ? ` ${Math.round(status.progress * 100)}%`
+      : "";
+    button.textContent = `음성 준비${percent}`;
+    button.title = status.file ?? "한국어 음성 모델 준비 중";
+  } else if (status.state === "synthesizing") {
+    button.textContent = "음성 생성 중";
+    button.title = status.file ?? "한국어 음성 생성 중";
+  } else if (status.state === "playing") {
+    button.textContent = "■ 정지";
+    button.title = "한국어 번역 읽기 정지";
+  } else if (status.state === "error") {
+    button.textContent = "다시 듣기";
+    button.title = status.error ?? "한국어 음성을 만들지 못했습니다.";
+  } else {
+    button.textContent = "▶ 듣기";
+    button.title = "한국어 번역 듣기";
+  }
+}
+
 const SELECTION_STYLES = `
   :host { all: initial; }
   * { box-sizing: border-box; }
@@ -678,6 +814,29 @@ const PAGE_TRANSLATION_STYLES = `
     vertical-align: .12em;
   }
   .text { white-space: pre-wrap; }
+  .speak {
+    display: inline-block;
+    margin: .08em .65em .08em 0;
+    border: 1px solid rgba(145, 169, 25, .35);
+    border-radius: 999px;
+    padding: .38em .7em;
+    background: rgba(145, 169, 25, .12);
+    color: #71870d;
+    font: 800 .68em/1 system-ui;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .speak:hover { background: rgba(145, 169, 25, .2); }
+  .speak.active {
+    border-color: rgba(221, 255, 68, .45);
+    background: rgba(221, 255, 68, .18);
+    color: #789000;
+  }
+  .speak.error {
+    border-color: rgba(220, 80, 72, .3);
+    background: rgba(220, 80, 72, .08);
+    color: #b5413b;
+  }
 `;
 
 const PAGE_TOOLBAR_STYLES = `

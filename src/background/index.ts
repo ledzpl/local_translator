@@ -3,6 +3,7 @@ import {
   DEFAULT_SETTINGS,
   MODEL_ID,
   OFFSCREEN_PATH,
+  TTS_MODEL_ID,
   type BackgroundMessage,
   type ContentMessage,
   type DevicePreference,
@@ -10,8 +11,11 @@ import {
   type ExtensionSettings,
   type OffscreenMessage,
   type PageTranslationStatus,
+  type SpeakResponse,
+  type TtsStatus,
   type TranslationOrigin,
-  type TranslationResponse
+  type TranslationResponse,
+  type UiTtsProgressMessage
 } from "../shared/protocol";
 import {
   containsMostlyKorean,
@@ -21,6 +25,7 @@ import {
 import { friendlyError, normalizeText } from "../shared/text";
 
 let creatingOffscreen: Promise<void> | null = null;
+let ttsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
 
 chrome.runtime.onInstalled.addListener(() => {
   void chrome.contextMenus.removeAll().then(() => {
@@ -48,11 +53,16 @@ chrome.commands.onCommand.addListener((command) => {
 
 chrome.runtime.onMessage.addListener(
   (
-    message: BackgroundMessage,
+    message: BackgroundMessage | UiTtsProgressMessage,
     _sender,
     sendResponse: (response: unknown) => void
   ): boolean | undefined => {
-    if (!message || message.target !== "background") return undefined;
+    if (!message) return undefined;
+    if (message.target === "ui" && message.type === "TTS_PROGRESS") {
+      ttsStatus = message.status;
+      return undefined;
+    }
+    if (message.target !== "background") return undefined;
 
     void handleBackgroundMessage(message)
       .then(sendResponse)
@@ -110,6 +120,27 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
       if (!tab?.id) return { text: "" };
       return { text: await getSelectionFromTab(tab.id) };
     }
+    case "SPEAK_KOREAN": {
+      const text = normalizeText(message.text);
+      if (!text) {
+        return {
+          ok: false,
+          error: "읽어줄 한국어 번역이 없습니다."
+        } satisfies SpeakResponse;
+      }
+      ttsStatus = {
+        state: "loading",
+        modelId: TTS_MODEL_ID,
+        progress: 0,
+        file: "한국어 음성 모델 준비 중"
+      };
+      await sendToOffscreen({
+        target: "offscreen",
+        type: "SPEAK_KOREAN_OFFSCREEN",
+        text
+      });
+      return { ok: true } satisfies SpeakResponse;
+    }
     case "START_PAGE_TRANSLATION":
       return sendPageCommand("START_PAGE_TRANSLATION");
     case "GET_PAGE_TRANSLATION_STATUS":
@@ -130,6 +161,15 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
           modelId: MODEL_ID
         } satisfies EngineStatus;
       }
+    case "GET_TTS_STATUS":
+      return ttsStatus;
+    case "STOP_SPEAKING":
+      ttsStatus = { state: "idle", modelId: TTS_MODEL_ID };
+      await sendToOffscreen({
+        target: "offscreen",
+        type: "STOP_SPEAKING_OFFSCREEN"
+      });
+      return { ok: true } satisfies SpeakResponse;
     case "RESET_ENGINE":
       return sendToOffscreen({
         target: "offscreen",
@@ -197,8 +237,12 @@ async function ensureOffscreenDocument(): Promise<void> {
   if (!creatingOffscreen) {
     creatingOffscreen = chrome.offscreen.createDocument({
       url: OFFSCREEN_PATH,
-      reasons: [chrome.offscreen.Reason.WORKERS, chrome.offscreen.Reason.BLOBS],
-      justification: "브라우저 내부 WASM/WebGPU 번역 모델을 로드하고 실행합니다."
+      reasons: [
+        chrome.offscreen.Reason.WORKERS,
+        chrome.offscreen.Reason.BLOBS,
+        chrome.offscreen.Reason.AUDIO_PLAYBACK
+      ],
+      justification: "브라우저 내부 AI 번역·한국어 음성 모델을 로드하고 음성을 재생합니다."
     }).finally(() => {
       creatingOffscreen = null;
     });
