@@ -21,6 +21,11 @@ import {
   MODEL_DEFINITIONS,
   SMALL100_MODEL_ID
 } from "../shared/models";
+import {
+  CURRENT_PRIVACY_CONSENT_VERSION,
+  hasPrivacyConsent
+} from "../shared/privacy";
+import { isSpeechStatusFor } from "../shared/tts";
 
 const app = document.querySelector<HTMLElement>("#app");
 if (!app) throw new Error("앱 루트를 찾을 수 없습니다.");
@@ -30,12 +35,34 @@ const EXTENSION_RELOAD_MESSAGE =
   "확장 프로그램이 업데이트되었습니다. chrome://extensions에서 온글 번역을 새로고침해 주세요.";
 
 app.innerHTML = `
+  <section id="privacy-onboarding" class="privacy-onboarding" hidden>
+    <div class="eyebrow"><span class="pulse"></span> PRIVATE BY DESIGN</div>
+    <h1>온글<span>.</span></h1>
+    <h2>번역을 시작하기 전에 확인해 주세요</h2>
+    <ul>
+      <li>직접 입력하거나 선택한 텍스트, 요청한 페이지 본문과 켠 YouTube 자막은 이 기기 안에서만 번역합니다.</li>
+      <li>번역·음성 모델 파일만 Hugging Face에서 내려받으며, 번역할 내용은 개발자나 Hugging Face에 보내지 않습니다.</li>
+      <li>첫 번역은 실행 경로별 약 650~750MB를 받으며, WebGPU 자동 전환 시 두 경로를 순차 다운로드해 전송량이 최대 약 1.4GB가 될 수 있습니다.</li>
+      <li>모델·언어·자막 설정과 이 확인 기록은 Chrome 동기화 저장소에 보관될 수 있습니다. 페이지 내용은 저장하지 않습니다.</li>
+    </ul>
+    <a href="/privacy.html" target="_blank" rel="noreferrer">개인정보처리방침 전체 보기</a>
+    <label class="consent-check">
+      <input id="privacy-consent-check" type="checkbox" />
+      <span>위 데이터 처리 방식과 모델 다운로드를 확인했습니다.</span>
+    </label>
+    <button id="privacy-consent-button" class="primary-button" type="button" disabled>
+      <span>동의하고 시작</span><span aria-hidden="true">→</span>
+    </button>
+    <p id="privacy-consent-error" class="consent-error" hidden></p>
+  </section>
+
+  <div id="product-ui" hidden>
   <header class="header">
     <div>
       <div class="eyebrow"><span class="pulse"></span> LOCAL AI TRANSLATOR</div>
       <h1>온글<span>.</span></h1>
     </div>
-    <div class="privacy-pill">서버 전송 없음</div>
+    <div class="privacy-pill">번역 내용 외부 전송 없음</div>
   </header>
 
   <section class="page-card">
@@ -84,7 +111,7 @@ app.innerHTML = `
       <div class="engine-icon">AI</div>
       <div class="engine-copy">
         <strong id="engine-title">로컬 모델 대기 중</strong>
-        <span id="engine-detail">첫 번역 때 약 620MB 모델을 한 번 내려받습니다.</span>
+        <span id="engine-detail">경로별 약 650~750MB · 자동 폴백 시 최대 약 1.4GB</span>
       </div>
       <span id="engine-state" class="engine-state idle">대기</span>
     </div>
@@ -133,27 +160,34 @@ app.innerHTML = `
     <label>
       번역 모델
       <select id="model-preference">
-        <option value="small100">SMaLL-100 — 빠른 기본 모델</option>
-        <option value="m2m100">M2M100 — 호환성 폴백</option>
+        <option value="m2m100">M2M100 — 권장 기본 모델</option>
+        <option value="small100">SMaLL-100 — 실험적 WASM 호환</option>
       </select>
     </label>
     <label>
       실행 장치
       <select id="device-preference">
-        <option value="wasm">WASM — 기본, 호환성 우선</option>
         <option value="auto">자동 — WebGPU 우선</option>
+        <option value="wasm">WASM — 호환성 우선</option>
         <option value="webgpu">WebGPU — 실험적 GPU 가속</option>
       </select>
     </label>
-    <p id="model-setting-detail">SMaLL-100 · 약 620MB · int8 WASM · Chrome 캐시에 보관</p>
+    <p id="model-setting-detail">M2M100 · 경로별 약 650~750MB · 자동 폴백 시 최대 약 1.4GB 전송 · Chrome 캐시에 보관</p>
   </details>
 
   <footer>
-    선택한 텍스트는 우클릭 또는 <kbd>⌥</kbd><kbd>⇧</kbd><kbd>K</kbd>로 바로 번역
+    <span>선택한 텍스트는 우클릭 또는 <kbd>⌥</kbd><kbd>⇧</kbd><kbd>K</kbd>로 바로 번역</span>
+    <a href="/privacy.html" target="_blank" rel="noreferrer">개인정보처리방침</a>
   </footer>
+  </div>
 `;
 
 const elements = {
+  privacyOnboarding: getElement<HTMLElement>("privacy-onboarding"),
+  privacyConsentCheck: getElement<HTMLInputElement>("privacy-consent-check"),
+  privacyConsentButton: getElement<HTMLButtonElement>("privacy-consent-button"),
+  privacyConsentError: getElement<HTMLElement>("privacy-consent-error"),
+  productUi: getElement<HTMLElement>("product-ui"),
   source: getElement<HTMLTextAreaElement>("source-text"),
   sourceLanguage: getElement<HTMLSelectElement>("source-language"),
   characterCount: getElement<HTMLElement>("character-count"),
@@ -187,6 +221,7 @@ const elements = {
 };
 let currentTranslation = "";
 let currentTtsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
+let currentSpeechId: string | null = null;
 
 for (const language of LANGUAGE_OPTIONS) {
   const option = document.createElement("option");
@@ -195,18 +230,41 @@ for (const language of LANGUAGE_OPTIONS) {
   elements.sourceLanguage.append(option);
 }
 
+elements.privacyConsentCheck.addEventListener("change", () => {
+  elements.privacyConsentButton.disabled = !elements.privacyConsentCheck.checked;
+});
+elements.privacyConsentButton.addEventListener("click", () => {
+  void acceptPrivacyDisclosure();
+});
+
 void initialize();
 
 async function initialize(): Promise<void> {
   if (!isExtensionRuntime) {
-    applySettings(DEFAULT_SETTINGS);
+    const previewSettings: ExtensionSettings = {
+      ...DEFAULT_SETTINGS,
+      privacyConsentVersion: CURRENT_PRIVACY_CONSENT_VERSION
+    };
+    applySettings(previewSettings);
+    updatePrivacyGate(previewSettings);
     updateEngineStatus({ state: "idle", modelId: MODEL_ID });
     return;
   }
 
   const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS) as ExtensionSettings;
   applySettings(settings);
+  updatePrivacyGate(settings);
+  if (!hasPrivacyConsent(settings)) {
+    updateEngineStatus({ state: "idle", modelId: MODEL_ID });
+    updateTtsStatus({ state: "idle", modelId: TTS_MODEL_ID });
+    updatePageStatus(idlePageStatus());
+    return;
+  }
 
+  await loadRuntimeState();
+}
+
+async function loadRuntimeState(): Promise<void> {
   const [selection, status, pageStatus, ttsStatus] = await Promise.all([
     chrome.runtime.sendMessage({
       target: "background",
@@ -231,8 +289,50 @@ async function initialize(): Promise<void> {
     updateCharacterCount();
   }
   updateEngineStatus(normalizeEngineStatus(status));
-  updateTtsStatus(normalizeTtsStatus(ttsStatus));
+  const normalizedTtsStatus = normalizeTtsStatus(ttsStatus);
+  currentSpeechId = isTtsActive(normalizedTtsStatus)
+    ? normalizedTtsStatus.speechId ?? null
+    : null;
+  updateTtsStatus(
+    currentSpeechId
+      ? normalizedTtsStatus
+      : { state: "idle", modelId: TTS_MODEL_ID }
+  );
   updatePageStatus(normalizePageStatus(pageStatus, EXTENSION_RELOAD_MESSAGE));
+}
+
+async function acceptPrivacyDisclosure(): Promise<void> {
+  if (!isExtensionRuntime || !elements.privacyConsentCheck.checked) return;
+  elements.privacyConsentButton.disabled = true;
+  elements.privacyConsentError.hidden = true;
+  try {
+    const current = await chrome.storage.sync.get(DEFAULT_SETTINGS) as ExtensionSettings;
+    const accepted: ExtensionSettings = {
+      ...current,
+      privacyConsentVersion: CURRENT_PRIVACY_CONSENT_VERSION,
+      youtubeEnabled: false,
+      autoEnableCaptions: false
+    };
+    await chrome.storage.sync.set({
+      privacyConsentVersion: CURRENT_PRIVACY_CONSENT_VERSION,
+      youtubeEnabled: false,
+      autoEnableCaptions: false
+    });
+    applySettings(accepted);
+    updatePrivacyGate(accepted);
+    await loadRuntimeState();
+  } catch (error) {
+    elements.privacyConsentError.textContent =
+      `설정을 저장하지 못했습니다: ${formatUiError(error)}`;
+    elements.privacyConsentError.hidden = false;
+    elements.privacyConsentButton.disabled = false;
+  }
+}
+
+function updatePrivacyGate(settings: ExtensionSettings): void {
+  const accepted = hasPrivacyConsent(settings);
+  elements.privacyOnboarding.hidden = accepted;
+  elements.productUi.hidden = !accepted;
 }
 
 elements.source.addEventListener("input", updateCharacterCount);
@@ -247,14 +347,14 @@ elements.pageTranslate.addEventListener("click", () => void handlePageTranslatio
 elements.pageRestore.addEventListener("click", () => void restorePageTranslation());
 elements.extensionReload.addEventListener("click", () => chrome.runtime.reload());
 
-elements.youtubeEnabled.addEventListener("change", saveSettings);
-elements.autoCaptions.addEventListener("change", saveSettings);
-elements.showOriginal.addEventListener("change", saveSettings);
+elements.youtubeEnabled.addEventListener("change", () => void saveSettingsSafely());
+elements.autoCaptions.addEventListener("change", () => void saveSettingsSafely());
+elements.showOriginal.addEventListener("change", () => void saveSettingsSafely());
 elements.subtitleSize.addEventListener("input", () => {
   elements.subtitleSizeValue.textContent = `${elements.subtitleSize.value}px`;
-  saveSettings();
+  void saveSettingsSafely();
 });
-elements.sourceLanguage.addEventListener("change", saveSettings);
+elements.sourceLanguage.addEventListener("change", () => void saveSettingsSafely());
 elements.modelPreference.addEventListener("change", () => void resetEngineForSettings());
 elements.devicePreference.addEventListener("change", () => void resetEngineForSettings());
 
@@ -265,7 +365,7 @@ if (isExtensionRuntime) {
     if (message?.target === "ui" && message.type === "ENGINE_PROGRESS") {
       updateEngineStatus(message.status);
     } else if (message?.target === "ui" && message.type === "TTS_PROGRESS") {
-      updateTtsStatus(message.status);
+      handleTtsProgress(message.status);
     }
   });
   window.setInterval(() => {
@@ -324,39 +424,51 @@ async function translate(): Promise<void> {
   setBusy(true);
   currentTranslation = "";
   elements.speak.disabled = true;
-  await stopSpeech();
   elements.resultCard.hidden = false;
   elements.resultText.className = "result-text loading-lines";
   elements.resultText.textContent = "브라우저에서 번역하고 있어요…";
   elements.resultMeta.textContent = "";
 
-  if (!isExtensionRuntime) {
-    setBusy(false);
+  try {
+    await stopSpeech();
+    if (!isExtensionRuntime) {
+      throw new Error("번역은 Chrome에 확장 프로그램을 로드한 뒤 사용할 수 있습니다.");
+    }
+
+    const response = await chrome.runtime.sendMessage({
+      target: "background",
+      type: "TRANSLATE",
+      requestId: createRequestId(),
+      text,
+      sourceLanguage: elements.sourceLanguage.value,
+      origin: "popup"
+    }) as TranslationResponse;
+
+    elements.resultText.className = response.ok ? "result-text" : "result-text error";
+    if (response.ok) {
+      currentTranslation = response.translation;
+      elements.speak.disabled = false;
+      elements.resultText.textContent = response.translation;
+      const device = response.device === "webgpu"
+        ? "WebGPU"
+        : response.device === "wasm"
+          ? "WASM"
+          : "번역 생략";
+      elements.resultMeta.textContent =
+        `${device} · ${(response.elapsedMs / 1000).toFixed(1)}초`;
+    } else {
+      elements.resultText.textContent = response.error;
+      elements.resultMeta.textContent =
+        response.code === "CONSENT_REQUIRED"
+          ? "데이터 처리 안내를 확인해 주세요."
+          : "엔진 설정이나 인터넷 연결을 확인해 주세요.";
+    }
+  } catch (error) {
     elements.resultText.className = "result-text error";
-    elements.resultText.textContent = "번역은 Chrome에 확장 프로그램을 로드한 뒤 사용할 수 있습니다.";
-    return;
-  }
-
-  const response = await chrome.runtime.sendMessage({
-    target: "background",
-    type: "TRANSLATE",
-    requestId: createRequestId(),
-    text,
-    sourceLanguage: elements.sourceLanguage.value,
-    origin: "popup"
-  }) as TranslationResponse;
-
-  setBusy(false);
-  elements.resultText.className = response.ok ? "result-text" : "result-text error";
-  if (response.ok) {
-    currentTranslation = response.translation;
-    elements.speak.disabled = false;
-    elements.resultText.textContent = response.translation;
-    const device = response.device === "webgpu" ? "WebGPU" : response.device === "wasm" ? "WASM" : "번역 생략";
-    elements.resultMeta.textContent = `${device} · ${(response.elapsedMs / 1000).toFixed(1)}초`;
-  } else {
-    elements.resultText.textContent = response.error;
-    elements.resultMeta.textContent = "엔진 설정이나 인터넷 연결을 확인해 주세요.";
+    elements.resultText.textContent = formatUiError(error);
+    elements.resultMeta.textContent = "확장 프로그램을 새로고침한 뒤 다시 시도해 주세요.";
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -367,36 +479,82 @@ async function toggleSpeech(): Promise<void> {
   }
   if (!currentTranslation || !isExtensionRuntime) return;
 
+  const speechId = createRequestId();
+  currentSpeechId = speechId;
   updateTtsStatus({
     state: "loading",
     modelId: TTS_MODEL_ID,
+    speechId,
     progress: 0,
     file: "한국어 음성 모델 준비 중"
   });
   const response = await chrome.runtime.sendMessage({
     target: "background",
     type: "SPEAK_KOREAN",
+    speechId,
     text: currentTranslation
   }).catch((error) => ({
     ok: false,
+    speechId,
     error: error instanceof Error ? error.message : String(error)
   })) as SpeakResponse;
-  if (!response?.ok) {
+  if (currentSpeechId !== speechId) return;
+  if (!response?.ok || response.speechId !== speechId) {
     updateTtsStatus({
       state: "error",
       modelId: TTS_MODEL_ID,
-      error: response.error ?? "한국어 음성을 시작하지 못했습니다."
+      speechId,
+      error: response?.error ?? "한국어 음성을 시작하지 못했습니다."
     });
+    currentSpeechId = null;
   }
 }
 
 async function stopSpeech(): Promise<void> {
-  if (!isExtensionRuntime || !isTtsActive(currentTtsStatus)) return;
-  await chrome.runtime.sendMessage({
+  const speechId = currentSpeechId ?? currentTtsStatus.speechId ?? null;
+  if (
+    !isExtensionRuntime ||
+    !speechId ||
+    !isTtsActive(currentTtsStatus)
+  ) {
+    return;
+  }
+  const response = await chrome.runtime.sendMessage({
     target: "background",
-    type: "STOP_SPEAKING"
-  }).catch(() => undefined);
-  updateTtsStatus({ state: "idle", modelId: TTS_MODEL_ID });
+    type: "STOP_SPEAKING",
+    speechId
+  }).catch((error) => ({
+    ok: false,
+    speechId,
+    error: error instanceof Error ? error.message : String(error)
+  })) as SpeakResponse;
+  if (currentSpeechId !== speechId) return;
+  if (response?.ok && response.speechId === speechId) {
+    updateTtsStatus({
+      state: "idle",
+      modelId: TTS_MODEL_ID,
+      speechId
+    });
+  } else {
+    updateTtsStatus({
+      state: "error",
+      modelId: TTS_MODEL_ID,
+      speechId,
+      error: response?.error ?? "한국어 음성을 정지하지 못했습니다."
+    });
+  }
+  currentSpeechId = null;
+}
+
+function handleTtsProgress(status: TtsStatus): void {
+  if (!currentSpeechId) return;
+  if (!isSpeechStatusFor(status, currentSpeechId)) {
+    currentSpeechId = null;
+    updateTtsStatus({ state: "idle", modelId: TTS_MODEL_ID });
+    return;
+  }
+  updateTtsStatus(status);
+  if (!isTtsActive(status)) currentSpeechId = null;
 }
 
 function updateTtsStatus(status: TtsStatus): void {
@@ -500,6 +658,7 @@ function applySettings(settings: ExtensionSettings): void {
 
 async function saveSettings(): Promise<void> {
   const settings: ExtensionSettings = {
+    privacyConsentVersion: CURRENT_PRIVACY_CONSENT_VERSION,
     youtubeEnabled: elements.youtubeEnabled.checked,
     autoEnableCaptions: elements.autoCaptions.checked,
     showOriginalCaptions: elements.showOriginal.checked,
@@ -511,18 +670,48 @@ async function saveSettings(): Promise<void> {
   if (isExtensionRuntime) await chrome.storage.sync.set(settings);
 }
 
+async function saveSettingsSafely(): Promise<void> {
+  try {
+    await saveSettings();
+  } catch (error) {
+    updateEngineStatus({
+      state: "error",
+      modelId: MODEL_DEFINITIONS[
+        elements.modelPreference.value as ModelPreference
+      ].id,
+      error: `설정을 저장하지 못했습니다: ${formatUiError(error)}`
+    });
+  }
+}
+
 async function resetEngineForSettings(): Promise<void> {
   updateModelSettingDetail();
-  await saveSettings();
-  if (isExtensionRuntime) {
-    await chrome.runtime.sendMessage({ target: "background", type: "RESET_ENGINE" });
+  try {
+    await saveSettings();
+    if (isExtensionRuntime) {
+      const status = await chrome.runtime.sendMessage({
+        target: "background",
+        type: "RESET_ENGINE"
+      });
+      if (status?.state === "error") {
+        throw new Error(status.error ?? "번역 엔진을 초기화하지 못했습니다.");
+      }
+    }
+    updateEngineStatus({
+      state: "idle",
+      modelId: MODEL_DEFINITIONS[
+        elements.modelPreference.value as ModelPreference
+      ].id
+    });
+  } catch (error) {
+    updateEngineStatus({
+      state: "error",
+      modelId: MODEL_DEFINITIONS[
+        elements.modelPreference.value as ModelPreference
+      ].id,
+      error: formatUiError(error)
+    });
   }
-  updateEngineStatus({
-    state: "idle",
-    modelId: MODEL_DEFINITIONS[
-      elements.modelPreference.value as ModelPreference
-    ].id
-  });
 }
 
 function updateModelSettingDetail(): void {
@@ -530,8 +719,13 @@ function updateModelSettingDetail(): void {
   const definition = MODEL_DEFINITIONS[preference];
   const usesSmall100 = preference === "small100";
   elements.devicePreference.disabled = usesSmall100;
+  const automaticFallbackNote =
+    preference === "m2m100"
+      ? " · 자동 폴백 시 최대 약 1.4GB 전송"
+      : "";
   elements.modelSettingDetail.textContent =
-    `${definition.label} · ${definition.downloadSize} · ${definition.deviceNote} · Chrome 캐시에 보관`;
+    `${definition.label} · ${definition.downloadSize}${automaticFallbackNote} · ` +
+    `${definition.deviceNote} · Chrome 캐시에 보관`;
 }
 
 function updateEngineStatus(status: EngineStatus): void {
@@ -563,9 +757,11 @@ function updateEngineStatus(status: EngineStatus): void {
     elements.engineTitle.textContent = `${modelLabel} 준비 완료`;
     const runtime =
       `${status.device === "webgpu" ? "WebGPU" : "WASM"}로 브라우저 안에서 실행 중`;
-    elements.engineDetail.textContent = status.fallbackFromModelId
-      ? `SMaLL-100 로드 실패로 M2M100 폴백 · ${runtime}`
-      : runtime;
+    elements.engineDetail.textContent = status.fallbackFromDevice === "webgpu"
+      ? `WebGPU 오류로 WASM 폴백 · ${runtime}`
+      : status.fallbackFromModelId
+        ? `SMaLL-100 로드 실패로 M2M100 폴백 · ${runtime}`
+        : runtime;
   } else if (status.state === "error") {
     elements.engineTitle.textContent = "모델을 준비하지 못했어요";
     elements.engineDetail.textContent = status.error ?? "다시 번역을 시도해 주세요.";
@@ -574,7 +770,9 @@ function updateEngineStatus(status: EngineStatus): void {
     const selected =
       MODEL_DEFINITIONS[elements.modelPreference.value as ModelPreference];
     elements.engineDetail.textContent =
-      `첫 번역 때 ${selected.downloadSize} 모델을 한 번 내려받습니다.`;
+      elements.modelPreference.value === "m2m100"
+        ? `${selected.downloadSize} · 자동 폴백 시 최대 약 1.4GB`
+        : `첫 번역 때 ${selected.downloadSize} 모델을 한 번 내려받습니다.`;
   }
 }
 
@@ -642,6 +840,14 @@ function normalizePageStatus(
 function shortenFile(file: string): string {
   const name = file.split("/").at(-1) ?? file;
   return name.length > 38 ? `${name.slice(0, 35)}…` : name;
+}
+
+function formatUiError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/receiving end does not exist|message port closed|extension context invalidated/i.test(message)) {
+    return EXTENSION_RELOAD_MESSAGE;
+  }
+  return message || "알 수 없는 오류가 발생했습니다.";
 }
 
 function getElement<T extends HTMLElement>(id: string): T {

@@ -1,12 +1,14 @@
 import {
-  MODEL_DEFINITIONS,
+  DEFAULT_MODEL_ID,
+  DEFAULT_MODEL_PREFERENCE,
+  TTS_MODEL_ID,
   type ModelPreference
 } from "./models";
 
 export const CONTEXT_MENU_ID = "ongeul-translate-selection";
 export const OFFSCREEN_PATH = "offscreen.html";
-export const MODEL_ID = MODEL_DEFINITIONS.small100.id;
-export const TTS_MODEL_ID = "Xenova/mms-tts-kor";
+export const MODEL_ID = DEFAULT_MODEL_ID;
+export { TTS_MODEL_ID } from "./models";
 
 export type DevicePreference = "auto" | "webgpu" | "wasm";
 export type RuntimeDevice = "webgpu" | "wasm";
@@ -14,6 +16,7 @@ export type TranslationOrigin = "popup" | "selection" | "youtube" | "page";
 export type { ModelPreference } from "./models";
 
 export interface ExtensionSettings {
+  privacyConsentVersion: number;
   youtubeEnabled: boolean;
   autoEnableCaptions: boolean;
   showOriginalCaptions: boolean;
@@ -24,13 +27,14 @@ export interface ExtensionSettings {
 }
 
 export const DEFAULT_SETTINGS: ExtensionSettings = {
-  youtubeEnabled: true,
-  autoEnableCaptions: true,
+  privacyConsentVersion: 0,
+  youtubeEnabled: false,
+  autoEnableCaptions: false,
   showOriginalCaptions: true,
   subtitleSize: 28,
   sourceLanguage: "auto",
-  modelPreference: "small100",
-  devicePreference: "wasm"
+  modelPreference: DEFAULT_MODEL_PREFERENCE,
+  devicePreference: "auto"
 };
 
 export interface TranslateRequest {
@@ -50,6 +54,9 @@ export interface TranslateOffscreenRequest {
   sourceLanguage: string;
   modelPreference: ModelPreference;
   devicePreference: DevicePreference;
+  runtimeDeviceOverride?: RuntimeDevice;
+  fallbackFromDevice?: RuntimeDevice;
+  deviceFallbackReason?: string;
   origin: TranslationOrigin;
 }
 
@@ -66,7 +73,13 @@ export interface TranslationFailure {
   ok: false;
   requestId: string;
   error: string;
-  code: "EMPTY_TEXT" | "MODEL_LOAD_FAILED" | "TRANSLATION_FAILED" | "UNSUPPORTED_PAGE";
+  code:
+    | "EMPTY_TEXT"
+    | "CONSENT_REQUIRED"
+    | "MODEL_LOAD_FAILED"
+    | "TRANSLATION_FAILED"
+    | "DEVICE_FALLBACK_REQUIRED"
+    | "UNSUPPORTED_PAGE";
 }
 
 export type TranslationResponse = TranslationSuccess | TranslationFailure;
@@ -80,6 +93,8 @@ export interface EngineStatus {
   error?: string;
   fallbackFromModelId?: string;
   fallbackReason?: string;
+  fallbackFromDevice?: RuntimeDevice;
+  deviceFallbackReason?: string;
 }
 
 export interface UiProgressMessage {
@@ -91,6 +106,7 @@ export interface UiProgressMessage {
 export interface TtsStatus {
   state: "idle" | "loading" | "synthesizing" | "playing" | "error";
   modelId: string;
+  speechId?: string;
   progress?: number;
   file?: string;
   error?: string;
@@ -105,11 +121,14 @@ export interface UiTtsProgressMessage {
 export interface SpeakRequest {
   target: "background";
   type: "SPEAK_KOREAN";
+  speechId: string;
   text: string;
 }
 
 export interface SpeakResponse {
   ok: boolean;
+  speechId: string;
+  stopped?: boolean;
   error?: string;
 }
 
@@ -131,15 +150,24 @@ export type BackgroundMessage =
   | { target: "background"; type: "RESTORE_PAGE_TRANSLATION" }
   | { target: "background"; type: "GET_ENGINE_STATUS" }
   | { target: "background"; type: "GET_TTS_STATUS" }
-  | { target: "background"; type: "STOP_SPEAKING" }
+  | { target: "background"; type: "STOP_SPEAKING"; speechId: string }
   | { target: "background"; type: "RESET_ENGINE" };
 
 export type OffscreenMessage =
   | TranslateOffscreenRequest
-  | { target: "offscreen"; type: "SPEAK_KOREAN_OFFSCREEN"; text: string }
+  | {
+      target: "offscreen";
+      type: "SPEAK_KOREAN_OFFSCREEN";
+      speechId: string;
+      text: string;
+    }
   | { target: "offscreen"; type: "GET_ENGINE_STATUS_OFFSCREEN" }
   | { target: "offscreen"; type: "GET_TTS_STATUS_OFFSCREEN" }
-  | { target: "offscreen"; type: "STOP_SPEAKING_OFFSCREEN" }
+  | {
+      target: "offscreen";
+      type: "STOP_SPEAKING_OFFSCREEN";
+      speechId: string;
+    }
   | { target: "offscreen"; type: "RESET_ENGINE_OFFSCREEN" };
 
 export type ContentMessage =

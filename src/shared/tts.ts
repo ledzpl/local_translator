@@ -1,4 +1,10 @@
-const SPEECH_CHUNK_LENGTH = 80;
+import type { TtsStatus } from "./protocol";
+
+// MMS-TTS WASM latency rises steeply with long romanized inputs. Keeping the
+// source chunks short gets the first audio playing quickly and avoids multi-
+// minute synthesis stalls on ordinary page translations.
+const SPEECH_CHUNK_LENGTH = 6;
+const KOREAN_DIGITS = ["영", "일", "이", "삼", "사", "오", "육", "칠", "팔", "구"];
 const HANGUL_BASE = 0xac00;
 const HANGUL_END = 0xd7a3;
 const INITIALS = [
@@ -22,11 +28,69 @@ const FINALS_BEFORE_VOWEL = [
 ];
 
 export function prepareKoreanForTts(text: string): string {
-  return romanizeKorean(text)
+  const readableText = text.replace(/\d/g, (digit) => KOREAN_DIGITS[Number(digit)]!);
+  return romanizeKorean(readableText)
     .toLowerCase()
     .replace(/[^a-z'\-\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+export interface TtsAudioMetrics {
+  durationSeconds: number;
+  rms: number;
+}
+
+export function canControlSpeech(
+  activeSpeechId: string | null,
+  requestedSpeechId?: string
+): boolean {
+  return requestedSpeechId === undefined || activeSpeechId === requestedSpeechId;
+}
+
+export function isSpeechStatusFor(
+  status: Pick<TtsStatus, "speechId">,
+  speechId: string | null
+): boolean {
+  return Boolean(speechId && status.speechId === speechId);
+}
+
+export function shouldMarkSpeechIdle(
+  activeSpeechId: string | undefined,
+  requestedSpeechId: string,
+  offscreenExists: boolean,
+  stopped: boolean
+): boolean {
+  return activeSpeechId === requestedSpeechId &&
+    (!offscreenExists || stopped);
+}
+
+export function validateTtsAudio(
+  samples: Float32Array,
+  sampleRate: number
+): TtsAudioMetrics {
+  if (!Number.isFinite(sampleRate) || sampleRate <= 0) {
+    throw new Error("음성 모델이 올바른 샘플 속도를 만들지 못했습니다.");
+  }
+  if (samples.length < sampleRate * 0.03) {
+    throw new Error("음성 모델이 재생할 만큼 긴 오디오를 만들지 못했습니다.");
+  }
+
+  let energy = 0;
+  for (const sample of samples) {
+    if (!Number.isFinite(sample)) {
+      throw new Error("음성 모델이 손상된 오디오를 만들었습니다.");
+    }
+    energy += sample * sample;
+  }
+  const rms = Math.sqrt(energy / samples.length);
+  if (rms < 1e-6) {
+    throw new Error("음성 모델이 무음 오디오를 만들었습니다.");
+  }
+  return {
+    durationSeconds: samples.length / sampleRate,
+    rms
+  };
 }
 
 export function romanizeKorean(text: string): string {

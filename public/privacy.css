@@ -1,0 +1,48 @@
+:root {
+  color: #eef1ea;
+  background: #101212;
+  font-family: Pretendard, Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at 85% 0%, rgba(221, 255, 68, .13), transparent 28rem),
+    #101212;
+}
+
+main {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 56px 24px 80px;
+}
+
+.eyebrow {
+  color: #cce83c;
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: .14em;
+}
+
+h1 {
+  margin: 10px 0 32px;
+  font-size: clamp(32px, 7vw, 54px);
+  letter-spacing: -.06em;
+}
+
+h2 {
+  margin: 36px 0 10px;
+  color: #f8faf5;
+  font-size: 20px;
+}
+
+p,
+li {
+  color: #b8bdb8;
+  font-size: 15px;
+  line-height: 1.75;
+}
+
+a {
+  color: #d8f158;
+}

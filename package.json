@@ -3,19 +3,32 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "브라우저 안에서 실행되는 한국어 번역 Chrome 확장 프로그램",
+  "description": "브라우저 안에서 번역하고 읽어주는 한국어 Chrome 확장 프로그램",
   "scripts": {
     "build": "node scripts/build.mjs",
     "dev": "vite",
     "test": "vitest run",
-    "test:extension": "node scripts/smoke-extension.mjs",
-    "test:extension:model": "node scripts/smoke-extension.mjs --with-model",
-    "test:extension:model:m2m100": "node scripts/smoke-extension.mjs --with-model --m2m100",
-    "test:extension:tts": "node scripts/smoke-extension.mjs --with-tts",
-    "test:extension:page-tts": "node scripts/smoke-extension.mjs --with-page-tts",
+    "test:extension:built": "node scripts/smoke-extension.mjs",
+    "test:extension:built:model": "node scripts/smoke-extension.mjs --with-model",
+    "test:extension:built:model:m2m100": "node scripts/smoke-extension.mjs --with-model",
+    "test:extension:built:model:m2m100:wasm": "node scripts/smoke-extension.mjs --with-model --wasm",
+    "test:extension:built:model:small100": "node scripts/smoke-extension.mjs --with-model --small100",
+    "test:extension:built:tts": "node scripts/smoke-extension.mjs --with-tts",
+    "test:extension:built:page-tts": "node scripts/smoke-extension.mjs --with-page-tts",
+    "test:extension": "npm run build && npm run test:extension:built",
+    "test:extension:model": "npm run build && npm run test:extension:built:model",
+    "test:extension:model:m2m100": "npm run build && npm run test:extension:built:model:m2m100",
+    "test:extension:model:m2m100:wasm": "npm run build && npm run test:extension:built:model:m2m100:wasm",
+    "test:extension:model:small100": "npm run build && npm run test:extension:built:model:small100",
+    "test:extension:tts": "npm run build && npm run test:extension:built:tts",
+    "test:extension:page-tts": "npm run build && npm run test:extension:built:page-tts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "verify": "npm run typecheck && npm run test && npm run build && node scripts/verify-build.mjs"
+    "verify": "npm run typecheck && npm run test && npm run build && node scripts/verify-build.mjs",
+    "release:check": "npm run verify && npm run test:extension:built && npm run test:extension:built:tts && npm run test:extension:built:page-tts && npm run test:extension:built:model:m2m100:wasm && npm run test:extension:built:model:small100 && npm audit --omit=dev",
+    "release:package": "npm run release:check && node scripts/package-release.mjs",
+    "release": "npm run release:package",
+    "store:assets": "npm run build && node scripts/capture-store-assets.mjs"
   },
   "dependencies": {
     "@huggingface/transformers": "3.8.1",
@@ -28,5 +41,8 @@
     "typescript": "7.0.2",
     "vite": "8.1.5",
     "vitest": "4.1.10"
+  },
+  "overrides": {
+    "sharp": "0.35.3"
   }
 }

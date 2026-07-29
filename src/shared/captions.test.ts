@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { captionStillMatches, joinCaptionSegments } from "./captions";
+import {
+  captionStillMatches,
+  captionTranslationKey,
+  joinCaptionSegments,
+  shouldRequestPendingCaption
+} from "./captions";
 
 describe("YouTube caption helpers", () => {
   it("joins YouTube caption segments without duplicated whitespace", () => {
@@ -9,5 +14,41 @@ describe("YouTube caption helpers", () => {
   it("allows a translated partial cue while YouTube appends words", () => {
     expect(captionStillMatches("This is a growing caption", "This is")).toBe(true);
     expect(captionStillMatches("A new caption", "This is")).toBe(false);
+  });
+
+  it("separates caption cache entries by model and runtime", () => {
+    const text = "A visible caption";
+    const wasm = captionTranslationKey(text, {
+      modelPreference: "small100",
+      devicePreference: "wasm"
+    });
+    const webgpu = captionTranslationKey(text, {
+      modelPreference: "m2m100",
+      devicePreference: "webgpu"
+    });
+    expect(wasm).not.toBe(webgpu);
+  });
+
+  it("requeues the same visible caption when settings changed in flight", () => {
+    expect(shouldRequestPendingCaption({
+      pendingCaption: "A visible caption",
+      currentCaption: "A visible caption",
+      sourceText: "A visible caption",
+      requestKey: "small100\u0000wasm\u0000A visible caption",
+      currentRequestKey: "m2m100\u0000wasm\u0000A visible caption",
+      generationChanged: true
+    })).toBe(true);
+  });
+
+  it("does not duplicate the same request after an unchanged cue mutation", () => {
+    const requestKey = "small100\u0000wasm\u0000A visible caption";
+    expect(shouldRequestPendingCaption({
+      pendingCaption: "A visible caption",
+      currentCaption: "A visible caption",
+      sourceText: "A visible caption",
+      requestKey,
+      currentRequestKey: requestKey,
+      generationChanged: false
+    })).toBe(false);
   });
 });

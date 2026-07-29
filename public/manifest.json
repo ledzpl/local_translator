@@ -3,7 +3,7 @@
   "name": "온글 번역 — 브라우저 로컬 AI",
   "short_name": "온글 번역",
   "version": "0.1.0",
-  "description": "웹 페이지 본문, 선택한 텍스트와 YouTube 자막을 서버 전송 없이 브라우저 안에서 한국어로 번역합니다.",
+  "description": "웹페이지 본문, 선택 텍스트와 YouTube 자막을 외부로 보내지 않고 브라우저 안에서 한국어로 번역하고 읽어줍니다.",
   "minimum_chrome_version": "116",
   "permissions": [
     "activeTab",

@@ -22,13 +22,23 @@ import {
 } from "../shared/protocol";
 import { LruCache } from "../shared/cache";
 import {
+  M2M100_REVISION,
   M2M100_MODEL_ID,
   SMALL100_MODEL_ID,
   SMALL100_REVISION,
-  createSmall100InputIds
+  TTS_MODEL_REVISION,
+  createSmall100InputIds,
+  isM2m100WebGpuWeightUrl
 } from "../shared/models";
+import { SerialTaskQueue } from "../shared/serial-queue";
 import { chunkText, friendlyError } from "../shared/text";
-import { chunkKoreanSpeech, prepareKoreanForTts } from "../shared/tts";
+import {
+  canControlSpeech,
+  chunkKoreanSpeech,
+  prepareKoreanForTts,
+  validateTtsAudio
+} from "../shared/tts";
+import { createTranslationCacheKey } from "../shared/translation-cache";
 
 type Small100Tokenizer = Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>>;
 type Small100Model = Awaited<ReturnType<typeof AutoModelForSeq2SeqLM.from_pretrained>>;
@@ -43,6 +53,13 @@ type TranslationEngine =
       pipeline: TranslationPipeline;
     };
 
+class WebGpuFallbackRequiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WebGpuFallbackRequiredError";
+  }
+}
+
 env.allowLocalModels = false;
 env.allowRemoteModels = true;
 env.useBrowserCache = true;
@@ -51,14 +68,18 @@ env.backends.onnx.wasm!.wasmPaths = chrome.runtime.getURL("wasm/");
 let engine: TranslationEngine | null = null;
 let enginePromise: Promise<TranslationEngine> | null = null;
 let loadedDevicePreference: DevicePreference | null = null;
+let loadedRuntimeDevice: RuntimeDevice | null = null;
 let loadedModelPreference: ModelPreference | null = null;
 let status: EngineStatus = { state: "idle", modelId: MODEL_ID };
-let translationQueue: Promise<unknown> = Promise.resolve();
+const engineQueue = new SerialTaskQueue();
+const ttsSynthesisQueue = new SerialTaskQueue();
 const translationCache = new LruCache<string>(220);
 let ttsEngine: TextToAudioPipeline | null = null;
 let ttsEnginePromise: Promise<TextToAudioPipeline> | null = null;
 let ttsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
 let speechRun = 0;
+let ttsProgressRun = 0;
+let activeSpeechId: string | null = null;
 let audioContext: AudioContext | null = null;
 let activeAudioSource: AudioBufferSourceNode | null = null;
 
@@ -71,10 +92,15 @@ chrome.runtime.onMessage.addListener(
     if (!message || message.target !== "offscreen") return undefined;
 
     if (message.type === "TRANSLATE_OFFSCREEN") {
-      translationQueue = translationQueue
-        .catch(() => undefined)
-        .then(() => translate(message));
-      void translationQueue.then(sendResponse);
+      const task = engineQueue.run(() => translate(message));
+      void task.then(sendResponse, (error) => {
+        sendResponse({
+          ok: false,
+          requestId: message.requestId,
+          code: "TRANSLATION_FAILED",
+          error: friendlyError(error)
+        } satisfies TranslationResponse);
+      });
       return true;
     }
 
@@ -84,8 +110,11 @@ chrome.runtime.onMessage.addListener(
     }
 
     if (message.type === "SPEAK_KOREAN_OFFSCREEN") {
-      startSpeech(message.text);
-      sendResponse({ ok: true } satisfies SpeakResponse);
+      startSpeech(message.text, message.speechId);
+      sendResponse({
+        ok: true,
+        speechId: message.speechId
+      } satisfies SpeakResponse);
       return false;
     }
 
@@ -95,13 +124,31 @@ chrome.runtime.onMessage.addListener(
     }
 
     if (message.type === "STOP_SPEAKING_OFFSCREEN") {
-      stopSpeech();
-      sendResponse({ ok: true } satisfies SpeakResponse);
+      const stopped = stopSpeech({
+        speechId: message.speechId
+      });
+      sendResponse({
+        ok: true,
+        speechId: message.speechId,
+        stopped
+      } satisfies SpeakResponse);
       return false;
     }
 
     if (message.type === "RESET_ENGINE_OFFSCREEN") {
-      void resetEngine().then(() => sendResponse(status));
+      const task = engineQueue.run(async () => {
+        await resetEngine();
+        return status;
+      });
+      void task.then(sendResponse, (error) => {
+        status = {
+          state: "error",
+          modelId: status.modelId,
+          error: friendlyError(error)
+        };
+        broadcastStatus();
+        sendResponse(status);
+      });
       return true;
     }
 
@@ -109,24 +156,31 @@ chrome.runtime.onMessage.addListener(
   }
 );
 
-function startSpeech(text: string): void {
-  stopSpeech(false);
+function startSpeech(text: string, speechId: string): void {
+  stopSpeech({ broadcast: false });
   const run = speechRun;
+  ttsProgressRun = run;
+  activeSpeechId = speechId;
   const chunks = chunkKoreanSpeech(text);
   ttsStatus = {
     state: "loading",
     modelId: TTS_MODEL_ID,
+    speechId,
     progress: ttsEngine ? 1 : 0,
     file: ttsEngine ? "음성 생성 준비 중" : "한국어 음성 모델 준비 중"
   };
   broadcastTtsStatus();
-  void runSpeech(chunks, run);
+  void runSpeech(chunks, run, speechId);
 }
 
-async function runSpeech(chunks: string[], run: number): Promise<void> {
+async function runSpeech(
+  chunks: string[],
+  run: number,
+  speechId: string
+): Promise<void> {
   try {
     const synthesizer = await getTtsEngine();
-    if (run !== speechRun) return;
+    if (!isCurrentSpeech(run, speechId)) return;
 
     for (let index = 0; index < chunks.length; index += 1) {
       const input = prepareKoreanForTts(chunks[index]!);
@@ -134,31 +188,45 @@ async function runSpeech(chunks: string[], run: number): Promise<void> {
       ttsStatus = {
         state: "synthesizing",
         modelId: TTS_MODEL_ID,
+        speechId,
         progress: index / chunks.length,
         file: `${index + 1} / ${chunks.length} 구간 음성 생성 중`
       };
       broadcastTtsStatus();
 
-      const output = await synthesizer(input, {});
-      if (run !== speechRun) return;
+      const output = await ttsSynthesisQueue.run(async () => {
+        if (!isCurrentSpeech(run, speechId)) return null;
+        return synthesizer(input, {});
+      });
+      if (!output || !isCurrentSpeech(run, speechId)) return;
+      validateTtsAudio(output.audio, output.sampling_rate);
       ttsStatus = {
         state: "playing",
         modelId: TTS_MODEL_ID,
+        speechId,
         progress: (index + 1) / chunks.length,
         file: `${index + 1} / ${chunks.length} 구간 재생 중`
       };
       broadcastTtsStatus();
       await playAudio(output.audio, output.sampling_rate, run);
-      if (run !== speechRun) return;
+      if (!isCurrentSpeech(run, speechId)) return;
     }
 
-    ttsStatus = { state: "idle", modelId: TTS_MODEL_ID, progress: 1 };
+    activeSpeechId = null;
+    ttsStatus = {
+      state: "idle",
+      modelId: TTS_MODEL_ID,
+      speechId,
+      progress: 1
+    };
     broadcastTtsStatus();
   } catch (error) {
-    if (run !== speechRun) return;
+    if (!isCurrentSpeech(run, speechId)) return;
+    activeSpeechId = null;
     ttsStatus = {
       state: "error",
       modelId: TTS_MODEL_ID,
+      speechId,
       error: friendlyError(error)
     };
     broadcastTtsStatus();
@@ -170,13 +238,22 @@ async function getTtsEngine(): Promise<TextToAudioPipeline> {
   if (ttsEnginePromise) return ttsEnginePromise;
 
   ttsEnginePromise = pipeline("text-to-speech", TTS_MODEL_ID, {
+    revision: TTS_MODEL_REVISION,
     device: "wasm",
     dtype: "q8",
     progress_callback: (progress: Record<string, unknown>) => {
-      if (ttsEngine || progress.status === "ready") return;
+      if (
+        ttsEngine ||
+        progress.status === "ready" ||
+        ttsProgressRun !== speechRun ||
+        ttsStatus.state !== "loading"
+      ) {
+        return;
+      }
       ttsStatus = {
         state: "loading",
         modelId: TTS_MODEL_ID,
+        speechId: activeSpeechId ?? ttsStatus.speechId,
         progress: getTtsProgress(progress),
         file: typeof progress.file === "string"
           ? progress.file
@@ -218,14 +295,35 @@ async function playAudio(
   });
 }
 
-function stopSpeech(broadcast = true): void {
+function stopSpeech(options: {
+  broadcast?: boolean;
+  speechId?: string;
+} = {}): boolean {
+  if (!canControlSpeech(activeSpeechId, options.speechId)) return false;
+  const stoppedSpeechId = activeSpeechId ?? options.speechId;
+  const stopped = activeSpeechId !== null || activeAudioSource !== null;
   speechRun += 1;
+  ttsProgressRun = speechRun;
+  activeSpeechId = null;
   if (activeAudioSource) {
-    activeAudioSource.stop();
+    try {
+      activeAudioSource.stop();
+    } catch {
+      // The source may finish between the state check and stop().
+    }
     activeAudioSource = null;
   }
-  ttsStatus = { state: "idle", modelId: TTS_MODEL_ID };
-  if (broadcast) broadcastTtsStatus();
+  ttsStatus = {
+    state: "idle",
+    modelId: TTS_MODEL_ID,
+    speechId: stoppedSpeechId
+  };
+  if (options.broadcast !== false) broadcastTtsStatus();
+  return stopped;
+}
+
+function isCurrentSpeech(run: number, speechId: string): boolean {
+  return run === speechRun && activeSpeechId === speechId;
 }
 
 function getTtsProgress(progress: Record<string, unknown>): number {
@@ -252,8 +350,12 @@ function broadcastTtsStatus(): void {
 
 async function translate(request: TranslateOffscreenRequest): Promise<TranslationResponse> {
   const started = performance.now();
-  const cacheKey =
-    `${request.modelPreference}\u0000${request.sourceLanguage}\u0000${request.text}`;
+  const cacheKey = createTranslationCacheKey(
+    request.modelPreference,
+    request.devicePreference,
+    request.sourceLanguage,
+    request.text
+  );
   const cached = translationCache.get(cacheKey);
   if (cached) {
     return {
@@ -267,19 +369,31 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
   }
 
   try {
-    const activeEngine = await getEngine(
+    let activeEngine = await getEngine(
       request.devicePreference,
-      request.modelPreference
+      request.modelPreference,
+      request.runtimeDeviceOverride,
+      request.fallbackFromDevice,
+      request.deviceFallbackReason
     );
-    const chunks = chunkText(request.text);
-    const translated: string[] = [];
-
-    for (const chunk of chunks) {
-      const result = await translateChunk(activeEngine, chunk, request.sourceLanguage);
-      if (result) translated.push(result);
+    let translation: string;
+    try {
+      translation = await translateText(
+        activeEngine,
+        request.text,
+        request.sourceLanguage
+      );
+    } catch (error) {
+      if (
+        activeEngine.kind !== "m2m100" ||
+        status.device !== "webgpu" ||
+        request.devicePreference === "wasm"
+      ) {
+        throw error;
+      }
+      await discardFailedM2m100WebGpuWeights();
+      throw new WebGpuFallbackRequiredError(friendlyError(error));
     }
-
-    const translation = translated.join(" ").trim();
     if (!translation) throw new Error("모델이 번역 결과를 만들지 못했습니다.");
     translationCache.set(cacheKey, translation);
 
@@ -293,6 +407,23 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
     };
   } catch (error) {
     const message = friendlyError(error);
+    if (error instanceof WebGpuFallbackRequiredError) {
+      status = {
+        ...status,
+        state: "error",
+        device: "webgpu",
+        error: message,
+        fallbackFromDevice: "webgpu",
+        deviceFallbackReason: message
+      };
+      broadcastStatus();
+      return {
+        ok: false,
+        requestId: request.requestId,
+        code: "DEVICE_FALLBACK_REQUIRED",
+        error: message
+      };
+    }
     status = { ...status, state: "error", error: message };
     broadcastStatus();
     return {
@@ -302,6 +433,19 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
       error: message
     };
   }
+}
+
+async function translateText(
+  activeEngine: TranslationEngine,
+  text: string,
+  sourceLanguage: string
+): Promise<string> {
+  const translated: string[] = [];
+  for (const chunk of chunkText(text)) {
+    const result = await translateChunk(activeEngine, chunk, sourceLanguage);
+    if (result) translated.push(result);
+  }
+  return translated.join(" ").trim();
 }
 
 async function translateChunk(
@@ -341,7 +485,8 @@ async function translateChunk(
       input_ids: inputIds,
       attention_mask: attentionMask,
       max_new_tokens: maxNewTokens,
-      num_beams: 1
+      num_beams: 3,
+      early_stopping: true
     } as never);
     const sequences =
       generated instanceof Tensor
@@ -367,25 +512,45 @@ async function translateChunk(
 
 async function getEngine(
   devicePreference: DevicePreference,
-  modelPreference: ModelPreference
+  modelPreference: ModelPreference,
+  runtimeDeviceOverride?: RuntimeDevice,
+  fallbackFromDevice?: RuntimeDevice,
+  deviceFallbackReason?: string
 ): Promise<TranslationEngine> {
+  const runtimeDevice =
+    modelPreference === "small100"
+      ? "wasm"
+      : runtimeDeviceOverride ?? chooseDevice(devicePreference);
   const samePreference =
     loadedDevicePreference === devicePreference &&
+    loadedRuntimeDevice === runtimeDevice &&
     loadedModelPreference === modelPreference;
   if (engine && samePreference) return engine;
   if (enginePromise && samePreference) return enginePromise;
   if (engine || enginePromise) await resetEngine();
 
   loadedDevicePreference = devicePreference;
+  loadedRuntimeDevice = runtimeDevice;
   loadedModelPreference = modelPreference;
-  const device =
-    modelPreference === "small100" ? "wasm" : chooseDevice(devicePreference);
   const modelId =
     modelPreference === "small100" ? SMALL100_MODEL_ID : M2M100_MODEL_ID;
-  status = { state: "loading", modelId, device, progress: 0 };
+  status = {
+    state: "loading",
+    modelId,
+    device: runtimeDevice,
+    progress: 0,
+    fallbackFromDevice,
+    deviceFallbackReason
+  };
   broadcastStatus();
 
-  enginePromise = loadRequestedEngine(modelPreference, devicePreference)
+  enginePromise = loadRequestedEngine(
+    modelPreference,
+    devicePreference,
+    runtimeDeviceOverride,
+    fallbackFromDevice,
+    deviceFallbackReason
+  )
     .then((loaded) => {
       engine = loaded;
       return loaded;
@@ -399,10 +564,19 @@ async function getEngine(
 
 async function loadRequestedEngine(
   modelPreference: ModelPreference,
-  devicePreference: DevicePreference
+  devicePreference: DevicePreference,
+  runtimeDeviceOverride?: RuntimeDevice,
+  fallbackFromDevice?: RuntimeDevice,
+  deviceFallbackReason?: string
 ): Promise<TranslationEngine> {
   if (modelPreference === "m2m100") {
-    return loadM2m100(chooseDevice(devicePreference), devicePreference);
+    return loadM2m100(
+      runtimeDeviceOverride ?? chooseDevice(devicePreference),
+      undefined,
+      undefined,
+      fallbackFromDevice,
+      deviceFallbackReason
+    );
   }
 
   try {
@@ -419,11 +593,15 @@ async function loadRequestedEngine(
       fallbackReason
     };
     broadcastStatus();
+    const fallbackDevice =
+      runtimeDeviceOverride ?? chooseDevice(devicePreference);
+    loadedRuntimeDevice = fallbackDevice;
     return loadM2m100(
-      chooseDevice(devicePreference),
-      devicePreference,
+      fallbackDevice,
       SMALL100_MODEL_ID,
-      fallbackReason
+      fallbackReason,
+      fallbackFromDevice,
+      deviceFallbackReason
     );
   }
 }
@@ -473,18 +651,22 @@ async function loadSmall100(): Promise<TranslationEngine> {
 
 async function loadM2m100(
   device: RuntimeDevice,
-  preference: DevicePreference,
   fallbackFromModelId?: string,
-  fallbackReason?: string
+  fallbackReason?: string,
+  fallbackFromDevice?: RuntimeDevice,
+  deviceFallbackReason?: string
 ): Promise<TranslationEngine> {
   const options: Record<string, unknown> = {
+    revision: M2M100_REVISION,
     device,
     dtype: device === "webgpu" ? "q4f16" : "q8",
     progress_callback: createProgressCallback(
       M2M100_MODEL_ID,
       device,
       fallbackFromModelId,
-      fallbackReason
+      fallbackReason,
+      fallbackFromDevice,
+      deviceFallbackReason
     )
   };
 
@@ -496,28 +678,28 @@ async function loadM2m100(
       device,
       progress: 1,
       fallbackFromModelId,
-      fallbackReason
+      fallbackReason,
+      fallbackFromDevice,
+      deviceFallbackReason
     };
     broadcastStatus();
     return { kind: "m2m100", pipeline: loaded };
   } catch (error) {
     if (device === "webgpu") {
+      const webGpuError = friendlyError(error);
+      await discardFailedM2m100WebGpuWeights();
       status = {
-        state: "loading",
+        state: "error",
         modelId: M2M100_MODEL_ID,
-        device: "wasm",
-        progress: 0,
-        file: "WebGPU를 사용할 수 없어 WASM으로 전환 중",
+        device: "webgpu",
+        error: webGpuError,
         fallbackFromModelId,
-        fallbackReason
+        fallbackReason,
+        fallbackFromDevice: "webgpu",
+        deviceFallbackReason: webGpuError
       };
       broadcastStatus();
-      return loadM2m100(
-        "wasm",
-        preference,
-        fallbackFromModelId,
-        fallbackReason
-      );
+      throw new WebGpuFallbackRequiredError(webGpuError);
     }
     enginePromise = null;
     const message = friendlyError(error);
@@ -527,10 +709,26 @@ async function loadM2m100(
       device,
       error: message,
       fallbackFromModelId,
-      fallbackReason
+      fallbackReason,
+      fallbackFromDevice,
+      deviceFallbackReason
     };
     broadcastStatus();
     throw error;
+  }
+}
+
+async function discardFailedM2m100WebGpuWeights(): Promise<void> {
+  try {
+    const cache = await caches.open("transformers-cache");
+    const requests = await cache.keys();
+    await Promise.all(
+      requests
+        .filter((request) => isM2m100WebGpuWeightUrl(request.url))
+        .map((request) => cache.delete(request))
+    );
+  } catch {
+    // Cache cleanup is best-effort and must not block the isolated WASM retry.
   }
 }
 
@@ -555,7 +753,9 @@ function createProgressCallback(
   modelId: string,
   device: RuntimeDevice,
   fallbackFromModelId?: string,
-  fallbackReason?: string
+  fallbackReason?: string,
+  fallbackFromDevice?: RuntimeDevice,
+  deviceFallbackReason?: string
 ): (progress: Record<string, unknown>) => void {
   return (progress) => {
     const fraction = getProgress(progress);
@@ -566,7 +766,9 @@ function createProgressCallback(
       progress: fraction,
       file: typeof progress.file === "string" ? progress.file : status.file,
       fallbackFromModelId,
-      fallbackReason
+      fallbackReason,
+      fallbackFromDevice,
+      deviceFallbackReason
     };
     broadcastStatus();
   };
@@ -581,20 +783,24 @@ function broadcastStatus(): void {
 }
 
 async function resetEngine(): Promise<void> {
-  if (engine?.kind === "small100") {
-    await engine.model.dispose();
-  } else if (
-    engine?.kind === "m2m100" &&
-    "dispose" in engine.pipeline &&
-    typeof engine.pipeline.dispose === "function"
-  ) {
-    await engine.pipeline.dispose();
+  try {
+    if (engine?.kind === "small100") {
+      await engine.model.dispose();
+    } else if (
+      engine?.kind === "m2m100" &&
+      "dispose" in engine.pipeline &&
+      typeof engine.pipeline.dispose === "function"
+    ) {
+      await engine.pipeline.dispose();
+    }
+  } finally {
+    engine = null;
+    enginePromise = null;
+    loadedDevicePreference = null;
+    loadedRuntimeDevice = null;
+    loadedModelPreference = null;
+    translationCache.clear();
   }
-  engine = null;
-  enginePromise = null;
-  loadedDevicePreference = null;
-  loadedModelPreference = null;
-  translationCache.clear();
   status = { state: "idle", modelId: MODEL_ID };
   broadcastStatus();
 }

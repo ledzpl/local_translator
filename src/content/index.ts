@@ -10,13 +10,20 @@ import {
   type TranslationResponse
 } from "../shared/protocol";
 import { LruCache } from "../shared/cache";
-import { captionStillMatches, joinCaptionSegments } from "../shared/captions";
 import {
-  PAGE_TRANSLATION_MAX_BLOCKS,
-  PAGE_TRANSLATION_MAX_CHARS,
-  getPageTranslationText
+  captionStillMatches,
+  captionTranslationKey,
+  joinCaptionSegments,
+  shouldRequestPendingCaption
+} from "../shared/captions";
+import {
+  getPageTranslationTexts,
+  isLikelyProsePreformatted,
+  prioritizePageTranslationCandidates
 } from "../shared/page-text";
+import { hasPrivacyConsent } from "../shared/privacy";
 import { normalizeText } from "../shared/text";
+import { isSpeechStatusFor } from "../shared/tts";
 
 declare global {
   interface Window {
@@ -209,6 +216,7 @@ class InPageTranslator {
   private speechButton: HTMLButtonElement | null = null;
   private speechPollTimer: number | null = null;
   private speechRequest = 0;
+  private speechId: string | null = null;
 
   start(): PageTranslationStatus {
     if (this.status.state === "translating") return this.getStatus();
@@ -258,36 +266,43 @@ class InPageTranslator {
   }
 
   private collectBlocks(): PageTranslationBlock[] {
-    const selector = "h1, h2, h3, h4, h5, h6, p, li, blockquote, figcaption, dd";
+    const selector =
+      "h1, h2, h3, h4, h5, h6, p, li, blockquote, figcaption, dd, pre, xmp, article > *, main > *, [role='main'] > *, [role='article'] > *";
     const blocked =
-      "nav, header, footer, aside, form, pre, code, script, style, noscript, svg, canvas, [contenteditable='true'], .html5-video-player, [data-ongeul-overlay], [data-ongeul-page-translation]";
-    const visible: PageTranslationBlock[] = [];
-    const remaining: PageTranslationBlock[] = [];
-    let totalChars = 0;
+      "nav, header, footer, aside, form, code, script, style, noscript, svg, canvas, [contenteditable='true'], .html5-video-player, [data-ongeul-overlay], [data-ongeul-page-translation]";
+    const candidates: Array<{
+      value: PageTranslationBlock;
+      sourceText: string;
+      visible: boolean;
+    }> = [];
 
     for (const element of document.querySelectorAll<HTMLElement>(selector)) {
       if (element.closest(blocked)) continue;
       if (element.querySelector(selector)) continue;
+      if (
+        element.matches("pre, xmp") &&
+        (element.querySelector("code") ||
+          !isLikelyProsePreformatted(element.textContent ?? ""))
+      ) {
+        continue;
+      }
       const style = getComputedStyle(element);
       if (style.display === "none" || style.visibility === "hidden") continue;
       const rect = element.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) continue;
-      const sourceText = getPageTranslationText(element.textContent ?? "");
-      if (!sourceText) continue;
-      if (
-        visible.length + remaining.length >= PAGE_TRANSLATION_MAX_BLOCKS ||
-        totalChars + sourceText.length > PAGE_TRANSLATION_MAX_CHARS
-      ) {
-        break;
+      const sourceTexts = getPageTranslationTexts(element.textContent ?? "");
+      const visible = rect.bottom >= 0 && rect.top <= window.innerHeight;
+      for (const sourceText of sourceTexts) {
+        candidates.push({
+          value: { element, sourceText },
+          sourceText,
+          visible
+        });
       }
-
-      const block = { element, sourceText };
-      totalChars += sourceText.length;
-      if (rect.bottom >= 0 && rect.top <= window.innerHeight) visible.push(block);
-      else remaining.push(block);
     }
 
-    return [...visible, ...remaining];
+    return prioritizePageTranslationCandidates(candidates)
+      .map((candidate) => candidate.value);
   }
 
   private async translateBlocks(
@@ -360,32 +375,43 @@ class InPageTranslator {
     this.resetSpeechButton();
     this.speechRequest += 1;
     const request = this.speechRequest;
+    const speechId = createRequestId();
+    this.speechId = speechId;
     this.speechButton = button;
     updatePageSpeechButton(button, {
       state: "loading",
       modelId: TTS_MODEL_ID,
+      speechId,
       file: "한국어 음성 모델 준비 중"
     });
     void chrome.runtime.sendMessage({
       target: "background",
       type: "SPEAK_KOREAN",
+      speechId,
       text: translation
     }).then((response: SpeakResponse | null) => {
-      if (request !== this.speechRequest || response?.ok) return;
+      if (request !== this.speechRequest) return;
+      if (response?.ok && response.speechId === speechId) {
+        this.pollSpeechStatus(request);
+        return;
+      }
       updatePageSpeechButton(button, {
         state: "error",
         modelId: TTS_MODEL_ID,
+        speechId,
         error: response?.error ?? "음성을 시작하지 못했습니다."
       });
+      this.finishSpeechRequest(request, speechId);
     }).catch((error) => {
       if (request !== this.speechRequest) return;
       updatePageSpeechButton(button, {
         state: "error",
         modelId: TTS_MODEL_ID,
+        speechId,
         error: error instanceof Error ? error.message : String(error)
       });
+      this.finishSpeechRequest(request, speechId);
     });
-    this.pollSpeechStatus(request);
   }
 
   private pollSpeechStatus(request: number): void {
@@ -398,13 +424,19 @@ class InPageTranslator {
           type: "GET_TTS_STATUS"
         }) as TtsStatus | null;
         if (request !== this.speechRequest || !this.speechButton) return;
-        if (status?.state) updatePageSpeechButton(this.speechButton, status);
+        if (!status || !isSpeechStatusFor(status, this.speechId)) {
+          this.resetSpeechButton();
+          return;
+        }
+        updatePageSpeechButton(this.speechButton, status);
         if (!status || status.state === "idle") {
           this.resetSpeechButton();
           return;
         }
         if (status.state === "error") {
           this.speechPollTimer = null;
+          this.speechButton = null;
+          this.speechId = null;
           return;
         }
       } catch {
@@ -416,16 +448,40 @@ class InPageTranslator {
   }
 
   private stopActiveSpeech(): void {
-    const wasActive = Boolean(this.speechButton);
+    const button = this.speechButton;
+    const speechId = this.speechId;
+    const wasActive = Boolean(
+      button &&
+      speechId &&
+      isActiveTtsButton(button)
+    );
     this.speechRequest += 1;
     if (this.speechPollTimer) window.clearTimeout(this.speechPollTimer);
     this.speechPollTimer = null;
     this.resetSpeechButton();
-    if (wasActive) {
+    if (wasActive && speechId) {
       void chrome.runtime.sendMessage({
         target: "background",
-        type: "STOP_SPEAKING"
-      }).catch(() => undefined);
+        type: "STOP_SPEAKING",
+        speechId
+      }).then((response: SpeakResponse | null) => {
+        if (!response?.ok && button?.isConnected) {
+          updatePageSpeechButton(button, {
+            state: "error",
+            modelId: TTS_MODEL_ID,
+            speechId,
+            error: response?.error ?? "음성을 정지하지 못했습니다."
+          });
+        }
+      }).catch((error) => {
+        if (!button?.isConnected) return;
+        updatePageSpeechButton(button, {
+          state: "error",
+          modelId: TTS_MODEL_ID,
+          speechId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
     }
   }
 
@@ -437,6 +493,15 @@ class InPageTranslator {
       });
     }
     this.speechButton = null;
+    this.speechId = null;
+  }
+
+  private finishSpeechRequest(request: number, speechId: string): void {
+    if (request !== this.speechRequest || this.speechId !== speechId) return;
+    if (this.speechPollTimer) window.clearTimeout(this.speechPollTimer);
+    this.speechPollTimer = null;
+    this.speechButton = null;
+    this.speechId = null;
   }
 
   private ensureToolbar(): void {
@@ -510,17 +575,25 @@ class YouTubeCaptionTranslator {
   private settings: ExtensionSettings = { ...DEFAULT_SETTINGS };
   private observer: MutationObserver | null = null;
   private debounceTimer: number | null = null;
-  private lastRequested = "";
+  private retryTimer: number | null = null;
+  private lastRequestedKey = "";
   private currentCaption = "";
   private pendingCaption = "";
   private translationInFlight = false;
+  private settingsGeneration = 0;
   private navigationUrl = location.href;
   private readonly cache = new LruCache<string>(180);
+  private readonly retryAttempts = new Map<string, number>();
 
   constructor(private readonly view: OverlayView) {}
 
   start(): void {
     void this.loadSettings().then(() => {
+      if (!hasPrivacyConsent(this.settings)) {
+        this.view.hideSubtitle();
+        this.applyOriginalCaptionVisibility(false);
+        return;
+      }
       this.observe();
       this.maybeEnableCaptions();
       this.scan();
@@ -528,22 +601,39 @@ class YouTubeCaptionTranslator {
 
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== "sync") return;
+      const previousTranslationSettings =
+        `${this.settings.modelPreference}\u0000${this.settings.devicePreference}`;
+      const wasEnabled = this.settings.youtubeEnabled;
       for (const key of Object.keys(DEFAULT_SETTINGS) as Array<keyof ExtensionSettings>) {
         if (changes[key]?.newValue !== undefined) {
           Object.assign(this.settings, { [key]: changes[key]?.newValue });
         }
       }
+      const nextTranslationSettings =
+        `${this.settings.modelPreference}\u0000${this.settings.devicePreference}`;
+      if (previousTranslationSettings !== nextTranslationSettings) {
+        this.invalidateTranslations();
+      } else if (wasEnabled !== this.settings.youtubeEnabled) {
+        this.lastRequestedKey = "";
+      }
       this.applyOriginalCaptionVisibility();
-      if (!this.settings.youtubeEnabled) this.view.hideSubtitle();
-      else this.scan();
+      if (!hasPrivacyConsent(this.settings) || !this.settings.youtubeEnabled) {
+        this.settingsGeneration += 1;
+        this.view.hideSubtitle();
+        return;
+      }
+      this.observe();
+      this.maybeEnableCaptions();
+      this.scan();
     });
 
     window.setInterval(() => {
       if (this.navigationUrl === location.href) return;
       this.navigationUrl = location.href;
-      this.lastRequested = "";
+      this.lastRequestedKey = "";
       this.currentCaption = "";
       this.pendingCaption = "";
+      this.clearRetry();
       this.view.hideSubtitle();
       this.applyOriginalCaptionVisibility(false);
       this.maybeEnableCaptions();
@@ -579,7 +669,7 @@ class YouTubeCaptionTranslator {
   }
 
   private scan(): void {
-    if (!this.settings.youtubeEnabled) return;
+    if (!hasPrivacyConsent(this.settings) || !this.settings.youtubeEnabled) return;
     this.applyOriginalCaptionVisibility(false);
     const text = readVisibleYoutubeCaption();
     this.currentCaption = text;
@@ -588,7 +678,8 @@ class YouTubeCaptionTranslator {
       return;
     }
 
-    const cached = this.cache.get(text);
+    const requestKey = captionTranslationKey(text, this.settings);
+    const cached = this.cache.get(requestKey);
     if (cached) {
       this.view.showSubtitle(cached, this.settings);
       this.applyOriginalCaptionVisibility(true);
@@ -599,13 +690,17 @@ class YouTubeCaptionTranslator {
       this.pendingCaption = text;
       return;
     }
-    if (text === this.lastRequested) return;
-    this.lastRequested = text;
-    void this.requestTranslation(text);
+    if (requestKey === this.lastRequestedKey) return;
+    this.lastRequestedKey = requestKey;
+    void this.requestTranslation(text, requestKey);
   }
 
-  private async requestTranslation(sourceText: string): Promise<void> {
+  private async requestTranslation(
+    sourceText: string,
+    requestKey: string
+  ): Promise<void> {
     this.translationInFlight = true;
+    const generation = this.settingsGeneration;
     try {
       const response = await chrome.runtime.sendMessage({
         target: "background",
@@ -614,26 +709,99 @@ class YouTubeCaptionTranslator {
         text: sourceText,
         sourceLanguage: "auto",
         origin: "youtube"
-      });
-      if (!response?.ok) return;
-      this.cache.set(sourceText, response.translation);
+      }) as TranslationResponse;
+      if (
+        generation !== this.settingsGeneration ||
+        requestKey !== captionTranslationKey(sourceText, this.settings)
+      ) {
+        return;
+      }
+      if (!response?.ok) {
+        this.scheduleRetry(sourceText, requestKey, generation);
+        return;
+      }
+      this.retryAttempts.delete(requestKey);
+      this.cache.set(requestKey, response.translation);
       if (captionStillMatches(this.currentCaption, sourceText)) {
         this.view.showSubtitle(response.translation, this.settings);
         this.applyOriginalCaptionVisibility(true);
       }
+    } catch {
+      this.scheduleRetry(sourceText, requestKey, generation);
     } finally {
       this.translationInFlight = false;
       const pending = this.pendingCaption;
       this.pendingCaption = "";
-      if (pending && pending !== sourceText && pending === this.currentCaption) {
-        this.lastRequested = pending;
-        void this.requestTranslation(pending);
+      const currentRequestKey = pending
+        ? captionTranslationKey(pending, this.settings)
+        : "";
+      if (shouldRequestPendingCaption({
+        pendingCaption: pending,
+        currentCaption: this.currentCaption,
+        sourceText,
+        requestKey,
+        currentRequestKey,
+        generationChanged: generation !== this.settingsGeneration
+      })) {
+        this.lastRequestedKey = "";
+        this.scan();
       }
     }
   }
 
+  private scheduleRetry(
+    sourceText: string,
+    requestKey: string,
+    generation: number
+  ): void {
+    if (
+      generation !== this.settingsGeneration ||
+      !captionStillMatches(this.currentCaption, sourceText)
+    ) {
+      return;
+    }
+    const attempts = (this.retryAttempts.get(requestKey) ?? 0) + 1;
+    this.retryAttempts.set(requestKey, attempts);
+    if (attempts > 2) return;
+
+    this.lastRequestedKey = "";
+    this.clearRetry();
+    this.retryTimer = window.setTimeout(() => {
+      this.retryTimer = null;
+      if (
+        generation === this.settingsGeneration &&
+        captionStillMatches(this.currentCaption, sourceText)
+      ) {
+        this.scan();
+      }
+    }, attempts * 800);
+  }
+
+  private invalidateTranslations(): void {
+    this.settingsGeneration += 1;
+    this.cache.clear();
+    this.retryAttempts.clear();
+    this.lastRequestedKey = "";
+    this.pendingCaption = "";
+    this.clearRetry();
+    this.view.hideSubtitle();
+  }
+
+  private clearRetry(): void {
+    if (this.retryTimer !== null) {
+      window.clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+  }
+
   private maybeEnableCaptions(): void {
-    if (!this.settings.youtubeEnabled || !this.settings.autoEnableCaptions) return;
+    if (
+      !hasPrivacyConsent(this.settings) ||
+      !this.settings.youtubeEnabled ||
+      !this.settings.autoEnableCaptions
+    ) {
+      return;
+    }
     window.setTimeout(() => {
       const button = document.querySelector<HTMLButtonElement>(".ytp-subtitles-button");
       if (button && button.getAttribute("aria-pressed") === "false") button.click();
@@ -642,6 +810,7 @@ class YouTubeCaptionTranslator {
 
   private applyOriginalCaptionVisibility(hasTranslation = false): void {
     const opacity =
+      hasPrivacyConsent(this.settings) &&
       this.settings.youtubeEnabled &&
       !this.settings.showOriginalCaptions &&
       hasTranslation

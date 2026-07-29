@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>온글 번역 개인정보처리방침</title>
+    <link rel="stylesheet" href="/privacy.css" />
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">ONGEUL · PRIVACY</p>
+      <h1>온글 번역 개인정보처리방침</h1>
+      <p>시행일: 2026년 7월 29일</p>
+
+      <h2>처리하는 데이터</h2>
+      <p>온글 번역은 사용자가 기능을 켜거나 직접 요청한 경우에만 직접 입력한 텍스트, 선택한 텍스트, 현재 페이지 본문, 화면에 표시되는 YouTube 자막과 듣기를 요청한 한국어 번역을 일시적으로 처리합니다.</p>
+      <p>이 내용은 한국어 번역과 음성 생성에만 사용됩니다. 개발자는 이를 수집하거나 열람하지 않으며 분석·광고·프로파일링에 사용하지 않습니다.</p>
+
+      <h2>로컬 처리와 네트워크 연결</h2>
+      <p>번역과 음성 생성은 사용자의 기기 안에서 실행됩니다. 번역할 내용과 결과는 개발자 서버, Hugging Face 또는 다른 제3자에게 전송되지 않습니다.</p>
+      <p>처음 사용할 때 HTTPS로 Hugging Face에서 모델 설정·토크나이저·가중치 파일을 내려받습니다. 다운로드 요청에는 번역할 내용이 포함되지 않습니다. 이때 IP 주소와 일반적인 HTTP 요청 정보에는 <a href="https://huggingface.co/privacy" target="_blank" rel="noreferrer">Hugging Face 개인정보처리방침</a>이 적용됩니다.</p>
+      <p>원격 JavaScript나 WASM 코드는 내려받아 실행하지 않습니다.</p>
+
+      <h2>저장과 보관</h2>
+      <ul>
+        <li>번역 모델은 경로별 약 650~750MB이며, WebGPU 자동 전환 시 최초 전송량이 최대 약 1.4GB가 될 수 있습니다.</li>
+        <li>모델 파일은 Chrome의 확장 프로그램 전용 캐시에 저장되며, 자동 전환 시 실패한 WebGPU 가중치는 정리합니다.</li>
+        <li>번역 결과 캐시는 실행 중 메모리에만 있으며 영구 저장하지 않습니다.</li>
+        <li>안내 확인 버전과 모델·언어·자막 설정은 Chrome 동기화 저장소에 보관될 수 있습니다.</li>
+        <li>페이지 내용, 선택 텍스트, 자막, 번역 결과와 음성은 동기화 저장소에 보관하지 않습니다.</li>
+      </ul>
+
+      <h2>사용자 선택과 삭제</h2>
+      <p>YouTube 자막 번역과 자동 켜기는 기본적으로 꺼져 있습니다. 팝업에서 기능을 끄고, 페이지 번역과 음성을 중지하거나 삭제할 수 있습니다. 확장 프로그램을 삭제하면 기기의 확장 데이터와 모델 캐시를 제거할 수 있고, 동기화 설정은 Chrome 동기화 관리 화면에서 관리할 수 있습니다.</p>
+
+      <h2>데이터 공유와 Limited Use</h2>
+      <p>사용자 데이터를 판매하거나 광고 사업자·데이터 브로커 등 제3자에게 공유하지 않습니다. Chrome API에서 받은 정보의 사용은 Chrome Web Store User Data Policy의 Limited Use 요건을 준수합니다.</p>
+
+      <h2>방침 변경과 문의</h2>
+      <p>데이터 처리 방식이 바뀌면 시행 전에 확장 UI와 이 문서에서 알리고 필요한 경우 다시 확인을 받습니다. 문의는 <a href="https://github.com/ledzpl/local_translator/issues" target="_blank" rel="noreferrer">프로젝트 GitHub Issues</a>에서 접수합니다.</p>
+    </main>
+  </body>
+</html>

@@ -22,10 +22,19 @@ import {
   normalizeLanguageCode,
   pickDetectedLanguage
 } from "../shared/languages";
+import { hasPrivacyConsent } from "../shared/privacy";
+import { SerialTaskQueue } from "../shared/serial-queue";
 import { friendlyError, normalizeText } from "../shared/text";
+import { shouldMarkSpeechIdle } from "../shared/tts";
 
 let creatingOffscreen: Promise<void> | null = null;
+let recoveringOffscreen: Promise<void> | null = null;
+let wasmFallbackOffscreenReady = false;
 let ttsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
+const translationRequests = new SerialTaskQueue();
+const speechStarts = new Map<string, Promise<SpeakResponse>>();
+let latestSpeechStartId: string | null = null;
+const WEBGPU_FALLBACK_REASON_KEY = "runtimeWebGpuFallbackReason";
 
 chrome.runtime.onInstalled.addListener(() => {
   void chrome.contextMenus.removeAll().then(() => {
@@ -38,17 +47,23 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
-  if (info.menuItemId !== CONTEXT_MENU_ID || !tab?.id || !info.selectionText) return;
-  void translateAndDisplay(tab.id, info.selectionText, "selection");
+  const tabId = tab?.id;
+  if (info.menuItemId !== CONTEXT_MENU_ID || typeof tabId !== "number") return;
+  void (async () => {
+    if (!await hasStoredPrivacyConsent() || !info.selectionText) return;
+    await translateAndDisplay(tabId, info.selectionText, "selection");
+  })();
 });
 
 chrome.commands.onCommand.addListener((command) => {
   if (command !== "translate-selection") return;
-  void chrome.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => {
+  void (async () => {
+    if (!await hasStoredPrivacyConsent()) return;
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) return;
     const text = await getSelectionFromTab(tab.id);
     if (text) await translateAndDisplay(tab.id, text, "selection");
-  });
+  })();
 });
 
 chrome.runtime.onMessage.addListener(
@@ -59,6 +74,7 @@ chrome.runtime.onMessage.addListener(
   ): boolean | undefined => {
     if (!message) return undefined;
     if (message.target === "ui" && message.type === "TTS_PROGRESS") {
+      if (recoveringOffscreen) return undefined;
       ttsStatus = message.status;
       return undefined;
     }
@@ -67,12 +83,7 @@ chrome.runtime.onMessage.addListener(
     void handleBackgroundMessage(message)
       .then(sendResponse)
       .catch((error) => {
-        sendResponse({
-          ok: false,
-          requestId: "unknown",
-          code: "TRANSLATION_FAILED",
-          error: friendlyError(error)
-        } satisfies TranslationResponse);
+        sendResponse(createBackgroundErrorResponse(message, error));
       });
     return true;
   }
@@ -91,6 +102,10 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
         } satisfies TranslationResponse;
       }
 
+      const settings = await getSettings();
+      if (!hasPrivacyConsent(settings)) {
+        return consentRequiredTranslation(message.requestId);
+      }
       const sourceLanguage = await resolveSourceLanguage(text, message.sourceLanguage);
       if (sourceLanguage === "ko") {
         return {
@@ -103,45 +118,47 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
         } satisfies TranslationResponse;
       }
 
-      const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS) as ExtensionSettings;
-      return sendToOffscreen({
-        target: "offscreen",
-        type: "TRANSLATE_OFFSCREEN",
-        requestId: message.requestId,
-        text,
-        sourceLanguage,
-        modelPreference: settings.modelPreference,
-        devicePreference: settings.devicePreference,
-        origin: message.origin
-      });
+      return translationRequests.run(() =>
+        translateWithDeviceRecovery({
+          target: "offscreen",
+          type: "TRANSLATE_OFFSCREEN",
+          requestId: message.requestId,
+          text,
+          sourceLanguage,
+          modelPreference: settings.modelPreference,
+          devicePreference: settings.devicePreference,
+          origin: message.origin
+        })
+      );
     }
     case "GET_ACTIVE_SELECTION": {
+      if (!hasPrivacyConsent(await getSettings())) return { text: "" };
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (!tab?.id) return { text: "" };
       return { text: await getSelectionFromTab(tab.id) };
     }
     case "SPEAK_KOREAN": {
-      const text = normalizeText(message.text);
-      if (!text) {
-        return {
-          ok: false,
-          error: "읽어줄 한국어 번역이 없습니다."
-        } satisfies SpeakResponse;
+      latestSpeechStartId = message.speechId;
+      const start = startKoreanSpeech(message);
+      speechStarts.set(message.speechId, start);
+      try {
+        return await start;
+      } finally {
+        if (speechStarts.get(message.speechId) === start) {
+          speechStarts.delete(message.speechId);
+        }
       }
-      ttsStatus = {
-        state: "loading",
-        modelId: TTS_MODEL_ID,
-        progress: 0,
-        file: "한국어 음성 모델 준비 중"
-      };
-      await sendToOffscreen({
-        target: "offscreen",
-        type: "SPEAK_KOREAN_OFFSCREEN",
-        text
-      });
-      return { ok: true } satisfies SpeakResponse;
     }
     case "START_PAGE_TRANSLATION":
+      if (!hasPrivacyConsent(await getSettings())) {
+        return {
+          state: "error",
+          total: 0,
+          completed: 0,
+          failed: 0,
+          error: "팝업에서 데이터 처리 안내를 확인한 뒤 사용할 수 있습니다."
+        } satisfies PageTranslationStatus;
+      }
       return sendPageCommand("START_PAGE_TRANSLATION");
     case "GET_PAGE_TRANSLATION_STATUS":
       return sendPageCommand("GET_PAGE_TRANSLATION_STATUS");
@@ -161,20 +178,322 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
           modelId: MODEL_ID
         } satisfies EngineStatus;
       }
-    case "GET_TTS_STATUS":
-      return ttsStatus;
-    case "STOP_SPEAKING":
-      ttsStatus = { state: "idle", modelId: TTS_MODEL_ID };
-      await sendToOffscreen({
+    case "GET_TTS_STATUS": {
+      const liveStatus = await sendToExistingOffscreen({
         target: "offscreen",
-        type: "STOP_SPEAKING_OFFSCREEN"
+        type: "GET_TTS_STATUS_OFFSCREEN"
       });
-      return { ok: true } satisfies SpeakResponse;
+      if (isTtsStatus(liveStatus)) ttsStatus = liveStatus;
+      return ttsStatus;
+    }
+    case "STOP_SPEAKING": {
+      try {
+        const cancelledPendingStart =
+          latestSpeechStartId === message.speechId &&
+          speechStarts.has(message.speechId);
+        if (latestSpeechStartId === message.speechId) {
+          latestSpeechStartId = null;
+        }
+        await speechStarts.get(message.speechId);
+        const liveResponse = await sendToExistingOffscreen({
+          target: "offscreen",
+          type: "STOP_SPEAKING_OFFSCREEN",
+          speechId: message.speechId
+        });
+        const response: SpeakResponse = liveResponse === null
+          ? {
+              ok: true,
+              speechId: message.speechId,
+              stopped: false
+            }
+          : isSpeakResponse(liveResponse) &&
+              liveResponse.speechId === message.speechId
+            ? liveResponse
+            : {
+                ok: false,
+                speechId: message.speechId,
+                error: "한국어 음성 엔진의 정지 응답이 올바르지 않습니다."
+              };
+
+        const stoppedCurrentSpeech = shouldMarkSpeechIdle(
+          ttsStatus.speechId,
+          message.speechId,
+          liveResponse !== null,
+          response.ok &&
+            (response.stopped === true || cancelledPendingStart)
+        );
+        if (stoppedCurrentSpeech) {
+          ttsStatus = {
+            state: "idle",
+            modelId: TTS_MODEL_ID,
+            speechId: message.speechId
+          };
+          broadcastTtsStatus();
+        }
+        return response;
+      } catch (error) {
+        const errorMessage = friendlyError(error);
+        if (ttsStatus.speechId === message.speechId) {
+          ttsStatus = {
+            state: "error",
+            modelId: TTS_MODEL_ID,
+            speechId: message.speechId,
+            error: errorMessage
+          };
+          broadcastTtsStatus();
+        }
+        return {
+          ok: false,
+          speechId: message.speechId,
+          error: errorMessage
+        } satisfies SpeakResponse;
+      }
+    }
     case "RESET_ENGINE":
+      await clearWebGpuFallback();
       return sendToOffscreen({
         target: "offscreen",
         type: "RESET_ENGINE_OFFSCREEN"
       });
+  }
+}
+
+async function translateWithDeviceRecovery(
+  request: Extract<OffscreenMessage, { type: "TRANSLATE_OFFSCREEN" }>
+): Promise<TranslationResponse> {
+  const storedFallbackReason = await getStoredWebGpuFallbackReason();
+  if (storedFallbackReason && !wasmFallbackOffscreenReady) {
+    await prepareStoredWasmFallbackDocument();
+  }
+
+  const firstRequest =
+    storedFallbackReason && request.devicePreference !== "wasm"
+      ? {
+          ...request,
+          runtimeDeviceOverride: "wasm" as const,
+          fallbackFromDevice: "webgpu" as const,
+          deviceFallbackReason: storedFallbackReason
+        }
+      : request;
+
+  try {
+    const response = await sendToOffscreen(firstRequest) as TranslationResponse;
+    if (
+      !isDeviceFallbackRequired(response) ||
+      request.devicePreference === "wasm"
+    ) {
+      return response;
+    }
+
+    await recreateOffscreenDocumentForWasm(response.error);
+    return sendToOffscreen({
+      ...request,
+      runtimeDeviceOverride: "wasm",
+      fallbackFromDevice: "webgpu",
+      deviceFallbackReason: response.error
+    }) as Promise<TranslationResponse>;
+  } catch (error) {
+    const recoveryReason = await getStoredWebGpuFallbackReason();
+    if (!recoveryReason || request.devicePreference === "wasm") throw error;
+    if (!wasmFallbackOffscreenReady) {
+      await recreateOffscreenDocumentForWasm();
+    }
+    return sendToOffscreen({
+      ...request,
+      runtimeDeviceOverride: "wasm",
+      fallbackFromDevice: "webgpu",
+      deviceFallbackReason: recoveryReason
+    }) as Promise<TranslationResponse>;
+  }
+}
+
+function isDeviceFallbackRequired(
+  response: TranslationResponse
+): response is Extract<TranslationResponse, { ok: false }> {
+  return !response.ok && response.code === "DEVICE_FALLBACK_REQUIRED";
+}
+
+async function getStoredWebGpuFallbackReason(): Promise<string | null> {
+  const stored = await chrome.storage.session.get(WEBGPU_FALLBACK_REASON_KEY);
+  const value = stored[WEBGPU_FALLBACK_REASON_KEY];
+  return typeof value === "string" && value ? value : null;
+}
+
+async function clearWebGpuFallback(): Promise<void> {
+  if (recoveringOffscreen) await recoveringOffscreen;
+  wasmFallbackOffscreenReady = false;
+  await chrome.storage.session.remove(WEBGPU_FALLBACK_REASON_KEY);
+}
+
+async function getSettings(): Promise<ExtensionSettings> {
+  return chrome.storage.sync.get(DEFAULT_SETTINGS) as Promise<ExtensionSettings>;
+}
+
+async function hasStoredPrivacyConsent(): Promise<boolean> {
+  try {
+    return hasPrivacyConsent(await getSettings());
+  } catch {
+    return false;
+  }
+}
+
+async function startKoreanSpeech(
+  message: Extract<BackgroundMessage, { type: "SPEAK_KOREAN" }>
+): Promise<SpeakResponse> {
+  const settings = await getSettings();
+  if (latestSpeechStartId !== message.speechId) {
+    return {
+      ok: true,
+      speechId: message.speechId,
+      stopped: false
+    };
+  }
+  if (!hasPrivacyConsent(settings)) {
+    return {
+      ok: false,
+      speechId: message.speechId,
+      error: "팝업에서 데이터 처리 안내를 확인한 뒤 사용할 수 있습니다."
+    };
+  }
+  const text = normalizeText(message.text);
+  if (!text) {
+    return {
+      ok: false,
+      speechId: message.speechId,
+      error: "읽어줄 한국어 번역이 없습니다."
+    };
+  }
+  ttsStatus = {
+    state: "loading",
+    modelId: TTS_MODEL_ID,
+    speechId: message.speechId,
+    progress: 0,
+    file: "한국어 음성 모델 준비 중"
+  };
+  try {
+    const response = await sendToOffscreen({
+      target: "offscreen",
+      type: "SPEAK_KOREAN_OFFSCREEN",
+      speechId: message.speechId,
+      text
+    }, () => latestSpeechStartId === message.speechId);
+    if (response === null) {
+      return {
+        ok: true,
+        speechId: message.speechId,
+        stopped: false
+      };
+    }
+    if (!isSpeakResponse(response) || response.speechId !== message.speechId) {
+      throw new Error("한국어 음성 엔진의 시작 응답이 올바르지 않습니다.");
+    }
+    return response;
+  } catch (error) {
+    if (latestSpeechStartId !== message.speechId) {
+      return {
+        ok: true,
+        speechId: message.speechId,
+        stopped: false
+      };
+    }
+    ttsStatus = {
+      state: "error",
+      modelId: TTS_MODEL_ID,
+      speechId: message.speechId,
+      error: friendlyError(error)
+    };
+    broadcastTtsStatus();
+    return {
+      ok: false,
+      speechId: message.speechId,
+      error: ttsStatus.error
+    };
+  }
+}
+
+function consentRequiredTranslation(requestId: string): TranslationResponse {
+  return {
+    ok: false,
+    requestId,
+    code: "CONSENT_REQUIRED",
+    error: "팝업에서 데이터 처리 안내를 확인한 뒤 번역할 수 있습니다."
+  };
+}
+
+function isTtsStatus(value: unknown): value is TtsStatus {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    "state" in value &&
+    "modelId" in value
+  );
+}
+
+function isSpeakResponse(value: unknown): value is SpeakResponse {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    "ok" in value &&
+    typeof value.ok === "boolean" &&
+    "speechId" in value &&
+    typeof value.speechId === "string"
+  );
+}
+
+function broadcastTtsStatus(): void {
+  void chrome.runtime.sendMessage({
+    target: "ui",
+    type: "TTS_PROGRESS",
+    status: ttsStatus
+  }).catch(() => undefined);
+}
+
+function createBackgroundErrorResponse(
+  message: BackgroundMessage,
+  error: unknown
+): unknown {
+  const errorMessage = friendlyError(error);
+  switch (message.type) {
+    case "TRANSLATE":
+      return {
+        ok: false,
+        requestId: message.requestId,
+        code: "TRANSLATION_FAILED",
+        error: errorMessage
+      } satisfies TranslationResponse;
+    case "SPEAK_KOREAN":
+    case "STOP_SPEAKING":
+      return {
+        ok: false,
+        speechId: message.speechId,
+        error: errorMessage
+      } satisfies SpeakResponse;
+    case "START_PAGE_TRANSLATION":
+    case "GET_PAGE_TRANSLATION_STATUS":
+    case "STOP_PAGE_TRANSLATION":
+    case "RESTORE_PAGE_TRANSLATION":
+      return {
+        state: "error",
+        total: 0,
+        completed: 0,
+        failed: 0,
+        error: errorMessage
+      } satisfies PageTranslationStatus;
+    case "GET_ENGINE_STATUS":
+    case "RESET_ENGINE":
+      return {
+        state: "error",
+        modelId: MODEL_ID,
+        error: errorMessage
+      } satisfies EngineStatus;
+    case "GET_TTS_STATUS":
+      return {
+        state: "error",
+        modelId: TTS_MODEL_ID,
+        error: errorMessage
+      } satisfies TtsStatus;
+    case "GET_ACTIVE_SELECTION":
+      return { text: "" };
   }
 }
 
@@ -250,8 +569,103 @@ async function ensureOffscreenDocument(): Promise<void> {
   await creatingOffscreen;
 }
 
-async function sendToOffscreen(message: OffscreenMessage): Promise<unknown> {
-  await ensureOffscreenDocument();
+async function prepareStoredWasmFallbackDocument(): Promise<void> {
+  try {
+    const liveStatus = await sendToExistingOffscreen({
+      target: "offscreen",
+      type: "GET_ENGINE_STATUS_OFFSCREEN"
+    });
+    if (
+      liveStatus === null ||
+      isReusableForStoredWasmFallback(liveStatus)
+    ) {
+      wasmFallbackOffscreenReady = true;
+      return;
+    }
+  } catch {
+    // An unreachable or failed WebGPU realm must be recreated below.
+  }
+  await recreateOffscreenDocumentForWasm();
+}
+
+function isReusableForStoredWasmFallback(value: unknown): boolean {
+  if (!value || typeof value !== "object" || !("state" in value)) return false;
+  const candidate = value as Partial<EngineStatus>;
+  if (candidate.state === "idle") return true;
+  return candidate.device === "wasm" && candidate.state !== "error";
+}
+
+async function recreateOffscreenDocumentForWasm(
+  fallbackReason?: string
+): Promise<void> {
+  if (!recoveringOffscreen) {
+    wasmFallbackOffscreenReady = false;
+    recoveringOffscreen = (async () => {
+      if (fallbackReason) {
+        await chrome.storage.session.set({
+          [WEBGPU_FALLBACK_REASON_KEY]: fallbackReason
+        });
+      }
+      if (creatingOffscreen) {
+        await creatingOffscreen.catch(() => undefined);
+      }
+
+      latestSpeechStartId = null;
+      speechStarts.clear();
+      ttsStatus = {
+        state: "idle",
+        modelId: TTS_MODEL_ID,
+        speechId: ttsStatus.speechId
+      };
+      broadcastTtsStatus();
+
+      const url = chrome.runtime.getURL(OFFSCREEN_PATH);
+      const existing = await chrome.runtime.getContexts({
+        contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT],
+        documentUrls: [url]
+      });
+      if (existing.length > 0) {
+        await chrome.offscreen.closeDocument();
+      }
+
+      creatingOffscreen = null;
+      await ensureOffscreenDocument();
+      wasmFallbackOffscreenReady = true;
+    })().finally(() => {
+      recoveringOffscreen = null;
+    });
+  }
+  await recoveringOffscreen;
+}
+
+async function sendToOffscreen(message: OffscreenMessage): Promise<unknown>;
+async function sendToOffscreen(
+  message: OffscreenMessage,
+  shouldSend: () => boolean
+): Promise<unknown | null>;
+async function sendToOffscreen(
+  message: OffscreenMessage,
+  shouldSend?: () => boolean
+): Promise<unknown | null> {
+  while (true) {
+    if (recoveringOffscreen) await recoveringOffscreen;
+    await ensureOffscreenDocument();
+    if (recoveringOffscreen) continue;
+    if (shouldSend && !shouldSend()) return null;
+    return chrome.runtime.sendMessage(message);
+  }
+}
+
+async function sendToExistingOffscreen(
+  message: OffscreenMessage
+): Promise<unknown | null> {
+  if (recoveringOffscreen) await recoveringOffscreen;
+  const url = chrome.runtime.getURL(OFFSCREEN_PATH);
+  const existing = await chrome.runtime.getContexts({
+    contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT],
+    documentUrls: [url]
+  });
+  if (existing.length === 0) return null;
   return chrome.runtime.sendMessage(message);
 }
 
@@ -297,6 +711,7 @@ async function translateAndDisplay(
   sourceText: string,
   origin: TranslationOrigin
 ): Promise<void> {
+  if (!await hasStoredPrivacyConsent()) return;
   try {
     await ensureContentScript(tabId);
     await chrome.tabs.sendMessage(tabId, {

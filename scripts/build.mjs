@@ -17,7 +17,7 @@ await esbuild({
   platform: "browser",
   target: "chrome116",
   outfile: join(dist, "background.js"),
-  sourcemap: true
+  sourcemap: false
 });
 
 await esbuild({
@@ -27,7 +27,7 @@ await esbuild({
   platform: "browser",
   target: "chrome116",
   outfile: join(dist, "content.js"),
-  sourcemap: true
+  sourcemap: false
 });
 
 const ortDist = join(root, "node_modules/onnxruntime-web/dist");
@@ -50,20 +50,71 @@ await Promise.all(
   )
 );
 
+const licenseDist = join(dist, "LICENSES");
+await mkdir(licenseDist, { recursive: true });
+await Promise.all([
+  cp(join(root, "PRIVACY_POLICY.md"), join(dist, "PRIVACY_POLICY.md")),
+  cp(join(root, "THIRD_PARTY_NOTICES.md"), join(dist, "THIRD_PARTY_NOTICES.md")),
+  cp(
+    join(root, "node_modules/@huggingface/transformers/LICENSE"),
+    join(licenseDist, "transformers-js-Apache-2.0.txt")
+  ),
+  cp(
+    join(root, "LICENSES/onnxruntime-MIT.txt"),
+    join(licenseDist, "onnxruntime-MIT.txt")
+  ),
+  cp(
+    join(root, "node_modules/@huggingface/jinja/LICENSE"),
+    join(licenseDist, "huggingface-jinja-MIT.txt")
+  ),
+  cp(
+    join(root, "node_modules/flatbuffers/LICENSE"),
+    join(licenseDist, "flatbuffers-Apache-2.0.txt")
+  ),
+  cp(
+    join(root, "LICENSES/guid-typescript-ISC.txt"),
+    join(licenseDist, "guid-typescript-ISC.txt")
+  ),
+  cp(
+    join(root, "node_modules/long/LICENSE"),
+    join(licenseDist, "long-Apache-2.0.txt")
+  ),
+  cp(
+    join(root, "node_modules/platform/LICENSE"),
+    join(licenseDist, "platform-MIT.txt")
+  ),
+  cp(
+    join(root, "node_modules/protobufjs/LICENSE"),
+    join(licenseDist, "protobufjs-and-helpers-BSD-3-Clause.txt")
+  )
+]);
+
 console.log(`Built Chrome extension at ${dist}`);
 
 function createIconPng(size) {
   const pixels = Buffer.alloc(size * size * 4);
-  const radius = size * 0.23;
+  const padding = Math.max(1, Math.round(size * 0.125));
+  const artworkSize = size - padding * 2;
+  const radius = artworkSize * 0.23;
   const center = (size - 1) / 2;
-  const ringRadius = size * 0.255;
-  const ringWidth = Math.max(1.5, size * 0.095);
+  const ringRadius = artworkSize * 0.255;
+  const ringWidth = Math.max(1.5, artworkSize * 0.095);
 
   for (let y = 0; y < size; y += 1) {
     for (let x = 0; x < size; x += 1) {
+      const localX = x - padding;
+      const localY = y - padding;
+      if (
+        localX < 0 ||
+        localY < 0 ||
+        localX >= artworkSize ||
+        localY >= artworkSize
+      ) {
+        continue;
+      }
       const index = (y * size + x) * 4;
-      const edgeX = Math.min(x, size - 1 - x);
-      const edgeY = Math.min(y, size - 1 - y);
+      const edgeX = Math.min(localX, artworkSize - 1 - localX);
+      const edgeY = Math.min(localY, artworkSize - 1 - localY);
       const cornerX = Math.max(0, radius - edgeX);
       const cornerY = Math.max(0, radius - edgeY);
       const inside = cornerX * cornerX + cornerY * cornerY <= radius * radius;
@@ -71,8 +122,11 @@ function createIconPng(size) {
 
       const distance = Math.hypot(x - center, y - center);
       const inRing = Math.abs(distance - ringRadius) <= ringWidth / 2;
-      const dotDistance = Math.hypot(x - size * 0.76, y - size * 0.76);
-      const inDot = dotDistance <= size * 0.07;
+      const dotDistance = Math.hypot(
+        x - (padding + artworkSize * 0.76),
+        y - (padding + artworkSize * 0.76)
+      );
+      const inDot = dotDistance <= artworkSize * 0.07;
       const color = inRing || inDot ? [221, 255, 68] : [20, 24, 22];
       pixels[index] = color[0];
       pixels[index + 1] = color[1];
