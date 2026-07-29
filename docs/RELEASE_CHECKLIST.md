@@ -12,7 +12,7 @@
 
 ## 법적·개인정보
 
-- [ ] 현재 배포가 비상업적임을 확인하거나, `Xenova/mms-tts-kor`의 CC BY-NC 4.0 사용 허가를 별도로 확보
+- [ ] `Supertone/supertonic-3` OpenRAIL-M의 사용 제한과 배포 고지 조건을 현재 제품 용도에 맞게 검토
 - [ ] `PRIVACY_POLICY.md`가 공개 HTTPS URL에서 열리는지 확인
 - [ ] Dashboard 개인정보 탭을 `docs/STORE_LISTING.md`와 동일하게 입력
 - [ ] Website content 처리와 Limited Use 인증

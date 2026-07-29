@@ -319,7 +319,7 @@ try {
       })
     );
     if (
-      ttsStatus?.modelId !== "Xenova/mms-tts-kor" ||
+      ttsStatus?.modelId !== "Supertone/supertonic-3" ||
       ttsStatus.state !== "playing"
     ) {
       throw new Error(`한국어 TTS 모델을 확인하지 못했습니다: ${JSON.stringify(ttsStatus)}`);
@@ -524,7 +524,7 @@ try {
         );
       }
       if (
-        pageTtsStatus?.modelId !== "Xenova/mms-tts-kor" ||
+        pageTtsStatus?.modelId !== "Supertone/supertonic-3" ||
         pageTtsStatus.state !== "playing"
       ) {
         throw new Error(

@@ -4,7 +4,6 @@ import {
   Tensor,
   env,
   pipeline,
-  type TextToAudioPipeline,
   type TranslationPipeline
 } from "@huggingface/transformers";
 import {
@@ -26,11 +25,16 @@ import {
   M2M100_MODEL_ID,
   SMALL100_MODEL_ID,
   SMALL100_REVISION,
-  TTS_MODEL_REVISION,
+  TTS_VOICE_STYLE,
   createSmall100InputIds,
+  getTtsModelFileUrl,
   isM2m100WebGpuWeightUrl
 } from "../shared/models";
 import { SerialTaskQueue } from "../shared/serial-queue";
+import {
+  SupertonicEngine,
+  configureSupertonicRuntime
+} from "../shared/supertonic";
 import { chunkText, friendlyError } from "../shared/text";
 import {
   canControlSpeech,
@@ -64,6 +68,7 @@ env.allowLocalModels = false;
 env.allowRemoteModels = true;
 env.useBrowserCache = true;
 env.backends.onnx.wasm!.wasmPaths = chrome.runtime.getURL("wasm/");
+configureSupertonicRuntime(chrome.runtime.getURL("wasm/"));
 
 let engine: TranslationEngine | null = null;
 let enginePromise: Promise<TranslationEngine> | null = null;
@@ -74,8 +79,9 @@ let status: EngineStatus = { state: "idle", modelId: MODEL_ID };
 const engineQueue = new SerialTaskQueue();
 const ttsSynthesisQueue = new SerialTaskQueue();
 const translationCache = new LruCache<string>(220);
-let ttsEngine: TextToAudioPipeline | null = null;
-let ttsEnginePromise: Promise<TextToAudioPipeline> | null = null;
+let ttsEngine: SupertonicEngine | null = null;
+let ttsEnginePromise: Promise<SupertonicEngine> | null = null;
+let forceTtsWasm = false;
 let ttsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
 let speechRun = 0;
 let ttsProgressRun = 0;
@@ -245,7 +251,7 @@ async function runSpeech(
 }
 
 function synthesizeSpeechChunk(
-  synthesizer: TextToAudioPipeline,
+  synthesizer: SupertonicEngine,
   chunk: string | undefined,
   run: number,
   speechId: string
@@ -256,7 +262,41 @@ function synthesizeSpeechChunk(
 
   const output = ttsSynthesisQueue.run(async () => {
     if (!isCurrentSpeech(run, speechId)) return null;
-    return synthesizer(input, {});
+    const onProgress = ({ step, total }: { step: number; total: number }) => {
+      if (!isCurrentSpeech(run, speechId)) return;
+      ttsStatus = {
+        state: "synthesizing",
+        modelId: TTS_MODEL_ID,
+        speechId,
+        progress: step / total,
+        file: `Supertonic 3 음성 생성 ${step} / ${total}단계`
+      };
+      broadcastTtsStatus();
+    };
+    try {
+      return await synthesizer.synthesize(input, onProgress);
+    } catch (error) {
+      if (synthesizer.device !== "webgpu" || !isCurrentSpeech(run, speechId)) {
+        throw error;
+      }
+      forceTtsWasm = true;
+      if (ttsEngine === synthesizer) {
+        ttsEngine = null;
+        ttsEnginePromise = null;
+        await synthesizer.release();
+      }
+      ttsStatus = {
+        state: "loading",
+        modelId: TTS_MODEL_ID,
+        speechId,
+        progress: 0,
+        file: "WebGPU 추론 실패, WASM으로 다시 준비 중"
+      };
+      broadcastTtsStatus();
+      const wasmSynthesizer = await getTtsEngine();
+      if (!isCurrentSpeech(run, speechId)) return null;
+      return wasmSynthesizer.synthesize(input, onProgress);
+    }
   });
   // The next chunk can fail while the current audio is still playing. Attach a
   // handler immediately; awaiting the original promise still forwards the
@@ -265,35 +305,58 @@ function synthesizeSpeechChunk(
   return output;
 }
 
-async function getTtsEngine(): Promise<TextToAudioPipeline> {
+async function getTtsEngine(): Promise<SupertonicEngine> {
   if (ttsEngine) return ttsEngine;
   if (ttsEnginePromise) return ttsEnginePromise;
 
-  ttsEnginePromise = pipeline("text-to-speech", TTS_MODEL_ID, {
-    revision: TTS_MODEL_REVISION,
-    device: "wasm",
-    dtype: "q8",
-    progress_callback: (progress: Record<string, unknown>) => {
-      if (
-        ttsEngine ||
-        progress.status === "ready" ||
-        ttsProgressRun !== speechRun ||
-        ttsStatus.state !== "loading"
-      ) {
-        return;
-      }
-      ttsStatus = {
-        state: "loading",
-        modelId: TTS_MODEL_ID,
-        speechId: activeSpeechId ?? ttsStatus.speechId,
-        progress: getTtsProgress(progress),
-        file: typeof progress.file === "string"
-          ? progress.file
-          : ttsStatus.file
-      };
-      broadcastTtsStatus();
+  const modelBaseUrl = getTtsModelFileUrl("onnx");
+  const voiceStyleUrl = getTtsModelFileUrl(
+    `voice_styles/${TTS_VOICE_STYLE}.json`
+  );
+  const reportProgress = (
+    device: "webgpu" | "wasm",
+    progress: { file: string; current: number; total: number }
+  ) => {
+    if (
+      ttsEngine ||
+      ttsProgressRun !== speechRun ||
+      ttsStatus.state !== "loading"
+    ) {
+      return;
     }
-  }).then((loaded) => {
+    ttsStatus = {
+      state: "loading",
+      modelId: TTS_MODEL_ID,
+      speechId: activeSpeechId ?? ttsStatus.speechId,
+      progress: progress.current / progress.total,
+      file: `${progress.file} (${device === "webgpu" ? "WebGPU" : "WASM"})`
+    };
+    broadcastTtsStatus();
+  };
+  const load = (device: "webgpu" | "wasm") => SupertonicEngine.load({
+    modelBaseUrl,
+    voiceStyleUrl,
+    device,
+    onProgress: (progress) => reportProgress(device, progress)
+  });
+
+  ttsEnginePromise = (async () => {
+    if (!forceTtsWasm && "gpu" in navigator) {
+      try {
+        return await load("webgpu");
+      } catch {
+        if (ttsProgressRun === speechRun && ttsStatus.state === "loading") {
+          ttsStatus = {
+            ...ttsStatus,
+            progress: 0,
+            file: "WebGPU 실패, WASM 음성 모델로 전환 중"
+          };
+          broadcastTtsStatus();
+        }
+      }
+    }
+    return load("wasm");
+  })().then((loaded) => {
     ttsEngine = loaded;
     return loaded;
   }).catch((error) => {
@@ -356,20 +419,6 @@ function stopSpeech(options: {
 
 function isCurrentSpeech(run: number, speechId: string): boolean {
   return run === speechRun && activeSpeechId === speechId;
-}
-
-function getTtsProgress(progress: Record<string, unknown>): number {
-  if (typeof progress.progress === "number") {
-    return Math.max(0, Math.min(1, progress.progress / 100));
-  }
-  if (
-    typeof progress.loaded === "number" &&
-    typeof progress.total === "number" &&
-    progress.total > 0
-  ) {
-    return Math.max(0, Math.min(1, progress.loaded / progress.total));
-  }
-  return ttsStatus.progress ?? 0;
 }
 
 function broadcastTtsStatus(): void {

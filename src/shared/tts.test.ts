@@ -9,13 +9,13 @@ import {
 } from "./tts";
 
 describe("prepareKoreanForTts", () => {
-  it("한국어를 MMS 음성 모델이 받는 로마자 입력으로 바꾼다", () => {
+  it("Supertonic 3에 전달할 한국어 원문을 유지한다", () => {
     expect(prepareKoreanForTts("안녕하세요. 번역한 한국어를 읽어줍니다."))
-      .toBe("annyeonghaseyo beonyeokhan hangugeoreul ilgeojumnida");
+      .toBe("안녕하세요. 번역한 한국어를 읽어줍니다.");
   });
 
-  it("영문과 숫자를 버리지 않고 읽을 수 있는 입력으로 만든다", () => {
-    expect(prepareKoreanForTts("온글 AI 2026!")).toBe("ongeul ai iyeongiyuk");
+  it("영문과 숫자를 보존하고 공백만 정규화한다", () => {
+    expect(prepareKoreanForTts("  온글   AI 2026! ")).toBe("온글 AI 2026!");
   });
 });
 
@@ -33,17 +33,17 @@ describe("chunkKoreanSpeech", () => {
       `${"첫 번째 문장입니다. ".repeat(10)}${"마지막 문장입니다. ".repeat(10)}`
     );
     expect(chunks.length).toBeGreaterThan(1);
-    expect(chunks.every((chunk) => chunk.length <= 36)).toBe(true);
+    expect(chunks.every((chunk) => chunk.length <= 120)).toBe(true);
     expect(chunks[0]).toMatch(/[.!?。！？]$/u);
     expect(chunks.join(" ").replace(/\s+/g, " ").trim()).toContain("마지막 문장입니다.");
   });
 
   it("경계가 없는 긴 텍스트도 모델 입력 상한에 맞게 자른다", () => {
-    const chunks = chunkKoreanSpeech("가".repeat(80));
+    const chunks = chunkKoreanSpeech("가".repeat(250));
     expect(chunks).toEqual([
-      "가".repeat(24),
-      "가".repeat(24),
-      "가".repeat(32)
+      "가".repeat(80),
+      "가".repeat(80),
+      "가".repeat(90)
     ]);
   });
 });

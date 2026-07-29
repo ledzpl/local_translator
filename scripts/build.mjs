@@ -64,6 +64,10 @@ await Promise.all([
     join(licenseDist, "onnxruntime-MIT.txt")
   ),
   cp(
+    join(root, "LICENSES/supertonic-code-MIT.txt"),
+    join(licenseDist, "supertonic-code-MIT.txt")
+  ),
+  cp(
     join(root, "node_modules/@huggingface/jinja/LICENSE"),
     join(licenseDist, "huggingface-jinja-MIT.txt")
   ),

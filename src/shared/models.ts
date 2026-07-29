@@ -3,8 +3,13 @@ export const SMALL100_REVISION = "5c2c73ac70bee9c58f5a7ac5e84a36bee25db8ee";
 export const SMALL100_KOREAN_TOKEN_ID = 128052;
 export const M2M100_MODEL_ID = "Xenova/m2m100_418M";
 export const M2M100_REVISION = "9c374f0b7aca709787cea97b047bfbbd1559d177";
-export const TTS_MODEL_ID = "Xenova/mms-tts-kor";
-export const TTS_MODEL_REVISION = "76e23d9c3552b7b29a1074d664e6a1337d3e24ef";
+export const TTS_MODEL_ID = "Supertone/supertonic-3";
+export const TTS_MODEL_REVISION = "3cadd1ee6394adea1bd021217a0e650ede09a323";
+export const TTS_VOICE_STYLE = "M1";
+
+export function getTtsModelFileUrl(path: string): string {
+  return `https://huggingface.co/${TTS_MODEL_ID}/resolve/${TTS_MODEL_REVISION}/${path}`;
+}
 
 export type ModelPreference = "small100" | "m2m100";
 export const DEFAULT_MODEL_PREFERENCE: ModelPreference = "m2m100";

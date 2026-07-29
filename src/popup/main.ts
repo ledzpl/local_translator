@@ -122,7 +122,7 @@ app.innerHTML = `
       <div class="engine-icon">VO</div>
       <div class="engine-copy">
         <strong id="tts-title">한국어 음성 AI 대기 중</strong>
-        <span id="tts-detail">첫 듣기 때 약 40MB 모델을 내려받습니다.</span>
+        <span id="tts-detail">첫 듣기 때 약 400MB 모델을 내려받습니다.</span>
       </div>
       <span id="tts-state" class="engine-state idle">대기</span>
       <button id="tts-stop-button" class="tts-stop-button" type="button" hidden>정지</button>
@@ -591,7 +591,7 @@ function updateTtsStatus(status: TtsStatus): void {
     elements.ttsDetail.textContent = status.error ?? "다시 듣기를 눌러 주세요.";
   } else {
     elements.ttsTitle.textContent = "한국어 음성 AI 대기 중";
-    elements.ttsDetail.textContent = "첫 듣기 때 약 40MB 모델을 내려받습니다.";
+    elements.ttsDetail.textContent = "첫 듣기 때 약 400MB 모델을 내려받습니다.";
   }
 }
 

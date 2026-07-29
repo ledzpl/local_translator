@@ -19,6 +19,7 @@ const required = [
   "THIRD_PARTY_NOTICES.md",
   "LICENSES/transformers-js-Apache-2.0.txt",
   "LICENSES/onnxruntime-MIT.txt",
+  "LICENSES/supertonic-code-MIT.txt",
   "LICENSES/huggingface-jinja-MIT.txt",
   "LICENSES/flatbuffers-Apache-2.0.txt",
   "LICENSES/guid-typescript-ISC.txt",
@@ -33,7 +34,7 @@ const required = [
 const pinnedRevisions = [
   "5c2c73ac70bee9c58f5a7ac5e84a36bee25db8ee",
   "9c374f0b7aca709787cea97b047bfbbd1559d177",
-  "76e23d9c3552b7b29a1074d664e6a1337d3e24ef"
+  "3cadd1ee6394adea1bd021217a0e650ede09a323"
 ];
 
 for (const file of required) {

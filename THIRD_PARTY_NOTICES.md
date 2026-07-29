@@ -22,14 +22,17 @@
   [Transformers.js용 int8 ONNX 변환본](https://huggingface.co/casawolice/small100-onnx) — upstream MIT License
 - [M2M100 418M](https://huggingface.co/facebook/m2m100_418M) 및
   [Transformers.js용 ONNX 변환본](https://huggingface.co/Xenova/m2m100_418M) — upstream MIT License
-- Meta의 [MMS Korean TTS](https://huggingface.co/facebook/mms-tts-kor) 및
-  Xenova의 [Transformers.js용 ONNX 변환본](https://huggingface.co/Xenova/mms-tts-kor) —
-  [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).
-  온글 번역은 변환 저장소의 q8 가중치를 그대로 선택해 내려받으며 모델을 추가 수정하지 않습니다.
+- Supertone의 [Supertonic 브라우저 추론 코드](https://github.com/supertone-inc/supertonic/tree/main/web) —
+  MIT License; [Supertonic 3 모델](https://huggingface.co/Supertone/supertonic-3) —
+  [OpenRAIL-M](https://huggingface.co/Supertone/supertonic-3/blob/main/LICENSE).
+  온글 번역은 공식 브라우저 구현을 TypeScript 실행 구조에 맞게 적용하고, 공식
+  ONNX 가중치와 M1 음성 스타일을 고정 revision에서 그대로 내려받아 WebGPU 또는
+  WASM으로 실행하며 모델을 추가 수정하지 않습니다.
 
-확장 패키지의 `LICENSES/`에는 위 브라우저 런타임 소프트웨어의 Apache 2.0,
-MIT, ISC 및 BSD 3-Clause 라이선스 전문과 저작권 고지가 포함됩니다. ONNX Runtime
-Web 번들 안에 보존된 Google 기여 코드의 Apache 2.0 고지도 그대로 유지됩니다.
+확장 패키지의 `LICENSES/`에는 위 브라우저 런타임과 Supertonic 추론 코드의
+Apache 2.0, MIT, ISC 및 BSD 3-Clause 라이선스 전문과 저작권 고지가 포함됩니다.
+ONNX Runtime Web 번들 안에 보존된 Google 기여 코드의 Apache 2.0 고지도 그대로
+유지됩니다.
 Node 전용 선택 의존성인 `onnxruntime-node`와 `sharp`는 확장 실행 번들에 포함하지
 않습니다.
 

@@ -6,8 +6,10 @@ import {
   MODEL_DEFINITIONS,
   SMALL100_KOREAN_TOKEN_ID,
   SMALL100_REVISION,
+  TTS_MODEL_ID,
   TTS_MODEL_REVISION,
   createSmall100InputIds,
+  getTtsModelFileUrl,
   isM2m100WebGpuWeightUrl
 } from "./models";
 
@@ -24,7 +26,12 @@ describe("translation model configuration", () => {
 
   it("pins every remotely downloaded model to a reviewed commit", () => {
     expect(M2M100_REVISION).toBe("9c374f0b7aca709787cea97b047bfbbd1559d177");
-    expect(TTS_MODEL_REVISION).toBe("76e23d9c3552b7b29a1074d664e6a1337d3e24ef");
+    expect(TTS_MODEL_ID).toBe("Supertone/supertonic-3");
+    expect(TTS_MODEL_REVISION).toBe("3cadd1ee6394adea1bd021217a0e650ede09a323");
+    expect(getTtsModelFileUrl("onnx/tts.json")).toBe(
+      `https://huggingface.co/Supertone/supertonic-3/resolve/` +
+      `${TTS_MODEL_REVISION}/onnx/tts.json`
+    );
   });
 
   it("identifies only the failed M2M100 WebGPU weight cache entries", () => {
