@@ -5,6 +5,14 @@ export const PAGE_TRANSLATION_MAX_BLOCKS = 40;
 export const PAGE_TRANSLATION_MAX_CHARS = 12_000;
 export const PAGE_TRANSLATION_MAX_CHARS_PER_BLOCK = 2_000;
 
+export function getPageTranslationTerminalState(
+  total: number,
+  failed: number
+): "complete" | "partial" | "error" {
+  if (total > 0 && failed >= total) return "error";
+  return failed > 0 ? "partial" : "complete";
+}
+
 export function getPageTranslationText(text: string): string | null {
   const normalized = normalizeText(text);
   if (

@@ -4,6 +4,7 @@ import {
   MODEL_ID,
   OFFSCREEN_PATH,
   TTS_MODEL_ID,
+  createRequestId,
   type BackgroundMessage,
   type ContentMessage,
   type DevicePreference,
@@ -778,15 +779,23 @@ async function translateAndDisplay(
   const text = normalizeText(sourceText);
   if (!text) return;
   const sourcePreview = createTextPreview(text);
+  const displayRequestId = createRequestId();
   try {
     await ensureContentScript(tabId);
+    await chrome.tabs.sendMessage(tabId, {
+      type: "TRANSLATION_STARTED",
+      requestId: displayRequestId,
+      sourceText: sourcePreview
+    } satisfies ContentMessage);
+
     if (text.length > TRANSLATION_REQUEST_MAX_CHARS) {
       await chrome.tabs.sendMessage(tabId, {
         type: "SHOW_TRANSLATION",
+        requestId: displayRequestId,
         sourceText: sourcePreview,
         response: {
           ok: false,
-          requestId: crypto.randomUUID(),
+          requestId: displayRequestId,
           code: "TEXT_TOO_LONG",
           error:
             `한 번에 번역할 수 있는 텍스트는 ` +
@@ -795,15 +804,11 @@ async function translateAndDisplay(
       } satisfies ContentMessage);
       return;
     }
-    await chrome.tabs.sendMessage(tabId, {
-      type: "TRANSLATION_STARTED",
-      sourceText: sourcePreview
-    } satisfies ContentMessage);
 
     const response = await handleBackgroundMessage({
       target: "background",
       type: "TRANSLATE",
-      requestId: crypto.randomUUID(),
+      requestId: displayRequestId,
       text,
       sourceLanguage: "auto",
       origin
@@ -811,18 +816,20 @@ async function translateAndDisplay(
 
     await chrome.tabs.sendMessage(tabId, {
       type: "SHOW_TRANSLATION",
+      requestId: displayRequestId,
       sourceText: sourcePreview,
       response
     } satisfies ContentMessage);
   } catch (error) {
     const response: TranslationResponse = {
       ok: false,
-      requestId: crypto.randomUUID(),
+      requestId: displayRequestId,
       code: "UNSUPPORTED_PAGE",
       error: friendlyError(error)
     };
     await chrome.tabs.sendMessage(tabId, {
       type: "SHOW_TRANSLATION",
+      requestId: displayRequestId,
       sourceText: sourcePreview,
       response
     } satisfies ContentMessage).catch(() => undefined);

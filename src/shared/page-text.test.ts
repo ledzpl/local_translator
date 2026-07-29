@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  getPageTranslationTerminalState,
   getPageTranslationText,
   getPageTranslationTexts,
   isLikelyProsePreformatted,
@@ -61,5 +62,11 @@ describe("page translation text selection", () => {
       "bbbb"
     ]);
     expect(limitPageTranslationTexts(["aaaa", "bbbb"], 5, 7)).toEqual(["aaaa"]);
+  });
+
+  it("distinguishes complete, partial, and fully failed page runs", () => {
+    expect(getPageTranslationTerminalState(4, 0)).toBe("complete");
+    expect(getPageTranslationTerminalState(4, 1)).toBe("partial");
+    expect(getPageTranslationTerminalState(4, 4)).toBe("error");
   });
 });

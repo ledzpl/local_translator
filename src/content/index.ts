@@ -17,6 +17,7 @@ import {
   shouldRequestPendingCaption
 } from "../shared/captions";
 import {
+  getPageTranslationTerminalState,
   getPageTranslationTexts,
   isLikelyProsePreformatted,
   prioritizePageTranslationCandidates
@@ -63,10 +64,14 @@ function initialize(): void {
           sendResponse(pageTranslator.restore());
           return false;
         case "TRANSLATION_STARTED":
-          view.showSelectionLoading(message.sourceText);
+          view.showSelectionLoading(message.requestId, message.sourceText);
           return false;
         case "SHOW_TRANSLATION":
-          view.showSelectionResult(message.sourceText, message.response);
+          view.showSelectionResult(
+            message.requestId,
+            message.sourceText,
+            message.response
+          );
           return false;
         default:
           return undefined;
@@ -101,8 +106,14 @@ class OverlayView {
   private selectionHost: HTMLElement | null = null;
   private subtitleHost: HTMLElement | null = null;
   private hideTimer: number | null = null;
+  private latestSelectionRequestId: string | null = null;
 
-  showSelectionLoading(sourceText: string): void {
+  showSelectionLoading(requestId: string, sourceText: string): void {
+    this.latestSelectionRequestId = requestId;
+    if (this.hideTimer) {
+      window.clearTimeout(this.hideTimer);
+      this.hideTimer = null;
+    }
     const body = this.ensureSelectionCard();
     body.replaceChildren(
       createElement("div", "badge", "LOCAL AI"),
@@ -112,7 +123,12 @@ class OverlayView {
     this.positionSelectionCard();
   }
 
-  showSelectionResult(sourceText: string, response: TranslationResponse): void {
+  showSelectionResult(
+    requestId: string,
+    sourceText: string,
+    response: TranslationResponse
+  ): void {
+    if (requestId !== this.latestSelectionRequestId) return;
     const body = this.ensureSelectionCard();
     const result = response.ok ? response.translation : response.error;
     body.replaceChildren(
@@ -345,10 +361,15 @@ class InPageTranslator {
     if (generation === this.generation) {
       this.status = {
         ...this.status,
-        state: this.status.failed === this.status.total ? "error" : "complete",
+        state: getPageTranslationTerminalState(
+          this.status.total,
+          this.status.failed
+        ),
         error:
           this.status.failed === this.status.total
             ? "페이지 문장을 번역하지 못했습니다."
+            : this.status.failed > 0
+              ? `${this.status.failed}개 문장을 번역하지 못했습니다.`
             : undefined
       };
       this.updateToolbar();
@@ -569,6 +590,9 @@ class InPageTranslator {
       status.textContent = "번역할 외국어 문장을 찾지 못했어요.";
     } else if (this.status.state === "complete") {
       status.textContent = `${this.status.completed}개 문장을 페이지에 표시했어요.`;
+    } else if (this.status.state === "partial") {
+      status.textContent =
+        `${this.status.completed}개 표시 · ${this.status.failed}개 실패`;
     } else if (this.status.state === "stopped") {
       status.textContent = `${this.status.completed}개 문장 번역 후 중지했어요.`;
     } else if (this.status.state === "error") {

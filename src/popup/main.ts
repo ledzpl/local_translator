@@ -226,6 +226,7 @@ const elements = {
 let currentTranslation = "";
 let currentTtsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
 let currentSpeechId: string | null = null;
+let translationInFlight = false;
 
 for (const language of LANGUAGE_OPTIONS) {
   const option = document.createElement("option");
@@ -417,6 +418,7 @@ async function refreshPageStatus(): Promise<void> {
 }
 
 async function translate(): Promise<void> {
+  if (translationInFlight) return;
   const text = elements.source.value.trim();
   if (!text) {
     elements.source.focus();
@@ -425,6 +427,7 @@ async function translate(): Promise<void> {
     return;
   }
 
+  translationInFlight = true;
   setBusy(true);
   currentTranslation = "";
   elements.speak.disabled = true;
@@ -472,6 +475,7 @@ async function translate(): Promise<void> {
     elements.resultText.textContent = formatUiError(error);
     elements.resultMeta.textContent = "확장 프로그램을 새로고침한 뒤 다시 시도해 주세요.";
   } finally {
+    translationInFlight = false;
     setBusy(false);
   }
 }
@@ -812,6 +816,9 @@ function updatePageStatus(status: PageTranslationStatus): void {
   } else if (status.state === "complete") {
     elements.pageStatus.textContent =
       `${status.completed}개 문장을 원문 아래에 표시했습니다.`;
+  } else if (status.state === "partial") {
+    elements.pageStatus.textContent =
+      `${status.completed}개 문장을 표시했고 ${status.failed}개 문장은 실패했습니다.`;
   } else if (status.state === "stopped") {
     elements.pageStatus.textContent =
       `${status.completed}개 문장까지 표시하고 중지했습니다.`;

@@ -134,7 +134,7 @@ export interface SpeakResponse {
 }
 
 export interface PageTranslationStatus {
-  state: "idle" | "translating" | "complete" | "stopped" | "error";
+  state: "idle" | "translating" | "complete" | "partial" | "stopped" | "error";
   total: number;
   completed: number;
   failed: number;
@@ -177,8 +177,13 @@ export type ContentMessage =
   | { type: "GET_PAGE_TRANSLATION_STATUS" }
   | { type: "STOP_PAGE_TRANSLATION" }
   | { type: "RESTORE_PAGE_TRANSLATION" }
-  | { type: "TRANSLATION_STARTED"; sourceText: string }
-  | { type: "SHOW_TRANSLATION"; sourceText: string; response: TranslationResponse };
+  | { type: "TRANSLATION_STARTED"; requestId: string; sourceText: string }
+  | {
+      type: "SHOW_TRANSLATION";
+      requestId: string;
+      sourceText: string;
+      response: TranslationResponse;
+    };
 
 export function createRequestId(): string {
   return `${Date.now().toString(36)}-${crypto.randomUUID()}`;

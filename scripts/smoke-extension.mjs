@@ -140,6 +140,39 @@ try {
     withModel ? "en" : "auto"
   );
 
+  if (!withModel && !withTts) {
+    await serviceWorker.evaluate(() => {
+      globalThis.__ongeulTranslateMessageCount = 0;
+      if (!globalThis.__ongeulTranslateMessageCounterInstalled) {
+        globalThis.__ongeulTranslateMessageCounterInstalled = true;
+        chrome.runtime.onMessage.addListener((message) => {
+          if (message?.target === "background" && message.type === "TRANSLATE") {
+            globalThis.__ongeulTranslateMessageCount += 1;
+          }
+        });
+      }
+    });
+    await popup.locator("#source-text").evaluate((element) => {
+      const event = () => new KeyboardEvent("keydown", {
+        key: "Enter",
+        ctrlKey: true,
+        bubbles: true
+      });
+      element.dispatchEvent(event());
+      element.dispatchEvent(event());
+    });
+    await popup.locator("#result-text").filter({ hasText: "브라우저 로컬 번역" }).waitFor();
+    const translateMessageCount = await serviceWorker.evaluate(
+      () => globalThis.__ongeulTranslateMessageCount
+    );
+    if (translateMessageCount !== 1) {
+      throw new Error(
+        `팝업 중복 번역 요청이 차단되지 않았습니다: ${translateMessageCount}`
+      );
+    }
+    console.log("POPUP_DUPLICATE_TRANSLATION_GUARD=PASS");
+  }
+
   if (withModel) {
     await popup.getByRole("button", { name: "한국어로 번역" }).click();
     const completed = await waitForTranslationResult(
@@ -548,6 +581,71 @@ try {
   if (!withModel && (started?.state !== "complete" || started.total !== 0)) {
     throw new Error(`동적 페이지 주입에 실패했습니다: ${JSON.stringify(started)}`);
   }
+
+  const selectionRaceResult = await popup.evaluate(async (pageUrl) => {
+    const tabs = await chrome.tabs.query({});
+    const tab = tabs.find((candidate) => candidate.url === pageUrl);
+    if (!tab?.id) throw new Error("선택 번역 테스트 탭을 찾지 못했습니다.");
+    const send = (message) => chrome.tabs.sendMessage(tab.id, message);
+    await send({
+      type: "TRANSLATION_STARTED",
+      requestId: "selection-old",
+      sourceText: "Old selection"
+    });
+    await send({
+      type: "TRANSLATION_STARTED",
+      requestId: "selection-new",
+      sourceText: "New selection"
+    });
+    await send({
+      type: "SHOW_TRANSLATION",
+      requestId: "selection-old",
+      sourceText: "Old selection",
+      response: {
+        ok: true,
+        requestId: "selection-old",
+        translation: "이전 결과",
+        sourceLanguage: "en",
+        device: "wasm",
+        elapsedMs: 1
+      }
+    });
+    await send({
+      type: "SHOW_TRANSLATION",
+      requestId: "selection-new",
+      sourceText: "New selection",
+      response: {
+        ok: true,
+        requestId: "selection-new",
+        translation: "최신 결과",
+        sourceLanguage: "en",
+        device: "wasm",
+        elapsedMs: 1
+      }
+    });
+    return true;
+  }, webPage.url());
+  if (!selectionRaceResult) {
+    throw new Error("선택 번역 최신 요청 테스트를 실행하지 못했습니다.");
+  }
+  const selectionOverlay = await webPage.evaluate(() => {
+    const host = document.querySelector('[data-ongeul-overlay="selection"]');
+    return {
+      source: host?.shadowRoot?.querySelector(".source")?.textContent ?? "",
+      translation:
+        host?.shadowRoot?.querySelector(".translation")?.textContent ?? ""
+    };
+  });
+  if (
+    selectionOverlay.source !== "New selection" ||
+    selectionOverlay.translation !== "최신 결과"
+  ) {
+    throw new Error(
+      `이전 선택 번역 결과가 최신 결과를 덮어썼습니다: ` +
+      JSON.stringify(selectionOverlay)
+    );
+  }
+  console.log("SELECTION_LATEST_REQUEST_GUARD=PASS");
 
   if (withModel) {
     const preTranslationHost = webPage.locator(
