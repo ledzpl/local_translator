@@ -5,6 +5,7 @@ import {
   isSpeechStatusFor,
   prepareKoreanForTts,
   shouldMarkSpeechIdle,
+  synthesizeWithSpeechEngineFallback,
   validateTtsAudio
 } from "./tts";
 
@@ -85,6 +86,67 @@ describe("speech ownership", () => {
       true,
       true
     )).toBe(false);
+  });
+});
+
+describe("synthesizeWithSpeechEngineFallback", () => {
+  it("reuses the WASM fallback directly for later speech chunks", async () => {
+    type FakeEngine = {
+      device: "webgpu" | "wasm";
+      name: string;
+    };
+    const webgpu: FakeEngine = { device: "webgpu", name: "primary" };
+    const wasm: FakeEngine = { device: "wasm", name: "fallback" };
+    const activeEngine = { current: webgpu };
+    const calls: string[] = [];
+    const synthesize = async (engine: FakeEngine, chunk: string) => {
+      calls.push(`${engine.device}:${chunk}`);
+      if (engine === webgpu) throw new Error("WebGPU inference failed");
+      return `${engine.name}:${chunk}`;
+    };
+    let fallbackLoads = 0;
+    const loadFallback = async () => {
+      fallbackLoads += 1;
+      return wasm;
+    };
+
+    await expect(synthesizeWithSpeechEngineFallback(
+      activeEngine,
+      (engine) => synthesize(engine, "first"),
+      loadFallback
+    )).resolves.toBe("fallback:first");
+    await expect(synthesizeWithSpeechEngineFallback(
+      activeEngine,
+      (engine) => synthesize(engine, "second"),
+      loadFallback
+    )).resolves.toBe("fallback:second");
+
+    expect(activeEngine.current).toBe(wasm);
+    expect(fallbackLoads).toBe(1);
+    expect(calls).toEqual([
+      "webgpu:first",
+      "wasm:first",
+      "wasm:second"
+    ]);
+  });
+
+  it("does not retry a failed WASM engine", async () => {
+    const activeEngine = {
+      current: { device: "wasm" as const }
+    };
+    let fallbackLoads = 0;
+
+    await expect(synthesizeWithSpeechEngineFallback(
+      activeEngine,
+      async () => {
+        throw new Error("WASM inference failed");
+      },
+      async () => {
+        fallbackLoads += 1;
+        return activeEngine.current;
+      }
+    )).rejects.toThrow("WASM inference failed");
+    expect(fallbackLoads).toBe(0);
   });
 });
 

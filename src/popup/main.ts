@@ -26,6 +26,7 @@ import {
   CURRENT_PRIVACY_CONSENT_VERSION,
   hasPrivacyConsent
 } from "../shared/privacy";
+import { RevisionedCommitter } from "../shared/revisioned-committer";
 import { isSpeechStatusFor } from "../shared/tts";
 
 const app = document.querySelector<HTMLElement>("#app");
@@ -227,6 +228,7 @@ let currentTranslation = "";
 let currentTtsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
 let currentSpeechId: string | null = null;
 let translationInFlight = false;
+const subtitleSizeCommitter = new RevisionedCommitter(saveSettingsSafely);
 
 for (const language of LANGUAGE_OPTIONS) {
   const option = document.createElement("option");
@@ -357,8 +359,10 @@ elements.autoCaptions.addEventListener("change", () => void saveSettingsSafely()
 elements.showOriginal.addEventListener("change", () => void saveSettingsSafely());
 elements.subtitleSize.addEventListener("input", () => {
   elements.subtitleSizeValue.textContent = `${elements.subtitleSize.value}px`;
-  void saveSettingsSafely();
+  subtitleSizeCommitter.markDirty();
 });
+elements.subtitleSize.addEventListener("change", commitSubtitleSize);
+window.addEventListener("pagehide", flushSubtitleSizeOnPageHide);
 elements.sourceLanguage.addEventListener("change", () => void saveSettingsSafely());
 elements.modelPreference.addEventListener("change", () => void resetEngineForSettings());
 elements.devicePreference.addEventListener("change", () => void resetEngineForSettings());
@@ -678,9 +682,10 @@ async function saveSettings(): Promise<void> {
   if (isExtensionRuntime) await chrome.storage.sync.set(settings);
 }
 
-async function saveSettingsSafely(): Promise<void> {
+async function saveSettingsSafely(): Promise<boolean> {
   try {
     await saveSettings();
+    return true;
   } catch (error) {
     updateEngineStatus({
       state: "error",
@@ -689,7 +694,24 @@ async function saveSettingsSafely(): Promise<void> {
       ].id,
       error: `설정을 저장하지 못했습니다: ${formatUiError(error)}`
     });
+    return false;
   }
+}
+
+function commitSubtitleSize(): void {
+  if (!subtitleSizeCommitter.isDirty()) return;
+  void subtitleSizeCommitter.commit();
+}
+
+function flushSubtitleSizeOnPageHide(): void {
+  if (!isExtensionRuntime || !subtitleSizeCommitter.isDirty()) return;
+  // A popup can be destroyed before an in-flight committer continuation runs.
+  // Dispatch the latest value directly so Chrome owns the final write before
+  // this document goes away. Limit the write to this key to avoid overwriting
+  // unrelated settings with a stale popup snapshot.
+  void chrome.storage.sync.set({
+    subtitleSize: Number(elements.subtitleSize.value)
+  }).catch(() => undefined);
 }
 
 async function resetEngineForSettings(): Promise<void> {

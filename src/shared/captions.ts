@@ -5,6 +5,26 @@ export function joinCaptionSegments(segments: Iterable<string | null | undefined
   return normalizeText(Array.from(segments, (segment) => segment ?? "").join(" "));
 }
 
+export function isYoutubeCaptionWindowVisible(options: {
+  hasLayoutBox: boolean;
+  hidden: boolean | string;
+  ariaHidden: string | null;
+  display: string;
+  opacity: string;
+  visibility: string;
+}): boolean {
+  const opacity = Number.parseFloat(options.opacity);
+  return (
+    options.hasLayoutBox &&
+    !options.hidden &&
+    options.ariaHidden?.trim().toLowerCase() !== "true" &&
+    options.display !== "none" &&
+    (Number.isNaN(opacity) || opacity > 0) &&
+    options.visibility !== "hidden" &&
+    options.visibility !== "collapse"
+  );
+}
+
 export function captionStillMatches(current: string, translatedSource: string): boolean {
   return current === translatedSource || current.startsWith(`${translatedSource} `);
 }

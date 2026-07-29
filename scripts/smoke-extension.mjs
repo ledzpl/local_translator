@@ -111,6 +111,65 @@ try {
       settings.youtubeEnabled === true &&
       settings.autoEnableCaptions === true;
   });
+  await serviceWorker.evaluate(() => {
+    globalThis.__ongeulSubtitleSizeWriteCount = 0;
+    if (!globalThis.__ongeulSubtitleSizeWriteCounterInstalled) {
+      globalThis.__ongeulSubtitleSizeWriteCounterInstalled = true;
+      chrome.storage.onChanged.addListener((changes, areaName) => {
+        if (areaName === "sync" && changes.subtitleSize) {
+          globalThis.__ongeulSubtitleSizeWriteCount += 1;
+        }
+      });
+    }
+  });
+  const initialSubtitleSize = Number(
+    await popup.locator("#subtitle-size").inputValue()
+  );
+  const nextSubtitleSize =
+    initialSubtitleSize === 42 ? initialSubtitleSize - 1 : initialSubtitleSize + 1;
+  await popup.locator("#subtitle-size").evaluate((element, nextValue) => {
+    const input = /** @type {HTMLInputElement} */ (element);
+    for (const value of [nextValue - 1, nextValue + 1, nextValue]) {
+      input.value = String(value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  }, nextSubtitleSize);
+  await popup.waitForTimeout(150);
+  const subtitleSizeBeforeCommit = await serviceWorker.evaluate(async () => ({
+    stored: (await chrome.storage.sync.get("subtitleSize")).subtitleSize,
+    writes: globalThis.__ongeulSubtitleSizeWriteCount
+  }));
+  if (
+    subtitleSizeBeforeCommit.stored !== initialSubtitleSize ||
+    subtitleSizeBeforeCommit.writes !== 0
+  ) {
+    throw new Error(
+      `자막 크기 input 이벤트가 설정을 저장했습니다: ${JSON.stringify(subtitleSizeBeforeCommit)}`
+    );
+  }
+  await popup.locator("#subtitle-size-value").filter({
+    hasText: `${nextSubtitleSize}px`
+  }).waitFor();
+  await popup.locator("#subtitle-size").dispatchEvent("change");
+  await popup.waitForFunction(async (expectedSize) =>
+    (await chrome.storage.sync.get("subtitleSize")).subtitleSize === expectedSize,
+  nextSubtitleSize);
+  const subtitleSizeWrites = await serviceWorker.evaluate(async () => {
+    const deadline = Date.now() + 2_000;
+    while (
+      globalThis.__ongeulSubtitleSizeWriteCount < 1 &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return globalThis.__ongeulSubtitleSizeWriteCount;
+  });
+  if (subtitleSizeWrites !== 1) {
+    throw new Error(
+      `자막 크기 change 저장 횟수가 올바르지 않습니다: ${subtitleSizeWrites}`
+    );
+  }
+  console.log("SUBTITLE_SIZE_COMMIT_GUARD=PASS");
   const selectedModel = await popup.locator("#model-preference").inputValue();
   if (selectedModel !== requestedModel) {
     throw new Error(`요청한 모델이 선택되지 않았습니다: ${selectedModel}`);
@@ -455,6 +514,9 @@ try {
       contentType: "text/html; charset=utf-8",
       body: `<!doctype html>
         <html lang="en">
+          <head>
+            <style>.captions-hidden { display: none; }</style>
+          </head>
           <body style="margin:0;background:#111;color:white">
             <div class="html5-video-player" style="position:relative;width:900px;height:506px">
               <button class="ytp-subtitles-button" aria-pressed="true">CC</button>
@@ -527,6 +589,121 @@ try {
       ],
       forbidden: [/\b(?:model|keeps?|text|inside|browser)\b/iu]
     });
+  }
+  if (withModel) {
+    await mockYoutube.evaluate(() => {
+      document.querySelector(".ytp-caption-window-container")
+        ?.setAttribute("aria-hidden", "true");
+    });
+    await subtitleHost.waitFor({ state: "hidden", timeout: 5_000 });
+    await mockYoutube.evaluate(() => {
+      document.querySelector(".ytp-caption-window-container")
+        ?.removeAttribute("aria-hidden");
+    });
+    await subtitleHost.waitFor({ state: "visible", timeout: 5_000 });
+    console.log("YOUTUBE_HIDDEN_CAPTION_GUARD=PASS");
+
+    await mockYoutube.evaluate(() => {
+      history.pushState({}, "", "/watch?v=ongeul-spa-navigation");
+    });
+    await mockYoutube.waitForTimeout(1_600);
+    if (!await subtitleHost.isVisible()) {
+      throw new Error("YouTube SPA 이동 후 첫 자막 번역이 복구되지 않았습니다.");
+    }
+    console.log("YOUTUBE_SPA_NAVIGATION_RESCAN=PASS");
+  } else {
+    await serviceWorker.evaluate(() => {
+      globalThis.__ongeulHiddenCaptionTranslateCount = 0;
+      if (!globalThis.__ongeulHiddenCaptionCounterInstalled) {
+        globalThis.__ongeulHiddenCaptionCounterInstalled = true;
+        chrome.runtime.onMessage.addListener((message) => {
+          if (message?.target === "background" && message.type === "TRANSLATE") {
+            globalThis.__ongeulHiddenCaptionTranslateCount += 1;
+          }
+        });
+      }
+    });
+    await mockYoutube.evaluate(() => {
+      const window = document.querySelector(".ytp-caption-window-container");
+      window?.classList.add("captions-hidden");
+    });
+    await mockYoutube.waitForTimeout(500);
+    const hiddenSameCueRequests = await serviceWorker.evaluate(
+      () => globalThis.__ongeulHiddenCaptionTranslateCount
+    );
+    if (hiddenSameCueRequests !== 0) {
+      throw new Error(
+        `숨겨진 동일 YouTube 자막이 번역 요청으로 전달됐습니다: ${hiddenSameCueRequests}`
+      );
+    }
+    await mockYoutube.evaluate(() => {
+      document.querySelector(".ytp-caption-window-container")
+        ?.classList.remove("captions-hidden");
+    });
+    await mockYoutube.waitForTimeout(500);
+    const reappearedSameCueRequests = await serviceWorker.evaluate(
+      () => globalThis.__ongeulHiddenCaptionTranslateCount
+    );
+    if (reappearedSameCueRequests !== 1) {
+      throw new Error(
+        `다시 나타난 동일 YouTube 자막이 재처리되지 않았습니다: ${reappearedSameCueRequests}`
+      );
+    }
+    await serviceWorker.evaluate(() => {
+      globalThis.__ongeulHiddenCaptionTranslateCount = 0;
+    });
+    await mockYoutube.evaluate(() => {
+      const window = document.querySelector(".ytp-caption-window-container");
+      if (window instanceof HTMLElement) window.style.opacity = "0";
+      const segment = window?.querySelector(".ytp-caption-segment");
+      if (segment) segment.textContent = "An opacity-hidden caption must stay hidden.";
+    });
+    await mockYoutube.waitForTimeout(500);
+    await mockYoutube.evaluate(() => {
+      const window = document.querySelector(".ytp-caption-window-container");
+      if (window instanceof HTMLElement) window.style.opacity = "";
+      document.querySelector(".ytp-subtitles-button")
+        ?.setAttribute("aria-pressed", "false");
+      const segment = window?.querySelector(".ytp-caption-segment");
+      if (segment) segment.textContent = "A caption behind disabled CC must stay hidden.";
+    });
+    await mockYoutube.waitForTimeout(500);
+    const hiddenCaptionState = await serviceWorker.evaluate(
+      () => globalThis.__ongeulHiddenCaptionTranslateCount
+    );
+    if (hiddenCaptionState !== 0) {
+      throw new Error(
+        `숨겨진 YouTube 자막이 번역 요청으로 전달됐습니다: ${hiddenCaptionState}`
+      );
+    }
+    console.log("YOUTUBE_HIDDEN_CAPTION_GUARD=PASS");
+
+    await mockYoutube.evaluate(() => {
+      const segment = document.querySelector(".ytp-caption-segment");
+      if (segment) segment.textContent = "브라우저 로컬 번역";
+    });
+    await mockYoutube.waitForTimeout(500);
+    await mockYoutube.evaluate(() => {
+      document.querySelector(".ytp-subtitles-button")
+        ?.setAttribute("aria-pressed", "true");
+    });
+    await mockYoutube.waitForTimeout(500);
+    await serviceWorker.evaluate(() => {
+      globalThis.__ongeulHiddenCaptionTranslateCount = 0;
+    });
+    await mockYoutube.evaluate(() => {
+      history.pushState({}, "", "/watch?v=ongeul-basic-spa-navigation");
+    });
+    await mockYoutube.waitForTimeout(1_600);
+    const navigationRescanRequests = await serviceWorker.evaluate(
+      () => globalThis.__ongeulHiddenCaptionTranslateCount
+    );
+    if (navigationRescanRequests !== 1) {
+      throw new Error(
+        `YouTube SPA 이동 후 첫 자막을 다시 처리하지 않았습니다: ${navigationRescanRequests}`
+      );
+    }
+    console.log("YOUTUBE_SPA_NAVIGATION_RESCAN=PASS");
   }
 
   let pageTranslation;
@@ -810,6 +987,46 @@ try {
     );
     console.log("PRIMARY_WEBGPU_FINAL=PASS");
   }
+
+  const inFlightSubtitleSize =
+    nextSubtitleSize <= 40 ? nextSubtitleSize + 1 : nextSubtitleSize - 1;
+  const pagehideSubtitleSize =
+    inFlightSubtitleSize <= 40
+      ? inFlightSubtitleSize + 1
+      : inFlightSubtitleSize - 1;
+  await popup.locator("#subtitle-size").evaluate((
+    element,
+    values
+  ) => {
+    const input = /** @type {HTMLInputElement} */ (element);
+    input.value = String(values.inFlight);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    input.value = String(values.pagehide);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }, {
+    inFlight: inFlightSubtitleSize,
+    pagehide: pagehideSubtitleSize
+  });
+  await popup.close();
+  const storedPagehideSubtitleSize = await serviceWorker.evaluate(async (
+    expectedSize
+  ) => {
+    const deadline = Date.now() + 2_000;
+    let stored;
+    while (Date.now() < deadline) {
+      stored = (await chrome.storage.sync.get("subtitleSize")).subtitleSize;
+      if (stored === expectedSize) return stored;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return stored;
+  }, pagehideSubtitleSize);
+  if (storedPagehideSubtitleSize !== pagehideSubtitleSize) {
+    throw new Error(
+      `popup 종료 직전 자막 크기를 보존하지 못했습니다: ${storedPagehideSubtitleSize}`
+    );
+  }
+  console.log("SUBTITLE_SIZE_PAGEHIDE_GUARD=PASS");
 
   const browserSession = await context.browser().newBrowserCDPSession();
   const { targetInfos } = await browserSession.send("Target.getTargets");

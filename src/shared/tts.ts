@@ -18,6 +18,29 @@ export interface TtsAudioMetrics {
   rms: number;
 }
 
+export interface ActiveSpeechEngine<Engine> {
+  current: Engine;
+}
+
+export async function synthesizeWithSpeechEngineFallback<
+  Engine extends { device: "webgpu" | "wasm" },
+  Output
+>(
+  activeEngine: ActiveSpeechEngine<Engine>,
+  synthesize: (engine: Engine) => Promise<Output>,
+  loadFallback: (failedEngine: Engine, error: unknown) => Promise<Engine>
+): Promise<Output> {
+  const engine = activeEngine.current;
+  try {
+    return await synthesize(engine);
+  } catch (error) {
+    if (engine.device !== "webgpu") throw error;
+    const fallbackEngine = await loadFallback(engine, error);
+    activeEngine.current = fallbackEngine;
+    return synthesize(fallbackEngine);
+  }
+}
+
 export function canControlSpeech(
   activeSpeechId: string | null,
   requestedSpeechId?: string

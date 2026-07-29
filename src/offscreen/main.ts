@@ -46,9 +46,11 @@ import {
   hasUsableTranslationOutput
 } from "../shared/text";
 import {
+  type ActiveSpeechEngine,
   canControlSpeech,
   chunkKoreanSpeech,
   prepareKoreanForTts,
+  synthesizeWithSpeechEngineFallback,
   validateTtsAudio
 } from "../shared/tts";
 import { createTranslationCacheKey } from "../shared/translation-cache";
@@ -210,11 +212,13 @@ async function runSpeech(
     // Keep the cancellable model download/session setup outside the inference
     // queue. A stopped cold TTS request must not block an already-ready
     // translation engine for several minutes while its files finish loading.
-    const synthesizer = await getTtsEngine();
+    const activeSynthesizer: ActiveSpeechEngine<SupertonicEngine> = {
+      current: await getTtsEngine()
+    };
     if (!isCurrentSpeech(run, speechId)) return;
 
     let pendingOutput = synthesizeSpeechChunk(
-      synthesizer,
+      activeSynthesizer,
       chunks[0],
       run,
       speechId
@@ -237,7 +241,7 @@ async function runSpeech(
       // This removes the synthesis-sized pause that previously occurred at
       // every chunk boundary.
       pendingOutput = synthesizeSpeechChunk(
-        synthesizer,
+        activeSynthesizer,
         chunks[index + 1],
         run,
         speechId
@@ -276,7 +280,7 @@ async function runSpeech(
 }
 
 function synthesizeSpeechChunk(
-  synthesizer: SupertonicEngine,
+  activeSynthesizer: ActiveSpeechEngine<SupertonicEngine>,
   chunk: string | undefined,
   run: number,
   speechId: string
@@ -303,39 +307,39 @@ function synthesizeSpeechChunk(
     });
 
   const output = (async () => {
-    try {
-      return await synthesize(synthesizer);
-    } catch (error) {
-      if (synthesizer.device !== "webgpu" || !isCurrentSpeech(run, speechId)) {
-        throw error;
+    return synthesizeWithSpeechEngineFallback(
+      activeSynthesizer,
+      synthesize,
+      async (synthesizer, error) => {
+        if (!isCurrentSpeech(run, speechId)) throw error;
+        forceTtsWasm = true;
+        await runtimeQueue.run(async () => {
+          if (
+            !isCurrentSpeech(run, speechId) ||
+            ttsEngine !== synthesizer
+          ) {
+            return;
+          }
+          ttsEngine = null;
+          ttsEnginePromise = null;
+          await synthesizer.release();
+        });
+        if (!isCurrentSpeech(run, speechId)) throw error;
+        ttsStatus = {
+          state: "loading",
+          modelId: TTS_MODEL_ID,
+          speechId,
+          progress: 0,
+          file: "WebGPU 추론 실패, WASM으로 다시 준비 중"
+        };
+        broadcastTtsStatus();
+        // Engine loading must happen outside an active runtimeQueue task because
+        // session creation is itself serialized through runtimeQueue.
+        const wasmSynthesizer = await getTtsEngine();
+        if (!isCurrentSpeech(run, speechId)) throw error;
+        return wasmSynthesizer;
       }
-      forceTtsWasm = true;
-      await runtimeQueue.run(async () => {
-        if (
-          !isCurrentSpeech(run, speechId) ||
-          ttsEngine !== synthesizer
-        ) {
-          return;
-        }
-        ttsEngine = null;
-        ttsEnginePromise = null;
-        await synthesizer.release();
-      });
-      if (!isCurrentSpeech(run, speechId)) return null;
-      ttsStatus = {
-        state: "loading",
-        modelId: TTS_MODEL_ID,
-        speechId,
-        progress: 0,
-        file: "WebGPU 추론 실패, WASM으로 다시 준비 중"
-      };
-      broadcastTtsStatus();
-      // Engine loading must happen outside an active runtimeQueue task because
-      // session creation is itself serialized through runtimeQueue.
-      const wasmSynthesizer = await getTtsEngine();
-      if (!isCurrentSpeech(run, speechId)) return null;
-      return synthesize(wasmSynthesizer);
-    }
+    );
   })();
   // The next chunk can fail while the current audio is still playing. Attach a
   // handler immediately; awaiting the original promise still forwards the

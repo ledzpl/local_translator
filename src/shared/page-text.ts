@@ -13,6 +13,14 @@ export function getPageTranslationTerminalState(
   return failed > 0 ? "partial" : "complete";
 }
 
+export function pageTranslationSourceStillMatches(
+  isConnected: boolean,
+  sourceSnapshot: string,
+  currentText: string
+): boolean {
+  return isConnected && normalizeText(currentText) === sourceSnapshot;
+}
+
 export function getPageTranslationText(text: string): string | null {
   const normalized = normalizeText(text);
   if (

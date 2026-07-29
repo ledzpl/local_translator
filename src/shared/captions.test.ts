@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   captionStillMatches,
   captionTranslationKey,
+  isYoutubeCaptionWindowVisible,
   joinCaptionSegments,
   shouldRequestPendingCaption
 } from "./captions";
@@ -9,6 +10,42 @@ import {
 describe("YouTube caption helpers", () => {
   it("joins YouTube caption segments without duplicated whitespace", () => {
     expect(joinCaptionSegments(["Hello ", "  from", "\nYouTube"])).toBe("Hello from YouTube");
+  });
+
+  it("rejects caption windows hidden by layout, attributes, or CSS", () => {
+    const visible = {
+      hasLayoutBox: true,
+      hidden: false,
+      ariaHidden: null,
+      display: "block",
+      opacity: "1",
+      visibility: "visible"
+    };
+    expect(isYoutubeCaptionWindowVisible(visible)).toBe(true);
+    expect(isYoutubeCaptionWindowVisible({
+      ...visible,
+      hasLayoutBox: false
+    })).toBe(false);
+    expect(isYoutubeCaptionWindowVisible({
+      ...visible,
+      hidden: true
+    })).toBe(false);
+    expect(isYoutubeCaptionWindowVisible({
+      ...visible,
+      ariaHidden: "true"
+    })).toBe(false);
+    expect(isYoutubeCaptionWindowVisible({
+      ...visible,
+      display: "none"
+    })).toBe(false);
+    expect(isYoutubeCaptionWindowVisible({
+      ...visible,
+      opacity: "0"
+    })).toBe(false);
+    expect(isYoutubeCaptionWindowVisible({
+      ...visible,
+      visibility: "hidden"
+    })).toBe(false);
   });
 
   it("allows a translated partial cue while YouTube appends words", () => {

@@ -13,6 +13,7 @@ import { LruCache } from "../shared/cache";
 import {
   captionStillMatches,
   captionTranslationKey,
+  isYoutubeCaptionWindowVisible,
   joinCaptionSegments,
   shouldRequestPendingCaption
 } from "../shared/captions";
@@ -20,6 +21,7 @@ import {
   getPageTranslationTerminalState,
   getPageTranslationTexts,
   isLikelyProsePreformatted,
+  pageTranslationSourceStillMatches,
   prioritizePageTranslationCandidates
 } from "../shared/page-text";
 import { hasPrivacyConsent } from "../shared/privacy";
@@ -227,6 +229,7 @@ class OverlayView {
 interface PageTranslationBlock {
   element: HTMLElement;
   sourceText: string;
+  sourceSnapshot: string;
 }
 
 class InPageTranslator {
@@ -316,10 +319,11 @@ class InPageTranslator {
       const rect = element.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) continue;
       const sourceTexts = getPageTranslationTexts(element.textContent ?? "");
+      const sourceSnapshot = normalizeText(element.textContent ?? "");
       const visible = rect.bottom >= 0 && rect.top <= window.innerHeight;
       for (const sourceText of sourceTexts) {
         candidates.push({
-          value: { element, sourceText },
+          value: { element, sourceText, sourceSnapshot },
           sourceText,
           visible
         });
@@ -346,7 +350,14 @@ class InPageTranslator {
           origin: "page"
         }) as TranslationResponse;
         if (generation !== this.generation) return;
-        if (response.ok) {
+        if (
+          response.ok &&
+          pageTranslationSourceStillMatches(
+            block.element.isConnected,
+            block.sourceSnapshot,
+            block.element.textContent ?? ""
+          )
+        ) {
           this.renderTranslation(block.element, response.translation);
           this.status.completed += 1;
         } else {
@@ -666,13 +677,16 @@ class YouTubeCaptionTranslator {
     window.setInterval(() => {
       if (this.navigationUrl === location.href) return;
       this.navigationUrl = location.href;
+      this.settingsGeneration += 1;
       this.lastRequestedKey = "";
       this.currentCaption = "";
       this.pendingCaption = "";
+      this.retryAttempts.clear();
       this.clearRetry();
       this.view.hideSubtitle();
       this.applyOriginalCaptionVisibility(false);
       this.maybeEnableCaptions();
+      this.scheduleScan();
     }, 900);
   }
 
@@ -688,11 +702,17 @@ class YouTubeCaptionTranslator {
         const node = mutation.target instanceof Element
           ? mutation.target
           : mutation.target.parentElement;
-        return Boolean(node?.closest(".ytp-caption-window-container, .ytp-caption-segment"));
+        return Boolean(
+          node?.closest(
+            ".ytp-caption-window-container, .ytp-caption-segment, .ytp-subtitles-button"
+          )
+        );
       });
       if (captionChanged) this.scheduleScan();
     });
     this.observer.observe(document.body, {
+      attributes: true,
+      attributeFilter: ["aria-hidden", "aria-pressed", "class", "hidden", "style"],
       childList: true,
       characterData: true,
       subtree: true
@@ -707,10 +727,16 @@ class YouTubeCaptionTranslator {
   private scan(): void {
     if (!hasPrivacyConsent(this.settings) || !this.settings.youtubeEnabled) return;
     this.applyOriginalCaptionVisibility(false);
+    const captionsButton =
+      document.querySelector<HTMLButtonElement>(".ytp-subtitles-button");
+    if (captionsButton?.getAttribute("aria-pressed") === "false") {
+      this.resetHiddenCaptionState();
+      return;
+    }
     const text = readVisibleYoutubeCaption();
     this.currentCaption = text;
     if (!text) {
-      this.view.hideSubtitle();
+      this.resetHiddenCaptionState();
       return;
     }
 
@@ -835,6 +861,15 @@ class YouTubeCaptionTranslator {
     }
   }
 
+  private resetHiddenCaptionState(): void {
+    this.lastRequestedKey = "";
+    this.currentCaption = "";
+    this.pendingCaption = "";
+    this.retryAttempts.clear();
+    this.clearRetry();
+    this.view.hideSubtitle();
+  }
+
   private maybeEnableCaptions(): void {
     if (
       !hasPrivacyConsent(this.settings) ||
@@ -850,17 +885,27 @@ class YouTubeCaptionTranslator {
   }
 
   private applyOriginalCaptionVisibility(hasTranslation = false): void {
-    const opacity =
+    const hidden =
       hasPrivacyConsent(this.settings) &&
       this.settings.youtubeEnabled &&
       !this.settings.showOriginalCaptions &&
-      hasTranslation
-        ? "0"
-        : "";
+      hasTranslation;
+    if (hidden) this.ensureOriginalCaptionStyle();
     document.querySelectorAll<HTMLElement>(".ytp-caption-window-container")
       .forEach((element) => {
-        element.style.opacity = opacity;
+        element.toggleAttribute("data-ongeul-original-caption-hidden", hidden);
       });
+  }
+
+  private ensureOriginalCaptionStyle(): void {
+    if (document.querySelector("[data-ongeul-overlay='caption-style']")) return;
+    const style = createStyle(
+      ".ytp-caption-window-container[data-ongeul-original-caption-hidden] {" +
+      " opacity: 0 !important;" +
+      " }"
+    );
+    style.dataset.ongeulOverlay = "caption-style";
+    document.documentElement.append(style);
   }
 }
 
@@ -868,8 +913,17 @@ export function readVisibleYoutubeCaption(root: ParentNode = document): string {
   const windows = Array.from(
     root.querySelectorAll<HTMLElement>(".ytp-caption-window-container")
   );
-  const visible = windows.filter((element) => element.getClientRects().length > 0);
-  const candidate = visible.at(-1) ?? windows.at(-1);
+  const candidate = windows.filter((element) => {
+    const style = getComputedStyle(element);
+    return isYoutubeCaptionWindowVisible({
+      hasLayoutBox: element.getClientRects().length > 0,
+      hidden: element.hidden,
+      ariaHidden: element.getAttribute("aria-hidden"),
+      display: style.display,
+      opacity: style.opacity,
+      visibility: style.visibility
+    });
+  }).at(-1);
   if (!candidate) return "";
   const segments = Array.from(candidate.querySelectorAll<HTMLElement>(".ytp-caption-segment"));
   return joinCaptionSegments(segments.map((segment) => segment.textContent));

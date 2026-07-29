@@ -5,6 +5,7 @@ import {
   getPageTranslationTexts,
   isLikelyProsePreformatted,
   limitPageTranslationTexts,
+  pageTranslationSourceStillMatches,
   prioritizePageTranslationCandidates
 } from "./page-text";
 
@@ -68,5 +69,20 @@ describe("page translation text selection", () => {
     expect(getPageTranslationTerminalState(4, 0)).toBe("complete");
     expect(getPageTranslationTerminalState(4, 1)).toBe("partial");
     expect(getPageTranslationTerminalState(4, 4)).toBe("error");
+  });
+
+  it("rejects a page translation result after its source node was replaced or changed", () => {
+    const source = "A paragraph collected before an asynchronous translation.";
+    expect(pageTranslationSourceStillMatches(true, source, source)).toBe(true);
+    expect(pageTranslationSourceStillMatches(
+      false,
+      source,
+      source
+    )).toBe(false);
+    expect(pageTranslationSourceStillMatches(
+      true,
+      source,
+      "A replacement paragraph rendered by the SPA."
+    )).toBe(false);
   });
 });
