@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   encodeSupertonicText,
-  preprocessSupertonicText
+  preprocessSupertonicText,
+  shouldRefreshSupertonicCache
 } from "./supertonic";
 
 describe("preprocessSupertonicText", () => {
@@ -30,5 +31,22 @@ describe("encodeSupertonicText", () => {
   it("indexer가 지원하지 않는 문자를 거부한다", () => {
     expect(() => encodeSupertonicText("가", []))
       .toThrow("지원하지 않는 문자");
+  });
+});
+
+describe("shouldRefreshSupertonicCache", () => {
+  it("retries malformed model data but preserves caches for hardware failures", () => {
+    expect(shouldRefreshSupertonicCache(
+      new Error("Failed to load model because protobuf parsing failed")
+    )).toBe(true);
+    expect(shouldRefreshSupertonicCache(
+      new SyntaxError("Unexpected end of JSON input")
+    )).toBe(true);
+    expect(shouldRefreshSupertonicCache(
+      new Error("Failed to create WebGPU buffer: out of memory")
+    )).toBe(false);
+    expect(shouldRefreshSupertonicCache(
+      new Error("no available backend found")
+    )).toBe(false);
   });
 });

@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   containsMostlyKorean,
   normalizeLanguageCode,
-  pickDetectedLanguage
+  pickDetectedLanguage,
+  supportsTranslateGemmaLanguage
 } from "./languages";
 
 describe("language helpers", () => {
@@ -26,5 +27,16 @@ describe("language helpers", () => {
       { language: "fr", percentage: 18 },
       { language: "es", percentage: 82 }
     ])).toBe("es");
+  });
+
+  it("routes detector codes missing from the pinned TranslateGemma template", () => {
+    expect(supportsTranslateGemmaLanguage("en")).toBe(true);
+    expect(supportsTranslateGemmaLanguage("fr")).toBe(true);
+    expect(supportsTranslateGemmaLanguage("ko")).toBe(true);
+    expect(supportsTranslateGemmaLanguage("cs")).toBe(true);
+    expect(supportsTranslateGemmaLanguage("ast")).toBe(false);
+    expect(supportsTranslateGemmaLanguage("ceb")).toBe(false);
+    expect(supportsTranslateGemmaLanguage("ilo")).toBe(false);
+    expect(supportsTranslateGemmaLanguage("ns")).toBe(false);
   });
 });

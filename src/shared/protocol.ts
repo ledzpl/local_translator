@@ -34,7 +34,7 @@ export const DEFAULT_SETTINGS: ExtensionSettings = {
   subtitleSize: 28,
   sourceLanguage: "auto",
   modelPreference: DEFAULT_MODEL_PREFERENCE,
-  devicePreference: "auto"
+  devicePreference: "webgpu"
 };
 
 export interface TranslateRequest {
@@ -75,6 +75,7 @@ export interface TranslationFailure {
   error: string;
   code:
     | "EMPTY_TEXT"
+    | "TEXT_TOO_LONG"
     | "CONSENT_REQUIRED"
     | "MODEL_LOAD_FAILED"
     | "TRANSLATION_FAILED"

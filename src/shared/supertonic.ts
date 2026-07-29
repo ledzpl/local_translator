@@ -54,6 +54,7 @@ const MODEL_FILES = [
 
 const TOTAL_STEPS = 8;
 const SPEECH_SPEED = 1.05;
+const MODEL_CACHE_NAME = "ongeul-supertonic-model-v1";
 
 export function configureSupertonicRuntime(wasmBaseUrl: string): void {
   ort.env.wasm.wasmPaths = wasmBaseUrl;
@@ -83,8 +84,17 @@ export class SupertonicEngine {
     voiceStyleUrl: string;
     device: SupertonicDevice;
     onProgress?: (progress: SupertonicLoadProgress) => void;
+    runSessionCreate?: (
+      task: () => Promise<ort.InferenceSession>
+    ) => Promise<ort.InferenceSession>;
   }): Promise<SupertonicEngine> {
-    const { modelBaseUrl, voiceStyleUrl, device, onProgress } = options;
+    const {
+      modelBaseUrl,
+      voiceStyleUrl,
+      device,
+      onProgress,
+      runSessionCreate
+    } = options;
     const [config, indexer, style] = await Promise.all([
       fetchJson<SupertonicConfig>(`${modelBaseUrl}/tts.json`),
       fetchJson<number[]>(`${modelBaseUrl}/unicode_indexer.json`),
@@ -101,13 +111,23 @@ export class SupertonicEngine {
           current: index,
           total: MODEL_FILES.length
         });
-        sessions.push(await ort.InferenceSession.create(
-          `${modelBaseUrl}/${filename}`,
+        const modelBytes = await fetchModelBytes(
+          `${modelBaseUrl}/${filename}`
+        );
+        const createSession = () => ort.InferenceSession.create(
+          modelBytes,
           {
             executionProviders: [device],
             graphOptimizationLevel: "all"
           }
-        ));
+        );
+        sessions.push(
+          await (
+            runSessionCreate
+              ? runSessionCreate(createSession)
+              : createSession()
+          )
+        );
       }
       onProgress?.({
         file: "음성 모델 준비 완료",
@@ -344,13 +364,54 @@ function flattenNumbers(values: unknown[]): number[] {
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
+  const bytes = await fetchModelBytes(url);
+  return JSON.parse(new TextDecoder().decode(bytes)) as T;
+}
+
+async function fetchModelBytes(url: string): Promise<ArrayBuffer> {
+  const cache = await caches.open(MODEL_CACHE_NAME);
+  const cached = await cache.match(url);
+  if (cached) {
+    const bytes = await cached.arrayBuffer();
+    if (bytes.byteLength > 0) return bytes;
+    await cache.delete(url);
+  }
+
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(
       `Supertonic 3 파일을 받지 못했습니다 (${response.status}): ${url}`
     );
   }
-  return response.json() as Promise<T>;
+  const cacheResponse = response.clone();
+  const cacheWrite = cache.put(url, cacheResponse).catch(() => undefined);
+  const [bytes] = await Promise.all([
+    response.arrayBuffer(),
+    cacheWrite
+  ]);
+  if (bytes.byteLength === 0) {
+    await cache.delete(url);
+    throw new Error(`Supertonic 3 파일이 비어 있습니다: ${url}`);
+  }
+  return bytes;
+}
+
+export async function clearSupertonicModelCache(): Promise<void> {
+  await caches.delete(MODEL_CACHE_NAME);
+}
+
+export function shouldRefreshSupertonicCache(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return [
+    /unexpected end of json/iu,
+    /unexpected token.*json/iu,
+    /not valid json/iu,
+    /protobuf.*(?:pars|decod|truncat|corrupt)/iu,
+    /invalid (?:onnx )?model (?:format|file)/iu,
+    /(?:model|onnx|external data|file).*(?:corrupt|truncat)/iu,
+    /(?:corrupt|truncat).*(?:model|onnx|external data|file)/iu,
+    /파일이 비어 있습니다/u
+  ].some((pattern) => pattern.test(message));
 }
 
 function validateConfig(config: SupertonicConfig): void {

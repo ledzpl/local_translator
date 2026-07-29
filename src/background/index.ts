@@ -24,13 +24,19 @@ import {
 } from "../shared/languages";
 import { hasPrivacyConsent } from "../shared/privacy";
 import { SerialTaskQueue } from "../shared/serial-queue";
-import { friendlyError, normalizeText } from "../shared/text";
+import {
+  createTextPreview,
+  TRANSLATION_REQUEST_MAX_CHARS,
+  friendlyError,
+  normalizeText
+} from "../shared/text";
 import { shouldMarkSpeechIdle } from "../shared/tts";
 
 let creatingOffscreen: Promise<void> | null = null;
 let recoveringOffscreen: Promise<void> | null = null;
 let wasmFallbackOffscreenReady = false;
 let ttsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
+let ttsInterruptedByEngineRecovery = false;
 const translationRequests = new SerialTaskQueue();
 const speechStarts = new Map<string, Promise<SpeakResponse>>();
 let latestSpeechStartId: string | null = null;
@@ -99,6 +105,16 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
           requestId: message.requestId,
           code: "EMPTY_TEXT",
           error: "번역할 텍스트가 없습니다."
+        } satisfies TranslationResponse;
+      }
+      if (text.length > TRANSLATION_REQUEST_MAX_CHARS) {
+        return {
+          ok: false,
+          requestId: message.requestId,
+          code: "TEXT_TOO_LONG",
+          error:
+            `한 번에 번역할 수 있는 텍스트는 ` +
+            `${TRANSLATION_REQUEST_MAX_CHARS.toLocaleString("ko-KR")}자까지입니다.`
         } satisfies TranslationResponse;
       }
 
@@ -183,7 +199,23 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
         target: "offscreen",
         type: "GET_TTS_STATUS_OFFSCREEN"
       });
-      if (isTtsStatus(liveStatus)) ttsStatus = liveStatus;
+      if (
+        isTtsStatus(liveStatus) &&
+        !(
+          ttsInterruptedByEngineRecovery &&
+          ttsStatus.state === "error" &&
+          liveStatus.state === "idle"
+        )
+      ) {
+        ttsStatus = liveStatus;
+      } else if (liveStatus === null && isActiveTtsStatus(ttsStatus)) {
+        ttsStatus = {
+          state: "idle",
+          modelId: TTS_MODEL_ID,
+          speechId: ttsStatus.speechId
+        };
+        broadcastTtsStatus();
+      }
       return ttsStatus;
     }
     case "STOP_SPEAKING": {
@@ -340,6 +372,7 @@ async function hasStoredPrivacyConsent(): Promise<boolean> {
 async function startKoreanSpeech(
   message: Extract<BackgroundMessage, { type: "SPEAK_KOREAN" }>
 ): Promise<SpeakResponse> {
+  ttsInterruptedByEngineRecovery = false;
   const settings = await getSettings();
   if (latestSpeechStartId !== message.speechId) {
     return {
@@ -426,6 +459,14 @@ function isTtsStatus(value: unknown): value is TtsStatus {
     typeof value === "object" &&
     "state" in value &&
     "modelId" in value
+  );
+}
+
+function isActiveTtsStatus(value: TtsStatus): boolean {
+  return (
+    value.state === "loading" ||
+    value.state === "synthesizing" ||
+    value.state === "playing"
   );
 }
 
@@ -610,13 +651,35 @@ async function recreateOffscreenDocumentForWasm(
         await creatingOffscreen.catch(() => undefined);
       }
 
+      const liveTtsStatus = await chrome.runtime.sendMessage({
+        target: "offscreen",
+        type: "GET_TTS_STATUS_OFFSCREEN"
+      } satisfies OffscreenMessage).catch(() => null);
+      if (isTtsStatus(liveTtsStatus)) {
+        // The service worker can restart while its offscreen audio task keeps
+        // running, so refresh the in-memory snapshot before closing the realm.
+        ttsStatus = liveTtsStatus;
+      }
+      const interruptedSpeechId = isActiveTtsStatus(ttsStatus)
+        ? ttsStatus.speechId
+        : undefined;
       latestSpeechStartId = null;
       speechStarts.clear();
-      ttsStatus = {
-        state: "idle",
-        modelId: TTS_MODEL_ID,
-        speechId: ttsStatus.speechId
-      };
+      ttsInterruptedByEngineRecovery = Boolean(interruptedSpeechId);
+      ttsStatus = interruptedSpeechId
+        ? {
+            state: "error",
+            modelId: TTS_MODEL_ID,
+            speechId: interruptedSpeechId,
+            error:
+              "번역 엔진을 WASM으로 전환하면서 음성 재생이 중단됐습니다. " +
+              "다시 듣기를 눌러 주세요."
+          }
+        : {
+            state: "idle",
+            modelId: TTS_MODEL_ID,
+            speechId: ttsStatus.speechId
+          };
       broadcastTtsStatus();
 
       const url = chrome.runtime.getURL(OFFSCREEN_PATH);
@@ -712,25 +775,43 @@ async function translateAndDisplay(
   origin: TranslationOrigin
 ): Promise<void> {
   if (!await hasStoredPrivacyConsent()) return;
+  const text = normalizeText(sourceText);
+  if (!text) return;
+  const sourcePreview = createTextPreview(text);
   try {
     await ensureContentScript(tabId);
+    if (text.length > TRANSLATION_REQUEST_MAX_CHARS) {
+      await chrome.tabs.sendMessage(tabId, {
+        type: "SHOW_TRANSLATION",
+        sourceText: sourcePreview,
+        response: {
+          ok: false,
+          requestId: crypto.randomUUID(),
+          code: "TEXT_TOO_LONG",
+          error:
+            `한 번에 번역할 수 있는 텍스트는 ` +
+            `${TRANSLATION_REQUEST_MAX_CHARS.toLocaleString("ko-KR")}자까지입니다.`
+        }
+      } satisfies ContentMessage);
+      return;
+    }
     await chrome.tabs.sendMessage(tabId, {
       type: "TRANSLATION_STARTED",
-      sourceText
+      sourceText: sourcePreview
     } satisfies ContentMessage);
 
     const response = await handleBackgroundMessage({
       target: "background",
       type: "TRANSLATE",
       requestId: crypto.randomUUID(),
-      text: sourceText,
+      text,
       sourceLanguage: "auto",
       origin
     }) as TranslationResponse;
 
     await chrome.tabs.sendMessage(tabId, {
       type: "SHOW_TRANSLATION",
-      sourceText,
+      sourceText: sourcePreview,
       response
     } satisfies ContentMessage);
   } catch (error) {
@@ -742,7 +823,7 @@ async function translateAndDisplay(
     };
     await chrome.tabs.sendMessage(tabId, {
       type: "SHOW_TRANSLATION",
-      sourceText,
+      sourceText: sourcePreview,
       response
     } satisfies ContentMessage).catch(() => undefined);
   }

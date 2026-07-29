@@ -27,9 +27,9 @@ AI 모델을 처음 사용할 때는 HTTPS로 Hugging Face에 연결하여 모�
 ## 저장과 보관
 
 - 기본 TranslateGemma 4B 모델은 약 3.1GB입니다. WebGPU를 사용할 수 없거나 실행이 실패해 M2M100 WASM으로 전환하면 약 650MB를 추가로 내려받을 수 있습니다.
-- 모델 파일은 Chrome의 확장 프로그램 전용 Cache Storage에 저장되어 다음 실행에 재사용됩니다. WebGPU 초기화에 실패한 가중치는 Cache Storage에서 정리합니다.
+- 모델 파일은 Chrome의 확장 프로그램 전용 Cache Storage에 저장되어 다음 실행에 재사용됩니다. WebGPU 하드웨어 호환성 실패만으로 이미 내려받은 정상 모델 파일을 삭제하지 않습니다.
 - 번역 결과 캐시는 실행 중인 오프스크린 문서의 메모리에만 보관되며 외부로 전송하거나 영구 저장하지 않습니다.
-- 데이터 처리 안내 확인 버전, 모델·실행 장치·언어·YouTube 자막 설정은 `chrome.storage.sync`에 저장되며 Chrome에 로그인한 사용자의 브라우저 사이에서 동기화될 수 있습니다.
+- 데이터 처리 안내 확인 버전, 모델·실행 장치·언어·YouTube 자막 설정은 `chrome.storage.sync`에 저장됩니다. 사용자가 Chrome 동기화를 켠 경우 이 설정은 Google의 Chrome 동기화 인프라에서 처리되고 로그인한 브라우저 사이에 동기화될 수 있습니다.
 - 웹페이지 내용, 선택 텍스트, 자막, 번역 결과와 음성은 `chrome.storage.sync`에 저장하지 않습니다.
 - 자체 분석 도구, 광고 SDK, 사용자 계정과 개발자 운영 서버를 사용하지 않습니다.
 
@@ -41,7 +41,7 @@ Chrome에서 확장 프로그램을 삭제하면 기기에 저장된 확장 프�
 
 ## 데이터 공유와 Limited Use
 
-온글 번역은 사용자 데이터를 판매하거나 광고 사업자·데이터 브로커 등 제3자에게 공유하지 않습니다. 사용자의 정보를 한국어 번역 및 음성 생성 기능 제공 외 목적으로 사용하지 않습니다. Chrome API에서 받은 정보의 사용은 [Chrome Web Store User Data Policy](https://developer.chrome.com/docs/webstore/program-policies/policies#user-data-policy)의 Limited Use 요건을 준수합니다.
+온글 번역은 번역 텍스트, 페이지 내용, 자막, 번역 결과와 음성을 제3자에게 공유하지 않습니다. 다만 모델 다운로드 연결 메타데이터는 위에서 설명한 대로 Hugging Face가 처리할 수 있고, 사용자가 Chrome 동기화를 켠 경우 위 설정은 Google의 Chrome 동기화 인프라가 처리할 수 있습니다. 이 정보를 판매하거나 광고·프로파일링에 사용하지 않으며, 한국어 번역 및 음성 생성 기능 제공 외 목적으로 사용하지 않습니다. Chrome API에서 받은 정보의 사용은 [Chrome Web Store User Data Policy](https://developer.chrome.com/docs/webstore/program-policies/policies#user-data-policy)의 Limited Use 요건을 준수합니다.
 
 ## 방침 변경
 
@@ -49,4 +49,4 @@ Chrome에서 확장 프로그램을 삭제하면 기기에 저장된 확장 프�
 
 ## 문의
 
-개인정보와 기능 관련 문의는 [프로젝트 GitHub Issues](https://github.com/ledzpl/local_translator/issues)에서 접수합니다.
+개인정보와 기능 관련 문의는 [프로젝트 GitHub Issues](https://github.com/ledzpl/local_translator/issues)에서 접수합니다. GitHub Issues는 공개 게시판이므로 번역 원문, 개인 식별 정보나 다른 민감정보를 올리지 마세요. 이슈를 게시하면 계정·게시물 메타데이터는 [GitHub 개인정보처리방침](https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement)의 적용을 받습니다. Chrome Web Store에 등록된 개발자 연락처 이메일을 통한 비공개 문의 경로도 제출 전에 함께 확인합니다.

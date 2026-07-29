@@ -1,6 +1,6 @@
 # Third-party notices
 
-온글 번역은 다음 오픈소스 소프트웨어와 모델을 사용합니다. npm 버전은
+온글 번역은 다음 제3자 소프트웨어와 모델을 사용합니다. npm 버전은
 `package-lock.json`에 고정된 브라우저 런타임 의존성을 기준으로 합니다.
 
 - [Transformers.js 4.2.0](https://github.com/huggingface/transformers.js) —
@@ -33,7 +33,10 @@
   WASM으로 실행하며 모델을 추가 수정하지 않습니다.
 
 확장 패키지의 `LICENSES/`에는 위 브라우저 런타임과 Supertonic 추론 코드의
-Apache 2.0, MIT, ISC 및 BSD 3-Clause 라이선스 전문과 저작권 고지가 포함됩니다.
+Apache 2.0, MIT, ISC 및 BSD 3-Clause 라이선스 전문과 저작권 고지가 포함되며,
+Supertonic 3 모델의 OpenRAIL-M 전문과 사용 제한도 함께 포함됩니다.
+현재 Gemma 이용약관 사본과 공식 배포 NOTICE도 함께 포함됩니다. 공식 약관 URL이
+사본보다 우선하며, 제출 전 현재 약관과 금지 용도 정책을 다시 확인해야 합니다.
 ONNX Runtime Web 번들 안에 보존된 Google 기여 코드의 Apache 2.0 고지도 그대로
 유지됩니다.
 Node 전용 선택 의존성인 `onnxruntime-node`와 `sharp`는 확장 실행 번들에 포함하지

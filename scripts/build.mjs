@@ -71,6 +71,18 @@ await Promise.all([
     join(licenseDist, "supertonic-code-MIT.txt")
   ),
   cp(
+    join(root, "LICENSES/supertonic-model-OpenRAIL-M.txt"),
+    join(licenseDist, "supertonic-model-OpenRAIL-M.txt")
+  ),
+  cp(
+    join(root, "LICENSES/Gemma-NOTICE.txt"),
+    join(licenseDist, "Gemma-NOTICE.txt")
+  ),
+  cp(
+    join(root, "LICENSES/Gemma-Terms-of-Use.txt"),
+    join(licenseDist, "Gemma-Terms-of-Use.txt")
+  ),
+  cp(
     join(root, "node_modules/@huggingface/jinja/LICENSE"),
     join(licenseDist, "huggingface-jinja-MIT.txt")
   ),

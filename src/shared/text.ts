@@ -1,7 +1,34 @@
 const MAX_INPUT_CHARS = 420;
+export const TRANSLATION_REQUEST_MAX_CHARS = 5_000;
+export const TRANSLATION_OVERLAY_PREVIEW_CHARS = 240;
 
 export function normalizeText(text: string): string {
   return text.replace(/\u200b/g, "").replace(/\s+/g, " ").trim();
+}
+
+export function hasUsableTranslationOutput(
+  sourceText: string,
+  translatedText: string
+): boolean {
+  const normalizedOutput = normalizeText(translatedText);
+  if (!normalizedOutput) return false;
+  if (/^(?:<\/?(?:pad|s|unk)>\s*)+$/iu.test(normalizedOutput)) return false;
+
+  const sourceHasWordsOrNumbers = /[\p{L}\p{N}]/u.test(sourceText);
+  return (
+    !sourceHasWordsOrNumbers ||
+    /[\p{L}\p{N}]/u.test(normalizedOutput)
+  );
+}
+
+export function createTextPreview(
+  text: string,
+  maxChars = TRANSLATION_OVERLAY_PREVIEW_CHARS
+): string {
+  const normalized = normalizeText(text);
+  if (normalized.length <= maxChars) return normalized;
+  if (maxChars <= 1) return "…".slice(0, Math.max(0, maxChars));
+  return `${normalized.slice(0, maxChars - 1).trimEnd()}…`;
 }
 
 export function chunkText(text: string, maxChars = MAX_INPUT_CHARS): string[] {

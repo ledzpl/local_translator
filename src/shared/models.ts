@@ -1,14 +1,14 @@
-export const SMALL100_MODEL_ID = "casawolice/small100-onnx";
-export const SMALL100_REVISION = "5c2c73ac70bee9c58f5a7ac5e84a36bee25db8ee";
+import modelLock from "../../models.lock.json";
+
+export const SMALL100_MODEL_ID = modelLock.small100.id;
+export const SMALL100_REVISION = modelLock.small100.revision;
 export const SMALL100_KOREAN_TOKEN_ID = 128052;
-export const M2M100_MODEL_ID = "Xenova/m2m100_418M";
-export const M2M100_REVISION = "9c374f0b7aca709787cea97b047bfbbd1559d177";
-export const TRANSLATEGEMMA_MODEL_ID =
-  "onnx-community/translategemma-text-4b-it-ONNX";
-export const TRANSLATEGEMMA_REVISION =
-  "f7874a1ac60758872a4f78aac0df95b17b776994";
-export const TTS_MODEL_ID = "Supertone/supertonic-3";
-export const TTS_MODEL_REVISION = "3cadd1ee6394adea1bd021217a0e650ede09a323";
+export const M2M100_MODEL_ID = modelLock.m2m100.id;
+export const M2M100_REVISION = modelLock.m2m100.revision;
+export const TRANSLATEGEMMA_MODEL_ID = modelLock.translategemma.id;
+export const TRANSLATEGEMMA_REVISION = modelLock.translategemma.revision;
+export const TTS_MODEL_ID = modelLock.tts.id;
+export const TTS_MODEL_REVISION = modelLock.tts.revision;
 export const TTS_VOICE_STYLE = "M1";
 
 export function getTtsModelFileUrl(path: string): string {
@@ -48,36 +48,6 @@ export const MODEL_DEFINITIONS: Record<ModelPreference, ModelDefinition> = {
 
 export const DEFAULT_MODEL_ID =
   MODEL_DEFINITIONS[DEFAULT_MODEL_PREFERENCE].id;
-
-export function isM2m100WebGpuWeightUrl(value: string): boolean {
-  let normalized = value;
-  try {
-    normalized = decodeURIComponent(value);
-  } catch {
-    // A malformed cache key cannot match the reviewed model path below.
-  }
-  normalized = normalized.toLowerCase();
-  return (
-    normalized.includes("/xenova/m2m100_418m/") &&
-    /\/onnx\/[^/?#]*_q4f16\.onnx(?:[?#]|$)/u.test(normalized)
-  );
-}
-
-export function isTranslateGemmaWebGpuWeightUrl(value: string): boolean {
-  let normalized = value;
-  try {
-    normalized = decodeURIComponent(value);
-  } catch {
-    // A malformed cache key cannot match the reviewed model path below.
-  }
-  normalized = normalized.toLowerCase();
-  return (
-    normalized.includes(
-      "/onnx-community/translategemma-text-4b-it-onnx/"
-    ) &&
-    /\/onnx\/model_q4\.onnx(?:_data(?:_\d+)?)?(?:[?#]|$)/u.test(normalized)
-  );
-}
 
 export function createSmall100InputIds(
   sourceIds: ArrayLike<number | bigint>

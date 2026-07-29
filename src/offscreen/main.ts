@@ -21,6 +21,7 @@ import {
   type TranslationResponse
 } from "../shared/protocol";
 import { LruCache } from "../shared/cache";
+import { supportsTranslateGemmaLanguage } from "../shared/languages";
 import {
   M2M100_REVISION,
   M2M100_MODEL_ID,
@@ -30,16 +31,20 @@ import {
   TRANSLATEGEMMA_REVISION,
   TTS_VOICE_STYLE,
   createSmall100InputIds,
-  getTtsModelFileUrl,
-  isM2m100WebGpuWeightUrl,
-  isTranslateGemmaWebGpuWeightUrl
+  getTtsModelFileUrl
 } from "../shared/models";
 import { SerialTaskQueue } from "../shared/serial-queue";
 import {
   SupertonicEngine,
-  configureSupertonicRuntime
+  clearSupertonicModelCache,
+  configureSupertonicRuntime,
+  shouldRefreshSupertonicCache
 } from "../shared/supertonic";
-import { chunkText, friendlyError } from "../shared/text";
+import {
+  chunkText,
+  friendlyError,
+  hasUsableTranslationOutput
+} from "../shared/text";
 import {
   canControlSpeech,
   chunkKoreanSpeech,
@@ -91,8 +96,10 @@ let loadedDevicePreference: DevicePreference | null = null;
 let loadedRuntimeDevice: RuntimeDevice | null = null;
 let loadedModelPreference: ModelPreference | null = null;
 let status: EngineStatus = { state: "idle", modelId: MODEL_ID };
-const engineQueue = new SerialTaskQueue();
-const ttsSynthesisQueue = new SerialTaskQueue();
+// ONNX Runtime WebGPU sessions share one adapter/device in this offscreen
+// realm. Serialize model loading, translation, reset, and TTS synthesis so a
+// page translation cannot dispatch GPU work at the same time as speech.
+const runtimeQueue = new SerialTaskQueue();
 const translationCache = new LruCache<string>(220);
 let ttsEngine: SupertonicEngine | null = null;
 let ttsEnginePromise: Promise<SupertonicEngine> | null = null;
@@ -113,7 +120,7 @@ chrome.runtime.onMessage.addListener(
     if (!message || message.target !== "offscreen") return undefined;
 
     if (message.type === "TRANSLATE_OFFSCREEN") {
-      const task = engineQueue.run(() => translate(message));
+      const task = runtimeQueue.run(() => translate(message));
       void task.then(sendResponse, (error) => {
         sendResponse({
           ok: false,
@@ -157,7 +164,7 @@ chrome.runtime.onMessage.addListener(
     }
 
     if (message.type === "RESET_ENGINE_OFFSCREEN") {
-      const task = engineQueue.run(async () => {
+      const task = runtimeQueue.run(async () => {
         await resetEngine();
         return status;
       });
@@ -200,6 +207,9 @@ async function runSpeech(
   speechId: string
 ): Promise<void> {
   try {
+    // Keep the cancellable model download/session setup outside the inference
+    // queue. A stopped cold TTS request must not block an already-ready
+    // translation engine for several minutes while its files finish loading.
     const synthesizer = await getTtsEngine();
     if (!isCurrentSpeech(run, speechId)) return;
 
@@ -275,7 +285,7 @@ function synthesizeSpeechChunk(
   const input = prepareKoreanForTts(chunk);
   if (!input) return Promise.resolve(null);
 
-  const output = ttsSynthesisQueue.run(async () => {
+  const output = runtimeQueue.run(async () => {
     if (!isCurrentSpeech(run, speechId)) return null;
     const onProgress = ({ step, total }: { step: number; total: number }) => {
       if (!isCurrentSpeech(run, speechId)) return;
@@ -352,7 +362,10 @@ async function getTtsEngine(): Promise<SupertonicEngine> {
     modelBaseUrl,
     voiceStyleUrl,
     device,
-    onProgress: (progress) => reportProgress(device, progress)
+    onProgress: (progress) => reportProgress(device, progress),
+    // Network/cache reads stay outside this queue. Only ORT session creation
+    // and inference share the GPU serialization boundary with translation.
+    runSessionCreate: (task) => runtimeQueue.run(task)
   });
 
   ttsEnginePromise = (async () => {
@@ -370,7 +383,24 @@ async function getTtsEngine(): Promise<SupertonicEngine> {
         }
       }
     }
-    return load("wasm");
+    try {
+      return await load("wasm");
+    } catch (error) {
+      // A malformed Cache Storage response otherwise poisons every retry.
+      // Delete the fixed-revision TTS cache only after both the preferred path
+      // and WASM fail, then retry WASM exactly once.
+      if (!shouldRefreshSupertonicCache(error)) throw error;
+      await clearSupertonicModelCache();
+      if (ttsProgressRun === speechRun && ttsStatus.state === "loading") {
+        ttsStatus = {
+          ...ttsStatus,
+          progress: 0,
+          file: "음성 모델 캐시를 정리하고 다시 받는 중"
+        };
+        broadcastTtsStatus();
+      }
+      return load("wasm");
+    }
   })().then((loaded) => {
     ttsEngine = loaded;
     return loaded;
@@ -454,6 +484,7 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
   );
   const cached = translationCache.get(cacheKey);
   if (cached) {
+    markEngineReadyAfterTranslation();
     return {
       ok: true,
       requestId: request.requestId,
@@ -465,12 +496,29 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
   }
 
   try {
+    const fallbackFromModelId =
+      request.modelPreference === "translategemma" &&
+      !supportsTranslateGemmaLanguage(request.sourceLanguage)
+        ? TRANSLATEGEMMA_MODEL_ID
+        : undefined;
+    const fallbackReason = fallbackFromModelId
+      ? `${request.sourceLanguage} 언어는 TranslateGemma 템플릿에서 지원하지 않아 ` +
+        "M2M100을 사용합니다."
+      : undefined;
+    const runtimeModelPreference = fallbackFromModelId
+      ? "m2m100"
+      : request.modelPreference;
+    const runtimeDeviceOverride = fallbackFromModelId
+      ? "wasm"
+      : request.runtimeDeviceOverride;
     let activeEngine = await getEngine(
       request.devicePreference,
-      request.modelPreference,
-      request.runtimeDeviceOverride,
+      runtimeModelPreference,
+      runtimeDeviceOverride,
       request.fallbackFromDevice,
-      request.deviceFallbackReason
+      request.deviceFallbackReason,
+      fallbackFromModelId,
+      fallbackReason
     );
     let translation: string;
     try {
@@ -481,7 +529,8 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
       );
     } catch (error) {
       if (
-        error instanceof TranslationOutputError ||
+        (error instanceof TranslationOutputError &&
+          activeEngine.kind !== "m2m100") ||
         activeEngine.kind === "small100" ||
         status.device !== "webgpu" ||
         request.devicePreference === "wasm"
@@ -492,6 +541,7 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
     }
     if (!translation) throw new Error("모델이 번역 결과를 만들지 못했습니다.");
     translationCache.set(cacheKey, translation);
+    markEngineReadyAfterTranslation();
 
     return {
       ok: true,
@@ -539,7 +589,18 @@ async function translateText(
   const translated: string[] = [];
   for (const chunk of chunkText(text)) {
     const result = await translateChunk(activeEngine, chunk, sourceLanguage);
-    if (result) translated.push(result);
+    if (!hasUsableTranslationOutput(chunk, result)) {
+      const modelName =
+        activeEngine.kind === "translategemma"
+          ? "TranslateGemma"
+          : activeEngine.kind === "m2m100"
+            ? "M2M100"
+            : "SMaLL-100";
+      throw new TranslationOutputError(
+        `${modelName}이 올바른 번역 결과를 만들지 못했습니다.`
+      );
+    }
+    translated.push(result);
   }
   return translated.join(" ").trim();
 }
@@ -642,7 +703,9 @@ async function getEngine(
   modelPreference: ModelPreference,
   runtimeDeviceOverride?: RuntimeDevice,
   fallbackFromDevice?: RuntimeDevice,
-  deviceFallbackReason?: string
+  deviceFallbackReason?: string,
+  fallbackFromModelId?: string,
+  fallbackReason?: string
 ): Promise<TranslationEngine> {
   const runtimeDevice =
     modelPreference === "small100"
@@ -652,7 +715,17 @@ async function getEngine(
     loadedDevicePreference === devicePreference &&
     loadedRuntimeDevice === runtimeDevice &&
     loadedModelPreference === modelPreference;
-  if (engine && samePreference) return engine;
+  if (engine && samePreference) {
+    status = {
+      ...status,
+      fallbackFromModelId,
+      fallbackReason,
+      fallbackFromDevice,
+      deviceFallbackReason,
+      error: undefined
+    };
+    return engine;
+  }
   if (enginePromise && samePreference) return enginePromise;
   if (engine || enginePromise) await resetEngine();
 
@@ -670,6 +743,8 @@ async function getEngine(
     modelId,
     device: runtimeDevice,
     progress: 0,
+    fallbackFromModelId,
+    fallbackReason,
     fallbackFromDevice,
     deviceFallbackReason
   };
@@ -680,7 +755,9 @@ async function getEngine(
     devicePreference,
     runtimeDeviceOverride,
     fallbackFromDevice,
-    deviceFallbackReason
+    deviceFallbackReason,
+    fallbackFromModelId,
+    fallbackReason
   )
     .then((loaded) => {
       engine = loaded;
@@ -698,13 +775,15 @@ async function loadRequestedEngine(
   devicePreference: DevicePreference,
   runtimeDeviceOverride?: RuntimeDevice,
   fallbackFromDevice?: RuntimeDevice,
-  deviceFallbackReason?: string
+  deviceFallbackReason?: string,
+  fallbackFromModelId?: string,
+  fallbackReason?: string
 ): Promise<TranslationEngine> {
   if (modelPreference === "m2m100") {
     return loadM2m100(
       runtimeDeviceOverride ?? chooseDevice(devicePreference),
-      undefined,
-      undefined,
+      fallbackFromModelId,
+      fallbackReason,
       fallbackFromDevice,
       deviceFallbackReason
     );
@@ -807,7 +886,6 @@ async function loadTranslateGemma(
     return { kind: "translategemma", pipeline: loaded };
   } catch (error) {
     const webGpuError = friendlyError(error);
-    await discardFailedWebGpuWeights();
     status = {
       state: "error",
       modelId: TRANSLATEGEMMA_MODEL_ID,
@@ -905,7 +983,6 @@ async function loadM2m100(
   } catch (error) {
     if (device === "webgpu") {
       const webGpuError = friendlyError(error);
-      await discardFailedWebGpuWeights();
       status = {
         state: "error",
         modelId: M2M100_MODEL_ID,
@@ -936,21 +1013,16 @@ async function loadM2m100(
   }
 }
 
-async function discardFailedWebGpuWeights(): Promise<void> {
-  try {
-    const cache = await caches.open("transformers-cache");
-    const requests = await cache.keys();
-    await Promise.all(
-      requests
-        .filter((request) =>
-          isM2m100WebGpuWeightUrl(request.url) ||
-          isTranslateGemmaWebGpuWeightUrl(request.url)
-        )
-        .map((request) => cache.delete(request))
-    );
-  } catch {
-    // Cache cleanup is best-effort and must not block the isolated WASM retry.
-  }
+function markEngineReadyAfterTranslation(): void {
+  if (!engine || status.state === "ready") return;
+  status = {
+    ...status,
+    state: "ready",
+    progress: 1,
+    file: undefined,
+    error: undefined
+  };
+  broadcastStatus();
 }
 
 function chooseDevice(preference: DevicePreference): RuntimeDevice {

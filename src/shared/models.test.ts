@@ -11,9 +11,7 @@ import {
   TTS_MODEL_ID,
   TTS_MODEL_REVISION,
   createSmall100InputIds,
-  getTtsModelFileUrl,
-  isM2m100WebGpuWeightUrl,
-  isTranslateGemmaWebGpuWeightUrl
+  getTtsModelFileUrl
 } from "./models";
 
 describe("translation model configuration", () => {
@@ -43,33 +41,6 @@ describe("translation model configuration", () => {
       `https://huggingface.co/Supertone/supertonic-3/resolve/` +
       `${TTS_MODEL_REVISION}/onnx/tts.json`
     );
-  });
-
-  it("identifies TranslateGemma q4 WebGPU cache entries", () => {
-    expect(isTranslateGemmaWebGpuWeightUrl(
-      "https://huggingface.co/onnx-community/translategemma-text-4b-it-ONNX/resolve/revision/onnx/model_q4.onnx"
-    )).toBe(true);
-    expect(isTranslateGemmaWebGpuWeightUrl(
-      "https://huggingface.co/onnx-community%2Ftranslategemma-text-4b-it-ONNX/resolve/revision/onnx/model_q4.onnx_data_1"
-    )).toBe(true);
-    expect(isTranslateGemmaWebGpuWeightUrl(
-      "https://huggingface.co/onnx-community/translategemma-text-4b-it-ONNX/resolve/revision/onnx/model_q4f16.onnx"
-    )).toBe(false);
-  });
-
-  it("identifies only the failed M2M100 WebGPU weight cache entries", () => {
-    expect(isM2m100WebGpuWeightUrl(
-      "https://huggingface.co/Xenova/m2m100_418M/resolve/revision/onnx/encoder_model_q4f16.onnx"
-    )).toBe(true);
-    expect(isM2m100WebGpuWeightUrl(
-      "https://huggingface.co/Xenova%2Fm2m100_418M/resolve/revision/onnx/decoder_model_merged_q4f16.onnx"
-    )).toBe(true);
-    expect(isM2m100WebGpuWeightUrl(
-      "https://huggingface.co/Xenova/m2m100_418M/resolve/revision/onnx/encoder_model_quantized.onnx"
-    )).toBe(false);
-    expect(isM2m100WebGpuWeightUrl(
-      "https://huggingface.co/other/model/resolve/revision/onnx/encoder_model_q4f16.onnx"
-    )).toBe(false);
   });
 
   it("prepends the Korean target token without changing source ids", () => {

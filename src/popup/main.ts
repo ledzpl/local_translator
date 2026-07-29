@@ -45,12 +45,13 @@ app.innerHTML = `
       <li>번역·음성 모델 파일만 Hugging Face에서 내려받으며, 번역할 내용은 개발자나 Hugging Face에 보내지 않습니다.</li>
       <li>기본 TranslateGemma 4B는 약 3.1GB이며 WebGPU가 필요합니다. 미지원·실패 시 M2M100 WASM 약 650MB를 추가로 받을 수 있습니다.</li>
       <li>TranslateGemma 사용에는 <a href="https://ai.google.dev/gemma/terms" target="_blank" rel="noreferrer">Gemma 이용약관</a>과 금지 용도 정책이 적용됩니다.</li>
-      <li>모델·언어·자막 설정과 이 확인 기록은 Chrome 동기화 저장소에 보관될 수 있습니다. 페이지 내용은 저장하지 않습니다.</li>
+      <li>한국어 음성에는 <a href="/LICENSES/supertonic-model-OpenRAIL-M.txt" target="_blank" rel="noreferrer">Supertonic 3 OpenRAIL-M</a> 사용 제한이 적용됩니다.</li>
+      <li>모델·언어·자막 설정과 이 확인 기록은 Chrome 동기화를 켠 경우 Google의 Chrome 동기화 인프라에서 처리될 수 있습니다. 페이지 내용은 저장하지 않습니다.</li>
     </ul>
     <a href="/privacy.html" target="_blank" rel="noreferrer">개인정보처리방침 전체 보기</a>
     <label class="consent-check">
       <input id="privacy-consent-check" type="checkbox" />
-      <span>위 데이터 처리 방식, 모델 다운로드와 Gemma 이용 조건을 확인했습니다.</span>
+      <span>위 데이터 처리 방식과 모델 다운로드를 확인하고, Gemma 및 Supertonic 모델 이용 조건에 동의합니다.</span>
     </label>
     <button id="privacy-consent-button" class="primary-button" type="button" disabled>
       <span>동의하고 시작</span><span aria-hidden="true">→</span>
@@ -170,9 +171,9 @@ app.innerHTML = `
     <label>
       실행 장치
       <select id="device-preference">
-        <option value="auto">자동 — WebGPU 우선</option>
+        <option value="webgpu">WebGPU — 권장 기본, 실패 시 WASM</option>
+        <option value="auto">자동 — WebGPU 사용 가능 여부 감지</option>
         <option value="wasm">WASM — 호환성 우선</option>
-        <option value="webgpu">WebGPU — 실험적 GPU 가속</option>
       </select>
     </label>
     <p id="model-setting-detail">TranslateGemma 4B · 약 3.1GB · WebGPU 전용 · 미지원 시 M2M100 WASM 폴백 · Chrome 캐시에 보관</p>

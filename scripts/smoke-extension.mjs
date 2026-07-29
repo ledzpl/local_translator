@@ -9,6 +9,7 @@ const extensionPath = join(root, "dist");
 const withPageTts = process.argv.includes("--with-page-tts");
 const withModel = process.argv.includes("--with-model") || withPageTts;
 const withTts = process.argv.includes("--with-tts");
+const requirePrimaryWebGpu = process.argv.includes("--require-primary-webgpu");
 const profileArgument = process.argv.find((argument) =>
   argument.startsWith("--profile=")
 );
@@ -23,24 +24,15 @@ const requestedModel = process.argv.includes("--small100")
 const requestedDevice =
   requestedModel === "small100" || process.argv.includes("--wasm")
     ? "wasm"
-    : "auto";
-const profilePath =
+    : "webgpu";
+let profilePath =
   existingProfilePath ??
   await mkdtemp(join(tmpdir(), "ongeul-chrome-smoke-"));
 const errors = [];
 
 let context;
 try {
-  context = await chromium.launchPersistentContext(profilePath, {
-    executablePath: chromium.executablePath(),
-    headless: true,
-    args: [
-      `--disable-extensions-except=${extensionPath}`,
-      `--load-extension=${extensionPath}`,
-      "--disable-component-update",
-      "--no-first-run"
-    ]
-  });
+  context = await launchExtensionWithRetry();
 
   const serviceWorker =
     context.serviceWorkers()[0] ??
@@ -50,10 +42,12 @@ try {
   await serviceWorker.evaluate(async ({ modelPreference, devicePreference }) => {
     await chrome.storage.sync.clear();
     await chrome.storage.session.clear();
-    await chrome.storage.sync.set({
-      modelPreference,
-      devicePreference
-    });
+    if (modelPreference !== "translategemma") {
+      await chrome.storage.sync.set({
+        modelPreference,
+        devicePreference
+      });
+    }
   }, {
     modelPreference: requestedModel,
     devicePreference: requestedDevice
@@ -113,7 +107,7 @@ try {
       "youtubeEnabled",
       "autoEnableCaptions"
     ]);
-    return settings.privacyConsentVersion === 2 &&
+    return settings.privacyConsentVersion === 3 &&
       settings.youtubeEnabled === true &&
       settings.autoEnableCaptions === true;
   });
@@ -216,6 +210,9 @@ try {
     ) {
       throw new Error(`요청한 모델 엔진이 준비되지 않았습니다: ${JSON.stringify(engineStatus)}`);
     }
+    if (requirePrimaryWebGpu) {
+      assertPrimaryWebGpuStatus(engineStatus, requestedModel, requestedModelId);
+    }
     console.log(`MODEL_TRANSLATION=${result}`);
     console.log(`MODEL_RUNTIME=${resultMeta}`);
     console.log(`MODEL_ENGINE=${engineStatus.modelId}`);
@@ -226,7 +223,7 @@ try {
     console.log(
       `MODEL_FALLBACK_REASON=${engineStatus.deviceFallbackReason ?? engineStatus.fallbackReason ?? "none"}`
     );
-    const cachedQ4f16Weights = await popup.evaluate(async () => {
+    const cachedWebGpuWeights = await popup.evaluate(async () => {
       const cache = await caches.open("transformers-cache");
       const requests = await cache.keys();
       return requests
@@ -242,15 +239,9 @@ try {
           )
         );
     });
-    if (
-      engineStatus.fallbackFromDevice === "webgpu" &&
-      cachedQ4f16Weights.length > 0
-    ) {
-      throw new Error(
-        `실패한 WebGPU 가중치가 캐시에 남았습니다: ${cachedQ4f16Weights.join(", ")}`
-      );
-    }
-    console.log(`MODEL_WEBGPU_CACHE_ENTRIES=${cachedQ4f16Weights.length}`);
+    console.log(
+      `MODEL_WEBGPU_CACHE_PRESERVED_ENTRIES=${cachedWebGpuWeights.length}`
+    );
 
     const warmResult = await popup.evaluate(async () =>
       chrome.runtime.sendMessage({
@@ -315,6 +306,40 @@ try {
       });
     }
     console.log(`PRIVACY_TRANSLATION=${privacyResult.translation}`);
+
+    if (requirePrimaryWebGpu) {
+      const mixedLanguageResult = await popup.evaluate(async () =>
+        chrome.runtime.sendMessage({
+          target: "background",
+          type: "TRANSLATE",
+          requestId: crypto.randomUUID(),
+          text: "Tento text zůstává v prohlížeči a překládá se místně.",
+          sourceLanguage: "cs",
+          origin: "popup"
+        })
+      );
+      if (
+        !mixedLanguageResult.ok ||
+        !/[가-힣]/.test(mixedLanguageResult.translation)
+      ) {
+        throw new Error(
+          `TranslateGemma 다국어 template 경로에 실패했습니다: ` +
+          JSON.stringify(mixedLanguageResult)
+        );
+      }
+      const mixedLanguageStatus = await popup.evaluate(async () =>
+        chrome.runtime.sendMessage({
+          target: "background",
+          type: "GET_ENGINE_STATUS"
+        })
+      );
+      assertPrimaryWebGpuStatus(
+        mixedLanguageStatus,
+        requestedModel,
+        "onnx-community/translategemma-text-4b-it-ONNX"
+      );
+      console.log("TRANSLATEGEMMA_MIXED_LANGUAGE=PASS");
+    }
   }
 
   if (withTts) {
@@ -415,20 +440,47 @@ try {
   await mockYoutube.goto("https://www.youtube.com/watch?v=ongeul-smoke");
 
   const subtitleHost = mockYoutube.locator('[data-ongeul-overlay="subtitle"]');
-  await subtitleHost.waitFor({ state: "attached", timeout: withModel ? 120_000 : 15_000 });
-  await mockYoutube.waitForFunction(
-    () => {
-      const host = document.querySelector('[data-ongeul-overlay="subtitle"]');
-      return Boolean(host?.shadowRoot?.querySelector(".subtitle")?.textContent?.trim());
-    },
-    undefined,
-    { timeout: withModel ? 120_000 : 15_000 }
-  );
-  const subtitle = await subtitleHost.evaluate((host) =>
-    host.shadowRoot?.querySelector(".subtitle")?.textContent?.trim()
-  );
-  if (!subtitle || !/[가-힣]/.test(subtitle)) {
-    throw new Error(`YouTube 한국어 오버레이를 확인하지 못했습니다: ${subtitle ?? ""}`);
+  let subtitle = "";
+  if (withModel) {
+    await subtitleHost.waitFor({ state: "attached", timeout: 120_000 });
+    await mockYoutube.waitForFunction(
+      () => {
+        const host = document.querySelector('[data-ongeul-overlay="subtitle"]');
+        return Boolean(host?.shadowRoot?.querySelector(".subtitle")?.textContent?.trim());
+      },
+      undefined,
+      { timeout: 120_000 }
+    );
+    subtitle = await subtitleHost.evaluate((host) =>
+      host.shadowRoot?.querySelector(".subtitle")?.textContent?.trim() ?? ""
+    );
+    if (!/[가-힣]/.test(subtitle)) {
+      throw new Error(`YouTube 한국어 오버레이를 확인하지 못했습니다: ${subtitle}`);
+    }
+  } else {
+    await mockYoutube.waitForTimeout(1_200);
+    const koreanCaptionState = await mockYoutube.evaluate(() => {
+      const host = document.querySelector(
+        '[data-ongeul-overlay="subtitle"]'
+      );
+      const original = document.querySelector(
+        ".ytp-caption-window-container"
+      );
+      return {
+        overlayVisible: Boolean(host && !host.hidden),
+        originalOpacity: original?.style.opacity ?? ""
+      };
+    });
+    if (
+      koreanCaptionState.overlayVisible ||
+      koreanCaptionState.originalOpacity === "0"
+    ) {
+      throw new Error(
+        `한국어 원문 자막이 중복되거나 숨겨졌습니다: ` +
+        JSON.stringify(koreanCaptionState)
+      );
+    }
+    subtitle = "KOREAN_SOURCE_SKIPPED";
   }
   if (withModel && requestedModel === "m2m100") {
     assertSemanticTranslation({
@@ -459,6 +511,7 @@ try {
         <pre id="pre-copy">This preformatted article paragraph is natural prose written for people to read, not source code.</pre>
         <article>
           <article-copy id="custom-copy">Visible custom text helps readers.</article-copy>
+          <button id="dangerous-action">Delete the current draft permanently</button>
         </article>`
       : `<p id="article-copy">브라우저 로컬 번역</p>`;
     await route.fulfill({
@@ -517,6 +570,13 @@ try {
     if (!preTranslation || !/[가-힣]/.test(preTranslation)) {
       throw new Error(`pre 산문 번역을 확인하지 못했습니다: ${preTranslation ?? ""}`);
     }
+    if (
+      await webPage.locator(
+        "#dangerous-action [data-ongeul-page-translation]"
+      ).count()
+    ) {
+      throw new Error("페이지 번역이 원래 동작 버튼 내부를 변경했습니다.");
+    }
     const stoppedForBudget = await popup.evaluate(async () =>
       chrome.runtime.sendMessage({
         target: "background",
@@ -550,6 +610,32 @@ try {
           `페이지 TTS 콜드 로드 정지 상태가 되살아났습니다: ${JSON.stringify(coldCancelStatus)}`
         );
       }
+      let translationProbeTimer;
+      const translationAfterColdTtsCancel = await Promise.race([
+        popup.evaluate(async () =>
+          chrome.runtime.sendMessage({
+            target: "background",
+            type: "TRANSLATE",
+            requestId: crypto.randomUUID(),
+            text: "A stopped speech download must not block translation.",
+            sourceLanguage: "en",
+            origin: "popup"
+          })
+        ),
+        new Promise((resolve) => {
+          translationProbeTimer = setTimeout(
+            () => resolve({ ok: false, error: "30초 시간 초과" }),
+            30_000
+          );
+        })
+      ]).finally(() => clearTimeout(translationProbeTimer));
+      if (!translationAfterColdTtsCancel?.ok) {
+        throw new Error(
+          `TTS 콜드 로드 정지가 번역 큐를 막았습니다: ` +
+          JSON.stringify(translationAfterColdTtsCancel)
+        );
+      }
+      console.log("TRANSLATION_AFTER_TTS_CANCEL=PASS");
       await pageSpeechButton.click();
       const pageTtsStatus = await waitForTtsState(
         popup,
@@ -612,6 +698,20 @@ try {
   if (await webPage.locator("[data-ongeul-page-translation]").count()) {
     throw new Error("원문 복원 후 페이지 번역 노드가 남아 있습니다.");
   }
+  if (requirePrimaryWebGpu) {
+    const finalEngineStatus = await popup.evaluate(async () =>
+      chrome.runtime.sendMessage({
+        target: "background",
+        type: "GET_ENGINE_STATUS"
+      })
+    );
+    assertPrimaryWebGpuStatus(
+      finalEngineStatus,
+      requestedModel,
+      "onnx-community/translategemma-text-4b-it-ONNX"
+    );
+    console.log("PRIMARY_WEBGPU_FINAL=PASS");
+  }
 
   const browserSession = await context.browser().newBrowserCDPSession();
   const { targetInfos } = await browserSession.send("Target.getTargets");
@@ -650,6 +750,47 @@ try {
   } else {
     await rm(profilePath, { recursive: true, force: true });
   }
+}
+
+function assertPrimaryWebGpuStatus(status, requestedModel, requestedModelId) {
+  if (
+    requestedModel !== "translategemma" ||
+    status?.state !== "ready" ||
+    status.modelId !== requestedModelId ||
+    status.device !== "webgpu" ||
+    status.fallbackFromModelId ||
+    status.fallbackFromDevice
+  ) {
+    throw new Error(
+      `TranslateGemma WebGPU 기본 엔진이 폴백 없이 준비되지 않았습니다: ` +
+      JSON.stringify(status)
+    );
+  }
+}
+
+async function launchExtensionWithRetry() {
+  let lastError;
+  const attempts = existingProfilePath ? 1 : 2;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await chromium.launchPersistentContext(profilePath, {
+        executablePath: chromium.executablePath(),
+        headless: true,
+        args: [
+          `--disable-extensions-except=${extensionPath}`,
+          `--load-extension=${extensionPath}`,
+          "--disable-component-update",
+          "--no-first-run"
+        ]
+      });
+    } catch (error) {
+      lastError = error;
+      if (existingProfilePath || attempt === attempts - 1) break;
+      await rm(profilePath, { recursive: true, force: true });
+      profilePath = await mkdtemp(join(tmpdir(), "ongeul-chrome-smoke-"));
+    }
+  }
+  throw lastError;
 }
 
 async function waitForTtsState(

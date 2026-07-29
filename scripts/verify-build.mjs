@@ -20,6 +20,9 @@ const required = [
   "LICENSES/transformers-js-Apache-2.0.txt",
   "LICENSES/onnxruntime-MIT.txt",
   "LICENSES/supertonic-code-MIT.txt",
+  "LICENSES/supertonic-model-OpenRAIL-M.txt",
+  "LICENSES/Gemma-NOTICE.txt",
+  "LICENSES/Gemma-Terms-of-Use.txt",
   "LICENSES/huggingface-jinja-MIT.txt",
   "LICENSES/flatbuffers-Apache-2.0.txt",
   "LICENSES/guid-typescript-ISC.txt",
@@ -31,15 +34,22 @@ const required = [
   "icons/icon-48.png",
   "icons/icon-128.png"
 ];
-const pinnedRevisions = [
-  "f7874a1ac60758872a4f78aac0df95b17b776994",
-  "5c2c73ac70bee9c58f5a7ac5e84a36bee25db8ee",
-  "9c374f0b7aca709787cea97b047bfbbd1559d177",
-  "3cadd1ee6394adea1bd021217a0e650ede09a323"
-];
+const modelLock = JSON.parse(
+  await readFile(join(root, "models.lock.json"), "utf8")
+);
 
 for (const file of required) {
   await access(join(dist, file), constants.R_OK);
+}
+const gemmaNotice = await readFile(
+  join(dist, "LICENSES/Gemma-NOTICE.txt"),
+  "utf8"
+);
+if (
+  gemmaNotice.trim() !==
+  "Gemma is provided under and subject to the Gemma Terms of Use found at ai.google.dev/gemma/terms"
+) {
+  throw new Error("Gemma 배포 NOTICE 문구가 공식 요구사항과 다릅니다.");
 }
 
 const manifest = JSON.parse(await readFile(join(dist, "manifest.json"), "utf8"));
@@ -49,12 +59,43 @@ if (manifest.version !== packageJson.version) {
   throw new Error(`manifest/package 버전이 다릅니다: ${manifest.version}/${packageJson.version}`);
 }
 if (!manifest.permissions.includes("offscreen")) throw new Error("offscreen 권한이 없습니다.");
+if (!manifest.permissions.includes("unlimitedStorage")) {
+  throw new Error("대용량 로컬 모델 캐시를 위한 unlimitedStorage 권한이 없습니다.");
+}
 if (!manifest.content_security_policy.extension_pages.includes("'wasm-unsafe-eval'")) {
   throw new Error("WASM CSP가 없습니다.");
+}
+const extensionCsp = manifest.content_security_policy.extension_pages;
+const allowedConnectOrigins = [
+  "https://huggingface.co",
+  "https://*.huggingface.co",
+  "https://*.hf.co"
+];
+for (const origin of allowedConnectOrigins) {
+  if (!extensionCsp.includes(origin)) {
+    throw new Error(`모델 호스트 CSP가 없습니다: ${origin}`);
+  }
+}
+const unexpectedConnectOrigins = Array.from(
+  extensionCsp.matchAll(/https:\/\/[^\s;]+/g),
+  (match) => match[0]
+).filter((origin) => !allowedConnectOrigins.includes(origin));
+if (unexpectedConnectOrigins.length > 0) {
+  throw new Error(
+    `CSP에 검토되지 않은 원격 연결 대상이 있습니다: ${unexpectedConnectOrigins.join(", ")}`
+  );
 }
 
 const files = await walkFiles(dist);
 const relativeFiles = files.map((file) => relative(dist, file));
+const unexpectedFiles = relativeFiles.filter((file) =>
+  !isAllowedReleaseFile(file)
+);
+if (unexpectedFiles.length > 0) {
+  throw new Error(
+    `릴리즈 패키지에 허용되지 않은 파일이 있습니다: ${unexpectedFiles.join(", ")}`
+  );
+}
 const sourceMaps = relativeFiles.filter((file) => file.endsWith(".map"));
 if (sourceMaps.length > 0) {
   throw new Error(`릴리즈 패키지에 source map이 있습니다: ${sourceMaps.join(", ")}`);
@@ -95,18 +136,60 @@ const remoteCodePatterns = [
   /https?:\/\/[^\s"'`<>]+\/[^/\s"'`<>]+\.(?:mjs|wasm)(?:[?#][^\s"'`<>]*)?/i
 ];
 for (const { file, source } of executableSources) {
-  const matched = remoteCodePatterns.find((pattern) => pattern.test(source));
+  const normalizedSource = foldStaticStringConcatenations(source);
+  const matched = remoteCodePatterns.find((pattern) =>
+    pattern.test(normalizedSource)
+  );
   if (matched) throw new Error(`${file}에서 원격 실행 코드 경로를 찾았습니다: ${matched}`);
 }
 
 const offscreenEntry = executableSources
   .find(({ file }) => /(?:^|\/)offscreen-[^/]+\.js$/.test(file));
 if (!offscreenEntry) throw new Error("offscreen 실행 번들을 찾지 못했습니다.");
-const packagedSource = executableSources.map(({ source }) => source).join("\n");
-for (const revision of pinnedRevisions) {
-  if (!packagedSource.includes(revision)) {
-    throw new Error(`실행 번들에 고정 모델 revision이 없습니다: ${revision}`);
+const offscreenRuntimeSource = collectModuleClosure(
+  offscreenEntry.file,
+  new Map(executableSources.map(({ file, source }) => [file, source]))
+);
+const modelSource = await readFile(
+  join(root, "src/shared/models.ts"),
+  "utf8"
+);
+const modelManifest = await readFile(
+  join(root, "docs/MODEL_MANIFEST.md"),
+  "utf8"
+);
+for (const [key, model] of Object.entries(modelLock)) {
+  if (
+    typeof model?.id !== "string" ||
+    typeof model?.revision !== "string" ||
+    !/^[0-9a-f]{40}$/u.test(model.revision)
+  ) {
+    throw new Error(`models.lock.json의 ${key} 항목이 올바르지 않습니다.`);
   }
+  if (
+    !modelSource.includes(`modelLock.${key}.id`) ||
+    !modelSource.includes(`modelLock.${key}.revision`)
+  ) {
+    throw new Error(`런타임 모델 설정이 lock 파일을 사용하지 않습니다: ${key}`);
+  }
+  if (
+    !offscreenRuntimeSource.includes(model.id) ||
+    !offscreenRuntimeSource.includes(model.revision)
+  ) {
+    throw new Error(
+      `offscreen 실행 번들에 고정 모델 ID/revision 쌍이 없습니다: ${key}`
+    );
+  }
+  if (
+    !modelManifest.includes(`\`${model.id}\``) ||
+    !modelManifest.includes(`\`${model.revision}\``)
+  ) {
+    throw new Error(`모델 매니페스트가 lock 파일과 다릅니다: ${key}`);
+  }
+}
+const packagedSource = executableSources.map(({ source }) => source).join("\n");
+if (/\/resolve\/(?:main|latest)(?:\/|["'`?])/iu.test(packagedSource)) {
+  throw new Error("실행 번들에 고정되지 않은 model revision 경로가 있습니다.");
 }
 
 const duplicateLargeFiles = await findDuplicateLargeFiles(files);
@@ -141,6 +224,58 @@ async function walkFiles(directory) {
     return entry.isDirectory() ? walkFiles(path) : [path];
   }));
   return nested.flat();
+}
+
+function isAllowedReleaseFile(file) {
+  return [
+    /^manifest\.json$/u,
+    /^(?:popup|offscreen)\.html$/u,
+    /^privacy\.(?:html|css)$/u,
+    /^(?:background|content)\.js$/u,
+    /^(?:PRIVACY_POLICY|THIRD_PARTY_NOTICES)\.md$/u,
+    /^assets\/(?:popup|offscreen|tts)-[A-Za-z0-9_-]+\.(?:js|css)$/u,
+    /^icons\/icon-(?:16|32|48|128)\.png$/u,
+    /^wasm\/ort-wasm-simd-threaded\.(?:jsep|asyncify)\.(?:mjs|wasm)$/u,
+    /^LICENSES\/[A-Za-z0-9_.-]+\.txt$/u
+  ].some((pattern) => pattern.test(file));
+}
+
+function foldStaticStringConcatenations(source) {
+  let folded = source;
+  const staticConcat =
+    /(["'])([^"'\\\r\n]*)\1\s*\+\s*(["'])([^"'\\\r\n]*)\3/gu;
+  for (let pass = 0; pass < 8; pass += 1) {
+    const next = folded.replace(
+      staticConcat,
+      (_match, _leftQuote, left, _rightQuote, right) =>
+        JSON.stringify(`${left}${right}`)
+    );
+    if (next === folded) break;
+    folded = next;
+  }
+  return folded;
+}
+
+function collectModuleClosure(entryFile, sourcesByFile) {
+  const visited = new Set();
+  const stack = [entryFile];
+  const sources = [];
+  while (stack.length > 0) {
+    const file = stack.pop();
+    if (!file || visited.has(file)) continue;
+    const source = sourcesByFile.get(file);
+    if (source === undefined) {
+      throw new Error(`실행 번들이 참조한 로컬 모듈이 없습니다: ${file}`);
+    }
+    visited.add(file);
+    sources.push(source);
+    for (const match of source.matchAll(
+      /(?:from\s*|import\s*)["'`](\.[^"'`]+\.js)["'`]/gu
+    )) {
+      stack.push(join(dirname(file), match[1]));
+    }
+  }
+  return sources.join("\n");
 }
 
 async function findDuplicateLargeFiles(paths) {

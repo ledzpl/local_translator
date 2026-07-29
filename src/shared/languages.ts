@@ -36,6 +36,12 @@ const SUPPORTED = new Set([
   "yi", "yo", "zh", "zu"
 ]);
 
+// These M2M100 detector codes are absent from the chat template bundled in the
+// pinned TranslateGemma revision. Route only those codes to M2M100; switching
+// every mixed-language page block between two multi-gigabyte engines would
+// otherwise cause severe model-session thrashing.
+const TRANSLATEGEMMA_UNSUPPORTED = new Set(["ast", "ceb", "ilo", "ns"]);
+
 const LANGUAGE_ALIASES: Record<string, string> = {
   "cmn": "zh",
   "fil": "tl",
@@ -52,6 +58,10 @@ export function normalizeLanguageCode(code: string | undefined): string {
   const normalized = code.trim().toLowerCase().replace("_", "-");
   const aliased = LANGUAGE_ALIASES[normalized] ?? normalized.split("-")[0] ?? "en";
   return SUPPORTED.has(aliased) ? aliased : "en";
+}
+
+export function supportsTranslateGemmaLanguage(code: string): boolean {
+  return SUPPORTED.has(code) && !TRANSLATEGEMMA_UNSUPPORTED.has(code);
 }
 
 export function containsMostlyKorean(text: string): boolean {

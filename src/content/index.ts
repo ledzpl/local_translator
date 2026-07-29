@@ -74,6 +74,15 @@ function initialize(): void {
     }
   );
 
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (
+      area === "sync" &&
+      (changes.modelPreference || changes.devicePreference)
+    ) {
+      pageTranslator.stop();
+    }
+  });
+
   if (location.hostname === "www.youtube.com") youtube.start();
 }
 
@@ -269,7 +278,7 @@ class InPageTranslator {
     const selector =
       "h1, h2, h3, h4, h5, h6, p, li, blockquote, figcaption, dd, pre, xmp, article > *, main > *, [role='main'] > *, [role='article'] > *";
     const blocked =
-      "nav, header, footer, aside, form, code, script, style, noscript, svg, canvas, [contenteditable='true'], .html5-video-player, [data-ongeul-overlay], [data-ongeul-page-translation]";
+      "nav, header, footer, aside, form, a, button, label, input, select, textarea, option, summary, audio, video, code, script, style, noscript, svg, canvas, [contenteditable='true'], [onclick], [tabindex]:not([tabindex='-1']), [role='button'], [role='link'], [role='menuitem'], [role='tab'], [role='checkbox'], [role='radio'], [role='switch'], .html5-video-player, [data-ongeul-overlay], [data-ongeul-page-translation]";
     const candidates: Array<{
       value: PageTranslationBlock;
       sourceText: string;
@@ -356,7 +365,10 @@ class InPageTranslator {
     speak.type = "button";
     speak.dataset.state = "idle";
     speak.setAttribute("aria-label", "한국어 번역 듣기");
-    speak.addEventListener("click", () => this.toggleSpeech(speak, translation));
+    speak.addEventListener("click", (event) => {
+      event.stopPropagation();
+      this.toggleSpeech(speak, translation);
+    });
     shadow.append(
       createStyle(PAGE_TRANSLATION_STYLES),
       createElement("span", "label", "KO"),
@@ -721,6 +733,11 @@ class YouTubeCaptionTranslator {
         return;
       }
       this.retryAttempts.delete(requestKey);
+      if (response.sourceLanguage === "ko" || response.device === "none") {
+        this.view.hideSubtitle();
+        this.applyOriginalCaptionVisibility(false);
+        return;
+      }
       this.cache.set(requestKey, response.translation);
       if (captionStillMatches(this.currentCaption, sourceText)) {
         this.view.showSubtitle(response.translation, this.settings);

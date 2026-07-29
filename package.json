@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "packageManager": "npm@12.0.1",
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10.0.0"
+  },
   "description": "브라우저 안에서 번역하고 읽어주는 한국어 Chrome 확장 프로그램",
   "scripts": {
     "build": "node scripts/build.mjs",
@@ -10,7 +15,7 @@
     "test": "vitest run",
     "test:extension:built": "node scripts/smoke-extension.mjs",
     "test:extension:built:model": "node scripts/smoke-extension.mjs --with-model",
-    "test:extension:built:model:translategemma": "node scripts/smoke-extension.mjs --with-model",
+    "test:extension:built:model:translategemma": "node scripts/smoke-extension.mjs --with-model --with-tts --require-primary-webgpu",
     "test:extension:built:model:m2m100": "node scripts/smoke-extension.mjs --with-model --m2m100",
     "test:extension:built:model:m2m100:wasm": "node scripts/smoke-extension.mjs --with-model --m2m100 --wasm",
     "test:extension:built:model:small100": "node scripts/smoke-extension.mjs --with-model --small100",
@@ -27,10 +32,12 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "verify": "npm run typecheck && npm run test && npm run build && node scripts/verify-build.mjs",
-    "release:check": "npm run verify && npm run test:extension:built && npm run test:extension:built:tts && npm run test:extension:built:page-tts && npm run test:extension:built:model:m2m100:wasm && npm run test:extension:built:model:small100 && npm audit --omit=dev",
-    "release:package": "npm run release:check && node scripts/package-release.mjs",
+    "release:check": "npm run verify && npm run store:assets:verify && npm run test:extension:built && npm run test:extension:built:model:translategemma && npm run test:extension:built:tts && npm run test:extension:built:page-tts && npm run test:extension:built:model:m2m100:wasm && npm run test:extension:built:model:small100 && npm audit --omit=dev",
+    "release:package": "npm run release:check && node scripts/package-release.mjs && npm run release:verify",
+    "release:verify": "node scripts/verify-release-package.mjs",
     "release": "npm run release:package",
-    "store:assets": "npm run build && node scripts/capture-store-assets.mjs"
+    "store:assets": "npm run build && node scripts/capture-store-assets.mjs",
+    "store:assets:verify": "node scripts/verify-store-assets.mjs"
   },
   "dependencies": {
     "@huggingface/transformers": "4.2.0",
@@ -45,6 +52,7 @@
     "vitest": "4.1.10"
   },
   "overrides": {
+    "adm-zip": "0.6.0",
     "sharp": "0.35.3"
   }
 }

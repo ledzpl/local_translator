@@ -1,6 +1,6 @@
 import type { ExtensionSettings } from "./protocol";
 
-export const CURRENT_PRIVACY_CONSENT_VERSION = 2;
+export const CURRENT_PRIVACY_CONSENT_VERSION = 3;
 
 export function hasPrivacyConsent(
   settings: Pick<ExtensionSettings, "privacyConsentVersion">

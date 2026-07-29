@@ -12,20 +12,24 @@
 - 자동 언어 감지, TranslateGemma 4B WebGPU 기본 실행과 M2M100/SMaLL-100 호환 모델 선택
 - 번역 결과의 **듣기** 버튼으로 브라우저 내 한국어 TTS 모델 음성 재생 및 정지
 - 모델 파일은 Chrome Cache Storage에 저장해 재사용하고, ONNX Runtime 실행 코드는 확장 패키지에서 로컬로 로드
+- 대용량 모델 캐시가 일반 웹 저장소 할당량으로 삭제되지 않도록 `unlimitedStorage`를 사용하며 사용자 텍스트는 영구 저장하지 않음
 - 최초 사용 전 로컬 처리 범위, 모델 다운로드와 Chrome 설정 동기화를 명확히 안내하고 확인
 
 ## 개발 및 설치
 
 ```bash
-npm install
+npm ci
 npm run verify
 ```
+
+릴리즈 검증 환경은 `.nvmrc`의 Node 26.5.0과 `package.json`의 npm 12.0.1을
+기준으로 합니다.
 
 1. Chrome에서 `chrome://extensions`를 엽니다.
 2. 오른쪽 위의 **개발자 모드**를 켭니다.
 3. **압축해제된 확장 프로그램을 로드합니다**를 누르고 이 프로젝트의 `dist` 폴더를 선택합니다.
 4. 팝업에서 데이터 처리 안내를 확인하고 동의합니다.
-5. 첫 번역 때 기본 TranslateGemma 4B q4 모델 약 3.1GB를 내려받습니다. WebGPU를 사용할 수 없거나 초기화·추론이 실패하면 M2M100 WASM 약 650MB를 추가로 내려받습니다. 초기화에 실패한 가중치는 정리하고 성공한 경로의 모델은 Chrome Cache Storage에서 재사용합니다. 첫 듣기 때는 Supertonic 3 모델과 기본 음성 스타일 약 400MB를 별도로 내려받습니다.
+5. 첫 번역 때 기본 TranslateGemma 4B q4 모델 약 3.1GB를 내려받습니다. WebGPU를 사용할 수 없거나 초기화·추론이 실패하면 M2M100 WASM 약 650MB를 추가로 내려받습니다. 하드웨어 호환성 실패만으로 정상 가중치를 지우지 않으며 Chrome Cache Storage에서 다음 실행에 재사용합니다. 첫 듣기 때는 Supertonic 3 모델과 기본 음성 스타일 약 400MB를 별도로 내려받습니다.
 
 코드를 다시 빌드한 뒤에는 `chrome://extensions`에서 **온글 번역** 카드의 새로고침 버튼을 눌러야 새 서비스 워커와 팝업 코드가 함께 적용됩니다.
 
@@ -34,12 +38,13 @@ npm run verify
 - YouTube 번역과 자막 자동 켜기는 기본적으로 꺼져 있습니다. 사용자가 직접 켠 동안 플레이어에 실제로 표시되는 자막만 읽으며, 영상에 자막 트랙이 없으면 번역할 수 없습니다.
 - 페이지 번역은 화면에 보이는 본문부터 최대 40개·12,000자까지 순서대로 처리합니다. `chrome://` 페이지나 Chrome 웹 스토어처럼 확장 프로그램 스크립트를 넣을 수 없는 페이지에서는 사용할 수 없습니다.
 - YouTube 번역을 직접 켜면 한국어를 원문 자막과 함께 표시하는 설정이 기본이며, 원문 자막 자동 켜기는 별도로 활성화해야 합니다.
-- 기본 TranslateGemma 4B는 55개 언어에 특화된 품질 우선 모델로 WebGPU에서만 실행합니다. WebGPU 초기화·첫 추론이 실패하거나 사용할 수 없으면 깨끗한 오프스크린 런타임을 만든 뒤 M2M100 WASM으로 전환합니다.
+- 기본 TranslateGemma 4B는 Google이 55개 언어용으로 설명한 품질 우선 모델이며 WebGPU에서만 실행합니다. 팝업의 18개 원문 언어를 품질 검증 범위로 삼고, 고정 chat template이 허용하는 추가 자동 감지 언어도 처리합니다. template에 없는 네 언어 코드는 M2M100 WASM으로 보냅니다. WebGPU 초기화·첫 추론이 실패하거나 사용할 수 없으면 깨끗한 오프스크린 런타임을 만든 뒤 M2M100 WASM으로 전환합니다.
+- M2M100 WebGPU가 빈 값·특수 토큰·문자나 숫자가 없는 비정상 결과를 만들면 그 결과를 저장하지 않고 M2M100 WASM q8로 한 번 재시도합니다. 이때 약 650MB를 추가로 내려받을 수 있고, 같은 Chrome 세션의 다음 번역도 WASM을 사용합니다. 엔진 초기화나 설정 변경 후에는 WebGPU를 다시 평가합니다. 오프스크린 엔진을 교체하는 순간 재생 중인 음성은 명시적 오류와 함께 중단될 수 있습니다.
 - TranslateGemma에는 [Gemma 이용약관](https://ai.google.dev/gemma/terms)과 금지 용도 정책이 적용됩니다.
 - 엔진 설정에서 실험적 SMaLL-100을 선택하면 int8 WASM 경로로 실행되며, 이 모델을 불러오지 못하면 M2M100으로 전환합니다. 일부 전문 용어는 원문 영문으로 남을 수 있습니다.
-- TranslateGemma는 55개 언어, M2M100과 SMaLL-100은 약 100개 언어를 다룹니다. 자동 감지가 불안정하면 팝업에서 원문 언어를 직접 선택하세요.
+- M2M100과 SMaLL-100은 약 100개 언어를 다룹니다. 자동 감지가 불안정하면 팝업에서 원문 언어를 직접 선택하세요.
 - 한국어 음성은 `Supertone/supertonic-3` 모델이 브라우저의 WebGPU에서 직접 생성하고, WebGPU를 사용할 수 없거나 추론에 실패하면 WASM으로 전환합니다. 한글 원문을 직접 합성하며 긴 번역은 여러 구간으로 나누어 차례로 읽고 팝업을 닫아도 재생이 이어집니다.
-- Supertonic 3 모델은 **OpenRAIL-M** 라이선스입니다. 허용 용도 제한과 배포 고지 조건은 릴리즈 전에 원문을 확인해야 합니다.
+- Supertonic 3 모델은 **OpenRAIL-M** 라이선스입니다. Gemma 이용약관·NOTICE와 Supertonic 모델 라이선스 전문은 배포 패키지의 `LICENSES/`에 포함됩니다.
 
 ## 데이터와 네트워크 경계
 
@@ -65,7 +70,7 @@ npm run test:extension:tts
 npm run test:extension:page-tts
 ```
 
-`test:extension`은 MV3 서비스 워커, 팝업, 오프스크린 문서와 YouTube 자막 오버레이를 확인합니다. `test:extension:model`과 `test:extension:model:translategemma`는 기본 TranslateGemma WebGPU 경로와 의미 품질을, `test:extension:model:m2m100` 및 `:wasm`은 경량 호환 경로를 확인합니다. `test:extension:model:small100`은 실험적 WASM 호환 모델을 검증합니다. `test:extension:tts`는 두 구간 한국어를 실제로 끝까지 생성·재생하고, `test:extension:page-tts`는 웹 페이지 번역 결과의 콜드 로드 취소·재생·정지를 검증합니다. 각 스모크 테스트는 임시 Chrome 프로필을 사용하고 완료 후 제거합니다.
+`test:extension`은 MV3 서비스 워커, 팝업, 오프스크린 문서와 YouTube 자막 오버레이를 확인합니다. `test:extension:model`은 기본 모델의 자동 폴백을 허용해 의미 품질을 확인하고, `test:extension:model:translategemma`는 TranslateGemma가 폴백 없이 WebGPU에서 실행된 상태로 Supertonic 음성까지 함께 로드·재생되는 기본 통합 경로를 강제합니다. `test:extension:model:m2m100` 및 `:wasm`은 경량 호환 경로를 확인합니다. `test:extension:model:small100`은 실험적 WASM 호환 모델을 검증합니다. `test:extension:tts`는 번역 모델을 미리 로드하지 않은 상태에서 두 구간 한국어를 실제로 끝까지 생성·재생하고, `test:extension:page-tts`는 M2M100 WebGPU 결과 검증과 필요한 경우 WASM 재시도, 웹 페이지 번역 결과의 콜드 로드 취소·재생·정지를 함께 검증합니다. 각 스모크 테스트는 임시 Chrome 프로필을 사용하고 완료 후 제거합니다.
 
 각 `test:extension:*` 명령은 최신 소스를 먼저 빌드하므로 이전 `dist`를 잘못 검사하지 않습니다. 페이지 스모크는 산문형 `pre`, 커스텀 본문 태그와 현재 화면 우선순위도 검증합니다.
 
@@ -76,9 +81,9 @@ npm run store:assets
 npm run release:package
 ```
 
-`store:assets`는 실제 확장 UI의 1280×800 스크린샷과 440×280 프로모션 이미지를 `store-assets/`에 만듭니다. `release:package`는 타입·단위·정적 검증, 실제 Chrome 기본 TranslateGemma `auto`, M2M100 명시적 WASM, 전체 TTS 재생·페이지 중지, SMaLL-100 호환 경로, npm production audit를 통과한 뒤 manifest가 루트에 있는 제출 ZIP과 SHA-256 파일을 `release/`에 생성합니다.
+`store:assets`는 실제 확장 UI 레이아웃의 1280×800 스크린샷과 440×280 프로모션 이미지를 `store-assets/`에 만들고 UI hash 매니페스트를 기록합니다. 번역 스크린샷은 재현 가능한 로컬 데모 상태이며 실모델 결과 증거는 별도 Chrome 스모크가 담당합니다. `release:package`는 타입·단위·정적 검증, 실제 Chrome 기본 TranslateGemma `WebGPU`, M2M100 명시적 WASM, 전체 TTS 재생·페이지 중지, SMaLL-100 호환 경로, npm production audit를 통과한 뒤 manifest가 루트에 있는 재현 가능한 제출 ZIP, SHA-256과 빌드 메타데이터를 `release/`에 생성하고 다시 검증합니다.
 
-Dashboard 입력 문안과 권한 설명은 [Chrome Web Store 제출 문안](docs/STORE_LISTING.md), 수동 확인 항목은 [릴리즈 체크리스트](docs/RELEASE_CHECKLIST.md)에 있습니다. 개인정보처리방침 공개 URL과 TTS의 비상업 라이선스 조건은 제출 전에 반드시 확인해야 합니다.
+Dashboard 입력 문안과 권한 설명은 [Chrome Web Store 제출 문안](docs/STORE_LISTING.md), 수동 확인 항목은 [릴리즈 체크리스트](docs/RELEASE_CHECKLIST.md)에 있습니다. 개인정보처리방침 공개 URL과 모델별 이용 제한·재배포 조건은 제출 전에 반드시 확인해야 합니다.
 
 ## 구조
 

@@ -1,27 +1,16 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { chromium } from "playwright-core";
+import { createStoreAssetManifest } from "./store-asset-integrity.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const extensionPath = join(root, "dist");
 const outputDir = join(root, "store-assets");
-const profilePath = await mkdtemp(join(tmpdir(), "ongeul-store-assets-"));
 await mkdir(outputDir, { recursive: true });
+const { context, profilePath } = await launchExtensionWithRetry();
 
-let context;
 try {
-  context = await chromium.launchPersistentContext(profilePath, {
-    executablePath: chromium.executablePath(),
-    headless: true,
-    viewport: { width: 1280, height: 800 },
-    args: [
-      `--disable-extensions-except=${extensionPath}`,
-      `--load-extension=${extensionPath}`,
-      "--disable-component-update",
-      "--no-first-run"
-    ]
-  });
   const serviceWorker =
     context.serviceWorkers()[0] ??
     await context.waitForEvent("serviceworker", { timeout: 20_000 });
@@ -72,6 +61,35 @@ try {
     "The model translates this text inside the browser."
   );
   await popup.locator("#source-language").selectOption("en");
+  await popup.evaluate(() => {
+    const resultCard = document.querySelector("#result-card");
+    const resultText = document.querySelector("#result-text");
+    const resultMeta = document.querySelector("#result-meta");
+    const speak = document.querySelector("#speak-button");
+    const engineTitle = document.querySelector("#engine-title");
+    const engineDetail = document.querySelector("#engine-detail");
+    const engineState = document.querySelector("#engine-state");
+    if (resultCard) resultCard.hidden = false;
+    if (resultText) {
+      resultText.className = "result-text";
+      resultText.textContent =
+        "이 모델은 브라우저 안에서 이 텍스트를 번역합니다.";
+    }
+    if (resultMeta) {
+      resultMeta.textContent =
+        "TranslateGemma 4B · WebGPU · 브라우저 내부 실행";
+    }
+    if (speak) speak.disabled = false;
+    if (engineTitle) engineTitle.textContent = "TranslateGemma 4B 준비됨";
+    if (engineDetail) {
+      engineDetail.textContent =
+        "WebGPU · onnx-community/translategemma-text-4b-it-ONNX";
+    }
+    if (engineState) {
+      engineState.className = "engine-state ready";
+      engineState.textContent = "준비";
+    }
+  });
   await popup.screenshot({
     path: join(outputDir, "screenshot-translator-1280x800.png")
   });
@@ -123,8 +141,46 @@ try {
     path: join(outputDir, "promo-small-440x280.png")
   });
 
+  const assetManifest = await createStoreAssetManifest(root);
+  await writeFile(
+    join(outputDir, "asset-manifest.json"),
+    `${JSON.stringify(assetManifest, null, 2)}\n`
+  );
   console.log(`STORE_ASSETS=${outputDir}`);
 } finally {
-  await context?.close().catch(() => undefined);
+  await context.close().catch(() => undefined);
   await rm(profilePath, { recursive: true, force: true });
+}
+
+async function launchExtensionWithRetry() {
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const candidateProfile = await mkdtemp(
+      join(tmpdir(), "ongeul-store-assets-")
+    );
+    try {
+      const candidateContext = await chromium.launchPersistentContext(
+        candidateProfile,
+        {
+          executablePath: chromium.executablePath(),
+          headless: true,
+          viewport: { width: 1280, height: 800 },
+          args: [
+            `--disable-extensions-except=${extensionPath}`,
+            `--load-extension=${extensionPath}`,
+            "--disable-component-update",
+            "--no-first-run"
+          ]
+        }
+      );
+      return {
+        context: candidateContext,
+        profilePath: candidateProfile
+      };
+    } catch (error) {
+      lastError = error;
+      await rm(candidateProfile, { recursive: true, force: true });
+    }
+  }
+  throw lastError;
 }
