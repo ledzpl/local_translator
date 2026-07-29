@@ -182,9 +182,13 @@ async function runSpeech(
     const synthesizer = await getTtsEngine();
     if (!isCurrentSpeech(run, speechId)) return;
 
+    let pendingOutput = synthesizeSpeechChunk(
+      synthesizer,
+      chunks[0],
+      run,
+      speechId
+    );
     for (let index = 0; index < chunks.length; index += 1) {
-      const input = prepareKoreanForTts(chunks[index]!);
-      if (!input) continue;
       ttsStatus = {
         state: "synthesizing",
         modelId: TTS_MODEL_ID,
@@ -194,12 +198,19 @@ async function runSpeech(
       };
       broadcastTtsStatus();
 
-      const output = await ttsSynthesisQueue.run(async () => {
-        if (!isCurrentSpeech(run, speechId)) return null;
-        return synthesizer(input, {});
-      });
+      const output = await pendingOutput;
       if (!output || !isCurrentSpeech(run, speechId)) return;
       validateTtsAudio(output.audio, output.sampling_rate);
+
+      // Start generating the following clause while the current audio plays.
+      // This removes the synthesis-sized pause that previously occurred at
+      // every chunk boundary.
+      pendingOutput = synthesizeSpeechChunk(
+        synthesizer,
+        chunks[index + 1],
+        run,
+        speechId
+      );
       ttsStatus = {
         state: "playing",
         modelId: TTS_MODEL_ID,
@@ -231,6 +242,27 @@ async function runSpeech(
     };
     broadcastTtsStatus();
   }
+}
+
+function synthesizeSpeechChunk(
+  synthesizer: TextToAudioPipeline,
+  chunk: string | undefined,
+  run: number,
+  speechId: string
+) {
+  if (!chunk) return Promise.resolve(null);
+  const input = prepareKoreanForTts(chunk);
+  if (!input) return Promise.resolve(null);
+
+  const output = ttsSynthesisQueue.run(async () => {
+    if (!isCurrentSpeech(run, speechId)) return null;
+    return synthesizer(input, {});
+  });
+  // The next chunk can fail while the current audio is still playing. Attach a
+  // handler immediately; awaiting the original promise still forwards the
+  // error to runSpeech's catch block.
+  void output.catch(() => undefined);
+  return output;
 }
 
 async function getTtsEngine(): Promise<TextToAudioPipeline> {

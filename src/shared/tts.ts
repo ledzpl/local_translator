@@ -1,9 +1,11 @@
 import type { TtsStatus } from "./protocol";
 
-// MMS-TTS WASM latency rises steeply with long romanized inputs. Keeping the
-// source chunks short gets the first audio playing quickly and avoids multi-
-// minute synthesis stalls on ordinary page translations.
-const SPEECH_CHUNK_LENGTH = 6;
+// MMS-TTS WASM latency rises steeply with long romanized inputs, but very short
+// chunks reset the voice every few syllables. Keep ordinary sentences/clauses
+// together while retaining a hard cap for long page translations.
+const SPEECH_CHUNK_TARGET_LENGTH = 24;
+const SPEECH_CHUNK_MAX_LENGTH = 36;
+const SPEECH_CHUNK_MIN_BOUNDARY = 10;
 const KOREAN_DIGITS = ["영", "일", "이", "삼", "사", "오", "육", "칠", "팔", "구"];
 const HANGUL_BASE = 0xac00;
 const HANGUL_END = 0xd7a3;
@@ -140,24 +142,33 @@ export function chunkKoreanSpeech(text: string): string[] {
 
   const chunks: string[] = [];
   let remaining = normalized;
-  while (remaining.length > SPEECH_CHUNK_LENGTH) {
-    const window = remaining.slice(0, SPEECH_CHUNK_LENGTH + 1);
-    const boundary = Math.max(
-      window.lastIndexOf(". "),
-      window.lastIndexOf("! "),
-      window.lastIndexOf("? "),
-      window.lastIndexOf("。"),
-      window.lastIndexOf("！"),
-      window.lastIndexOf("？"),
-      window.lastIndexOf(", "),
-      window.lastIndexOf(" ")
+  while (remaining.length > SPEECH_CHUNK_MAX_LENGTH) {
+    const window = remaining.slice(0, SPEECH_CHUNK_MAX_LENGTH + 1);
+    const sentenceBoundary = findLastSpeechBoundary(
+      window,
+      /[.!?。！？](?:["'”’)\]}]*)?(?:\s|$)/gu
     );
-    const end = boundary >= Math.floor(SPEECH_CHUNK_LENGTH * 0.55)
-      ? boundary + 1
-      : SPEECH_CHUNK_LENGTH;
+    const phraseWindow = remaining.slice(0, SPEECH_CHUNK_TARGET_LENGTH + 1);
+    const phraseBoundary = findLastSpeechBoundary(
+      phraseWindow,
+      /[,，、;:](?:\s|$)|\s/gu
+    );
+    const end = sentenceBoundary >= SPEECH_CHUNK_MIN_BOUNDARY
+      ? sentenceBoundary
+      : phraseBoundary >= SPEECH_CHUNK_MIN_BOUNDARY
+        ? phraseBoundary
+        : SPEECH_CHUNK_TARGET_LENGTH;
     chunks.push(remaining.slice(0, end).trim());
     remaining = remaining.slice(end).trim();
   }
   if (remaining) chunks.push(remaining);
   return chunks;
+}
+
+function findLastSpeechBoundary(text: string, pattern: RegExp): number {
+  let end = -1;
+  for (const match of text.matchAll(pattern)) {
+    end = match.index + match[0].length;
+  }
+  return end;
 }

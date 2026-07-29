@@ -20,13 +20,31 @@ describe("prepareKoreanForTts", () => {
 });
 
 describe("chunkKoreanSpeech", () => {
-  it("긴 번역 결과를 문장 경계에 가까운 작은 조각으로 나눈다", () => {
+  it("서로 이어지는 짧은 문장은 한 음성 구간으로 유지한다", () => {
+    expect(chunkKoreanSpeech(
+      "첫 문장입니다. 이어지는 문장도 자연스럽게 읽습니다."
+    )).toEqual([
+      "첫 문장입니다. 이어지는 문장도 자연스럽게 읽습니다."
+    ]);
+  });
+
+  it("긴 번역 결과를 문장과 구 경계에 맞춘 구간으로 나눈다", () => {
     const chunks = chunkKoreanSpeech(
       `${"첫 번째 문장입니다. ".repeat(10)}${"마지막 문장입니다. ".repeat(10)}`
     );
     expect(chunks.length).toBeGreaterThan(1);
-    expect(chunks.every((chunk) => chunk.length <= 7)).toBe(true);
+    expect(chunks.every((chunk) => chunk.length <= 36)).toBe(true);
+    expect(chunks[0]).toMatch(/[.!?。！？]$/u);
     expect(chunks.join(" ").replace(/\s+/g, " ").trim()).toContain("마지막 문장입니다.");
+  });
+
+  it("경계가 없는 긴 텍스트도 모델 입력 상한에 맞게 자른다", () => {
+    const chunks = chunkKoreanSpeech("가".repeat(80));
+    expect(chunks).toEqual([
+      "가".repeat(24),
+      "가".repeat(24),
+      "가".repeat(32)
+    ]);
   });
 });
 
