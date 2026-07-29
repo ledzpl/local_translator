@@ -26,8 +26,8 @@ AI 모델을 처음 사용할 때는 HTTPS로 Hugging Face에 연결하여 모�
 
 ## 저장과 보관
 
-- 번역 모델은 실행 경로별 약 650~750MB입니다. 자동 WebGPU 실행이 실패해 WASM으로 전환하면 최초 네트워크 전송량이 최대 약 1.4GB가 될 수 있습니다.
-- 모델 파일은 Chrome의 확장 프로그램 전용 Cache Storage에 저장되어 다음 실행에 재사용됩니다. 자동 전환 때 실패한 WebGPU 가중치는 Cache Storage에서 정리합니다.
+- 기본 TranslateGemma 4B 모델은 약 3.1GB입니다. WebGPU를 사용할 수 없거나 실행이 실패해 M2M100 WASM으로 전환하면 약 650MB를 추가로 내려받을 수 있습니다.
+- 모델 파일은 Chrome의 확장 프로그램 전용 Cache Storage에 저장되어 다음 실행에 재사용됩니다. WebGPU 초기화에 실패한 가중치는 Cache Storage에서 정리합니다.
 - 번역 결과 캐시는 실행 중인 오프스크린 문서의 메모리에만 보관되며 외부로 전송하거나 영구 저장하지 않습니다.
 - 데이터 처리 안내 확인 버전, 모델·실행 장치·언어·YouTube 자막 설정은 `chrome.storage.sync`에 저장되며 Chrome에 로그인한 사용자의 브라우저 사이에서 동기화될 수 있습니다.
 - 웹페이지 내용, 선택 텍스트, 자막, 번역 결과와 음성은 `chrome.storage.sync`에 저장하지 않습니다.

@@ -9,13 +9,24 @@ const extensionPath = join(root, "dist");
 const withPageTts = process.argv.includes("--with-page-tts");
 const withModel = process.argv.includes("--with-model") || withPageTts;
 const withTts = process.argv.includes("--with-tts");
-const keepProfile = process.argv.includes("--keep-profile");
-const requestedModel = process.argv.includes("--small100") ? "small100" : "m2m100";
+const profileArgument = process.argv.find((argument) =>
+  argument.startsWith("--profile=")
+);
+const existingProfilePath = profileArgument?.slice("--profile=".length);
+const keepProfile =
+  process.argv.includes("--keep-profile") || Boolean(existingProfilePath);
+const requestedModel = process.argv.includes("--small100")
+  ? "small100"
+  : process.argv.includes("--m2m100")
+    ? "m2m100"
+    : "translategemma";
 const requestedDevice =
   requestedModel === "small100" || process.argv.includes("--wasm")
     ? "wasm"
     : "auto";
-const profilePath = await mkdtemp(join(tmpdir(), "ongeul-chrome-smoke-"));
+const profilePath =
+  existingProfilePath ??
+  await mkdtemp(join(tmpdir(), "ongeul-chrome-smoke-"));
 const errors = [];
 
 let context;
@@ -37,6 +48,8 @@ try {
   const extensionId = new URL(serviceWorker.url()).host;
   if (!extensionId) throw new Error("확장 프로그램 ID를 확인하지 못했습니다.");
   await serviceWorker.evaluate(async ({ modelPreference, devicePreference }) => {
+    await chrome.storage.sync.clear();
+    await chrome.storage.session.clear();
     await chrome.storage.sync.set({
       modelPreference,
       devicePreference
@@ -100,7 +113,7 @@ try {
       "youtubeEnabled",
       "autoEnableCaptions"
     ]);
-    return settings.privacyConsentVersion === 1 &&
+    return settings.privacyConsentVersion === 2 &&
       settings.youtubeEnabled === true &&
       settings.autoEnableCaptions === true;
   });
@@ -116,8 +129,8 @@ try {
   if (requestedModel === "small100" && !deviceDisabled) {
     throw new Error("SMaLL-100의 WASM 전용 장치 설정이 UI에 반영되지 않았습니다.");
   }
-  if (requestedModel === "m2m100" && deviceDisabled) {
-    throw new Error("M2M100 장치 설정이 비활성화됐습니다.");
+  if (requestedModel !== "small100" && deviceDisabled) {
+    throw new Error("선택한 번역 모델의 장치 설정이 비활성화됐습니다.");
   }
   if (await popup.getByRole("button", { name: "확장 새로고침" }).isVisible()) {
     throw new Error("정상 서비스 워커에서 확장 새로고침 안내가 표시됐습니다.");
@@ -135,14 +148,21 @@ try {
 
   if (withModel) {
     await popup.getByRole("button", { name: "한국어로 번역" }).click();
-    await popup.waitForFunction(
-      () => {
-        const result = document.querySelector("#result-text");
-        return result && !result.classList.contains("loading-lines");
-      },
-      undefined,
-      { timeout: 15 * 60_000 }
+    const completed = await waitForTranslationResult(
+      popup,
+      requestedModel === "translategemma" ? 60 * 60_000 : 15 * 60_000
     );
+    if (!completed) {
+      const timedOutStatus = await popup.evaluate(async () =>
+        chrome.runtime.sendMessage({
+          target: "background",
+          type: "GET_ENGINE_STATUS"
+        })
+      );
+      throw new Error(
+        `번역 모델 준비 시간 초과: ${JSON.stringify(timedOutStatus)}`
+      );
+    }
     const result = (await popup.locator("#result-text").innerText()).trim();
     const resultMeta = (await popup.locator("#result-meta").innerText()).trim();
     const engineStatus = await popup.evaluate(async () =>
@@ -151,34 +171,48 @@ try {
         type: "GET_ENGINE_STATUS"
       })
     );
+    if (engineStatus.state === "error") {
+      throw new Error(
+        `번역 엔진 오류: ${JSON.stringify(engineStatus)} result=${result}`
+      );
+    }
     if (!/[가-힣]/.test(result) || /<\/?(?:pad|s)>/i.test(result)) {
       throw new Error(
         `한국어 번역 결과를 확인하지 못했습니다: ${result} (${resultMeta}) ` +
         `engine=${JSON.stringify(engineStatus)}`
       );
     }
-    if (requestedModel === "m2m100") {
+    if (requestedModel !== "small100") {
       assertSemanticTranslation({
         id: "browser_local_execution",
         translation: result,
         requiredConcepts: [
           [/모델/u],
           [/번역/u],
-          [/브라우저\s*(?:안|내부)/u]
+          [/브라우저\s*(?:안|내부|내)/u]
         ],
         forbidden: [/\b(?:model|translates?|sentence|inside|browser)\b/iu]
       });
     }
+    const requestedModelId = {
+      small100: "casawolice/small100-onnx",
+      m2m100: "Xenova/m2m100_418M",
+      translategemma: "onnx-community/translategemma-text-4b-it-ONNX"
+    }[requestedModel];
     const expectedModelId =
-      requestedModel === "small100"
-        ? "casawolice/small100-onnx"
-        : "Xenova/m2m100_418M";
+      requestedModel === "translategemma" &&
+      engineStatus.fallbackFromModelId === requestedModelId
+        ? "Xenova/m2m100_418M"
+        : requestedModelId;
     if (
       engineStatus.state !== "ready" ||
       engineStatus.modelId !== expectedModelId ||
       !["wasm", "webgpu"].includes(engineStatus.device) ||
       (requestedDevice === "wasm" && engineStatus.device !== "wasm") ||
-      (requestedModel === "small100" && engineStatus.fallbackFromModelId)
+      (requestedModel === "small100" && engineStatus.fallbackFromModelId) ||
+      (requestedModel === "translategemma" &&
+        engineStatus.modelId !== requestedModelId &&
+        engineStatus.fallbackFromModelId !== requestedModelId)
     ) {
       throw new Error(`요청한 모델 엔진이 준비되지 않았습니다: ${JSON.stringify(engineStatus)}`);
     }
@@ -189,14 +223,23 @@ try {
     console.log(
       `MODEL_DEVICE_FALLBACK=${engineStatus.fallbackFromDevice ?? "none"}`
     );
+    console.log(
+      `MODEL_FALLBACK_REASON=${engineStatus.deviceFallbackReason ?? engineStatus.fallbackReason ?? "none"}`
+    );
     const cachedQ4f16Weights = await popup.evaluate(async () => {
       const cache = await caches.open("transformers-cache");
       const requests = await cache.keys();
       return requests
         .map((request) => decodeURIComponent(request.url).toLowerCase())
         .filter((url) =>
-          url.includes("/xenova/m2m100_418m/") &&
-          /\/onnx\/[^/?#]*_q4f16\.onnx(?:[?#]|$)/u.test(url)
+          (
+            url.includes("/xenova/m2m100_418m/") &&
+            /\/onnx\/[^/?#]*_q4f16\.onnx(?:[?#]|$)/u.test(url)
+          ) ||
+          (
+            url.includes("/onnx-community/translategemma-text-4b-it-onnx/") &&
+            /\/onnx\/model_q4\.onnx(?:_data(?:_\d+)?)?(?:[?#]|$)/u.test(url)
+          )
         );
     });
     if (
@@ -226,7 +269,7 @@ try {
     ) {
       throw new Error(`웜업 번역 결과를 확인하지 못했습니다: ${JSON.stringify(warmResult)}`);
     }
-    if (requestedModel === "m2m100") {
+    if (requestedModel !== "small100") {
       assertSemanticTranslation({
         id: "navigation_readability",
         translation: warmResult.translation,
@@ -255,7 +298,7 @@ try {
     if (!privacyResult.ok) {
       throw new Error(`개인정보 부정문 번역에 실패했습니다: ${JSON.stringify(privacyResult)}`);
     }
-    if (requestedModel === "m2m100") {
+    if (requestedModel !== "small100") {
       assertSemanticTranslation({
         id: "privacy_negation",
         translation: privacyResult.translation,
@@ -644,4 +687,37 @@ async function waitForTtsState(
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   return status;
+}
+
+async function waitForTranslationResult(page, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let lastProgress = "";
+  while (Date.now() < deadline) {
+    const snapshot = await page.evaluate(async () => {
+      const result = document.querySelector("#result-text");
+      const status = await chrome.runtime.sendMessage({
+        target: "background",
+        type: "GET_ENGINE_STATUS"
+      });
+      return {
+        complete: Boolean(result && !result.classList.contains("loading-lines")),
+        status
+      };
+    });
+    const progress = JSON.stringify({
+      state: snapshot.status?.state,
+      modelId: snapshot.status?.modelId,
+      device: snapshot.status?.device,
+      progressBucket: Math.floor((snapshot.status?.progress ?? 0) * 10) * 10,
+      file: snapshot.status?.file,
+      error: snapshot.status?.error
+    });
+    if (progress !== lastProgress) {
+      console.log(`MODEL_PROGRESS=${progress}`);
+      lastProgress = progress;
+    }
+    if (snapshot.complete) return true;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return false;
 }

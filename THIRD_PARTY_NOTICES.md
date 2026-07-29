@@ -3,13 +3,13 @@
 온글 번역은 다음 오픈소스 소프트웨어와 모델을 사용합니다. npm 버전은
 `package-lock.json`에 고정된 브라우저 런타임 의존성을 기준으로 합니다.
 
-- [Transformers.js 3.8.1](https://github.com/huggingface/transformers.js) —
+- [Transformers.js 4.2.0](https://github.com/huggingface/transformers.js) —
   Apache License 2.0
 - Transformers.js 웹 번들에 포함된
   [Hugging Face Jinja 0.5.9](https://github.com/huggingface/huggingface.js/tree/main/packages/jinja) —
   MIT License
-- [ONNX Runtime Common 1.21.0과 ONNX Runtime Web/Common
-  1.22.0-dev.20250409-89f8206ba4](https://github.com/microsoft/onnxruntime) —
+- [ONNX Runtime Common 1.24.0-dev.20251116-b39e144322와 ONNX Runtime Web
+  1.26.0-dev.20260416-b7804b056c](https://github.com/microsoft/onnxruntime) —
   MIT License
 - ONNX Runtime Web 패키지가 선언해 함께 설치되는 브라우저 런타임 의존성:
   [FlatBuffers 25.9.23](https://github.com/google/flatbuffers) 및
@@ -22,6 +22,9 @@
   [Transformers.js용 int8 ONNX 변환본](https://huggingface.co/casawolice/small100-onnx) — upstream MIT License
 - [M2M100 418M](https://huggingface.co/facebook/m2m100_418M) 및
   [Transformers.js용 ONNX 변환본](https://huggingface.co/Xenova/m2m100_418M) — upstream MIT License
+- Google의 [TranslateGemma 4B](https://huggingface.co/google/translategemma-4b-it) 및
+  [Transformers.js용 ONNX 변환본](https://huggingface.co/onnx-community/translategemma-text-4b-it-ONNX) —
+  [Gemma 이용약관](https://ai.google.dev/gemma/terms)과 금지 용도 정책 적용
 - Supertone의 [Supertonic 브라우저 추론 코드](https://github.com/supertone-inc/supertonic/tree/main/web) —
   MIT License; [Supertonic 3 모델](https://huggingface.co/Supertone/supertonic-3) —
   [OpenRAIL-M](https://huggingface.co/Supertone/supertonic-3/blob/main/LICENSE).

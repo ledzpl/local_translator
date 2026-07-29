@@ -3,15 +3,16 @@
 ## 코드와 패키지
 
 - [ ] `npm ci`
-- [ ] `npm run release:check` — 타입, 단위 테스트, 정적 패키지, 실제 Chrome 기본 M2M100 `auto`·명시적 WASM, TTS 전체 재생·중지, SMaLL-100 호환 경로
+- [ ] `npm run release:check` — 타입, 단위 테스트, 정적 패키지, 실제 Chrome 기본 TranslateGemma `auto`, M2M100 명시적 WASM, TTS 전체 재생·중지, SMaLL-100 호환 경로
 - [ ] `npm run release:package` — `release/ongeul-local-translator-v<version>.zip` 생성
 - [ ] ZIP 루트에 `manifest.json`이 있는지 확인
 - [ ] 출력된 SHA-256을 릴리즈 기록에 보관
 - [ ] `dist` 실행 번들에 jsDelivr/unpkg/원격 JS·WASM 경로와 source map이 없는지 확인
-- [ ] 자동 WebGPU 폴백에서 q4f16 캐시 정리·WASM 재시도와 최대 약 1.4GB 최초 전송 안내가 일치하는지 확인
+- [ ] 자동 WebGPU 폴백에서 TranslateGemma q4 캐시 정리와 M2M100 WASM 재시도 안내가 일치하는지 확인
 
 ## 법적·개인정보
 
+- [ ] TranslateGemma의 Gemma 이용약관·금지 용도 정책 고지와 제품 용도를 검토
 - [ ] `Supertone/supertonic-3` OpenRAIL-M의 사용 제한과 배포 고지 조건을 현재 제품 용도에 맞게 검토
 - [ ] `PRIVACY_POLICY.md`가 공개 HTTPS URL에서 열리는지 확인
 - [ ] Dashboard 개인정보 탭을 `docs/STORE_LISTING.md`와 동일하게 입력

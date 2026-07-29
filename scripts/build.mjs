@@ -35,7 +35,10 @@ const wasmDist = join(dist, "wasm");
 await mkdir(wasmDist, { recursive: true });
 const ortFiles = (await readdir(ortDist)).filter(
   (file) =>
-    file.startsWith("ort-wasm-simd-threaded.jsep.") &&
+    (
+      file.startsWith("ort-wasm-simd-threaded.jsep.") ||
+      file.startsWith("ort-wasm-simd-threaded.asyncify.")
+    ) &&
     (file.endsWith(".wasm") || file.endsWith(".mjs"))
 );
 await Promise.all(

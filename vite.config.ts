@@ -1,11 +1,16 @@
 import { resolve } from "node:path";
 import { defineConfig, type Plugin } from "vite";
 
-const TRANSFORMERS_REMOTE_WASM_DEFAULT =
-  /https:\/\/cdn\.jsdelivr\.net\/npm\/@huggingface\/transformers@\$\{[^}]+\}\/dist\//g;
+const TRANSFORMERS_REMOTE_WASM_DEFAULTS = [
+  /https:\/\/cdn\.jsdelivr\.net\/npm\/@huggingface\/transformers@\$\{[^}]+\}\/dist\//g,
+  /https:\/\/cdn\.jsdelivr\.net\/npm\/onnxruntime-web@\$\{[^}]+\}\/dist\//g
+];
 
 export default defineConfig({
   plugins: [localTransformersWasmPlugin()],
+  resolve: {
+    conditions: ["onnxruntime-web-use-extern-wasm"]
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,
@@ -32,7 +37,10 @@ function localTransformersWasmPlugin(): Plugin {
     name: "ongeul-local-transformers-wasm",
     enforce: "post",
     renderChunk(code) {
-      const localized = code.replace(TRANSFORMERS_REMOTE_WASM_DEFAULT, "wasm/");
+      const localized = TRANSFORMERS_REMOTE_WASM_DEFAULTS.reduce(
+        (source, pattern) => source.replace(pattern, "wasm/"),
+        code
+      );
       return localized === code ? null : { code: localized, map: null };
     }
   };

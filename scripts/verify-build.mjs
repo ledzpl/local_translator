@@ -32,6 +32,7 @@ const required = [
   "icons/icon-128.png"
 ];
 const pinnedRevisions = [
+  "f7874a1ac60758872a4f78aac0df95b17b776994",
   "5c2c73ac70bee9c58f5a7ac5e84a36bee25db8ee",
   "9c374f0b7aca709787cea97b047bfbbd1559d177",
   "3cadd1ee6394adea1bd021217a0e650ede09a323"
@@ -61,13 +62,18 @@ if (sourceMaps.length > 0) {
 
 const wasmFiles = files.filter((file) => extname(file) === ".wasm");
 const wasmFactories = files.filter(
-  (file) => file.endsWith(".mjs") && file.includes("ort-wasm-simd-threaded")
+  (file) =>
+    file.endsWith(".mjs") &&
+    (
+      file.includes("ort-wasm-simd-threaded.jsep") ||
+      file.includes("ort-wasm-simd-threaded.asyncify")
+    )
 );
-if (wasmFiles.length !== 1) {
-  throw new Error(`ONNX Runtime WASM은 정확히 한 개여야 합니다: ${wasmFiles.length}`);
+if (wasmFiles.length !== 2) {
+  throw new Error(`ONNX Runtime WASM 변형은 정확히 두 개여야 합니다: ${wasmFiles.length}`);
 }
-if (wasmFactories.length !== 1) {
-  throw new Error(`로컬 ONNX Runtime factory는 정확히 한 개여야 합니다: ${wasmFactories.length}`);
+if (wasmFactories.length !== 2) {
+  throw new Error(`로컬 ONNX Runtime factory는 정확히 두 개여야 합니다: ${wasmFactories.length}`);
 }
 
 const executableFiles = files.filter((file) =>
@@ -119,13 +125,13 @@ if (!bounds || bounds.minX < 16 || bounds.minY < 16 || bounds.maxX > 111 || boun
 
 const totalBytes = (await Promise.all(files.map(async (file) => (await stat(file)).size)))
   .reduce((sum, size) => sum + size, 0);
-if (totalBytes > 30 * 1024 * 1024) {
-  throw new Error(`릴리즈 패키지가 30MB를 초과합니다: ${(totalBytes / 1024 / 1024).toFixed(1)}MB`);
+if (totalBytes > 55 * 1024 * 1024) {
+  throw new Error(`릴리즈 패키지가 55MB를 초과합니다: ${(totalBytes / 1024 / 1024).toFixed(1)}MB`);
 }
 
 console.log(
   `Verified MV3 release package: ${relativeFiles.length} files, ` +
-  `${(totalBytes / 1024 / 1024).toFixed(1)}MB, local WASM only`
+  `${(totalBytes / 1024 / 1024).toFixed(1)}MB, local WebGPU/WASM runtimes only`
 );
 
 async function walkFiles(directory) {

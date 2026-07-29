@@ -10,13 +10,15 @@
     "test": "vitest run",
     "test:extension:built": "node scripts/smoke-extension.mjs",
     "test:extension:built:model": "node scripts/smoke-extension.mjs --with-model",
-    "test:extension:built:model:m2m100": "node scripts/smoke-extension.mjs --with-model",
-    "test:extension:built:model:m2m100:wasm": "node scripts/smoke-extension.mjs --with-model --wasm",
+    "test:extension:built:model:translategemma": "node scripts/smoke-extension.mjs --with-model",
+    "test:extension:built:model:m2m100": "node scripts/smoke-extension.mjs --with-model --m2m100",
+    "test:extension:built:model:m2m100:wasm": "node scripts/smoke-extension.mjs --with-model --m2m100 --wasm",
     "test:extension:built:model:small100": "node scripts/smoke-extension.mjs --with-model --small100",
     "test:extension:built:tts": "node scripts/smoke-extension.mjs --with-tts",
-    "test:extension:built:page-tts": "node scripts/smoke-extension.mjs --with-page-tts",
+    "test:extension:built:page-tts": "node scripts/smoke-extension.mjs --with-page-tts --m2m100",
     "test:extension": "npm run build && npm run test:extension:built",
     "test:extension:model": "npm run build && npm run test:extension:built:model",
+    "test:extension:model:translategemma": "npm run build && npm run test:extension:built:model:translategemma",
     "test:extension:model:m2m100": "npm run build && npm run test:extension:built:model:m2m100",
     "test:extension:model:m2m100:wasm": "npm run build && npm run test:extension:built:model:m2m100:wasm",
     "test:extension:model:small100": "npm run build && npm run test:extension:built:model:small100",
@@ -31,8 +33,8 @@
     "store:assets": "npm run build && node scripts/capture-store-assets.mjs"
   },
   "dependencies": {
-    "@huggingface/transformers": "3.8.1",
-    "onnxruntime-web": "1.22.0-dev.20250409-89f8206ba4"
+    "@huggingface/transformers": "4.2.0",
+    "onnxruntime-web": "1.26.0-dev.20260416-b7804b056c"
   },
   "devDependencies": {
     "@types/chrome": "0.2.2",

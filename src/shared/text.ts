@@ -69,7 +69,9 @@ function splitLongSegment(segment: string, maxChars: number): string[] {
 export function friendlyError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   if (/fetch|network|failed to load|load failed/i.test(message)) {
-    return "모델을 내려받지 못했습니다. 인터넷 연결을 확인한 뒤 다시 시도해 주세요.";
+    const detail = message.length <= 240 ? ` (${message})` : "";
+    return "모델을 내려받거나 불러오지 못했습니다. 인터넷 연결을 확인한 뒤 다시 시도해 주세요." +
+      detail;
   }
   if (/memory|allocation|out of memory/i.test(message)) {
     return "모델을 실행할 메모리가 부족합니다. 다른 탭을 닫거나 WASM 모드로 바꿔 주세요.";

@@ -19,7 +19,8 @@ import { LANGUAGE_OPTIONS } from "../shared/languages";
 import {
   M2M100_MODEL_ID,
   MODEL_DEFINITIONS,
-  SMALL100_MODEL_ID
+  SMALL100_MODEL_ID,
+  TRANSLATEGEMMA_MODEL_ID
 } from "../shared/models";
 import {
   CURRENT_PRIVACY_CONSENT_VERSION,
@@ -42,13 +43,14 @@ app.innerHTML = `
     <ul>
       <li>직접 입력하거나 선택한 텍스트, 요청한 페이지 본문과 켠 YouTube 자막은 이 기기 안에서만 번역합니다.</li>
       <li>번역·음성 모델 파일만 Hugging Face에서 내려받으며, 번역할 내용은 개발자나 Hugging Face에 보내지 않습니다.</li>
-      <li>첫 번역은 실행 경로별 약 650~750MB를 받으며, WebGPU 자동 전환 시 두 경로를 순차 다운로드해 전송량이 최대 약 1.4GB가 될 수 있습니다.</li>
+      <li>기본 TranslateGemma 4B는 약 3.1GB이며 WebGPU가 필요합니다. 미지원·실패 시 M2M100 WASM 약 650MB를 추가로 받을 수 있습니다.</li>
+      <li>TranslateGemma 사용에는 <a href="https://ai.google.dev/gemma/terms" target="_blank" rel="noreferrer">Gemma 이용약관</a>과 금지 용도 정책이 적용됩니다.</li>
       <li>모델·언어·자막 설정과 이 확인 기록은 Chrome 동기화 저장소에 보관될 수 있습니다. 페이지 내용은 저장하지 않습니다.</li>
     </ul>
     <a href="/privacy.html" target="_blank" rel="noreferrer">개인정보처리방침 전체 보기</a>
     <label class="consent-check">
       <input id="privacy-consent-check" type="checkbox" />
-      <span>위 데이터 처리 방식과 모델 다운로드를 확인했습니다.</span>
+      <span>위 데이터 처리 방식, 모델 다운로드와 Gemma 이용 조건을 확인했습니다.</span>
     </label>
     <button id="privacy-consent-button" class="primary-button" type="button" disabled>
       <span>동의하고 시작</span><span aria-hidden="true">→</span>
@@ -111,7 +113,7 @@ app.innerHTML = `
       <div class="engine-icon">AI</div>
       <div class="engine-copy">
         <strong id="engine-title">로컬 모델 대기 중</strong>
-        <span id="engine-detail">경로별 약 650~750MB · 자동 폴백 시 최대 약 1.4GB</span>
+        <span id="engine-detail">TranslateGemma 4B 약 3.1GB · WebGPU 우선</span>
       </div>
       <span id="engine-state" class="engine-state idle">대기</span>
     </div>
@@ -160,7 +162,8 @@ app.innerHTML = `
     <label>
       번역 모델
       <select id="model-preference">
-        <option value="m2m100">M2M100 — 권장 기본 모델</option>
+        <option value="translategemma">TranslateGemma 4B — 최고 품질</option>
+        <option value="m2m100">M2M100 — 경량 호환 모델</option>
         <option value="small100">SMaLL-100 — 실험적 WASM 호환</option>
       </select>
     </label>
@@ -172,7 +175,7 @@ app.innerHTML = `
         <option value="webgpu">WebGPU — 실험적 GPU 가속</option>
       </select>
     </label>
-    <p id="model-setting-detail">M2M100 · 경로별 약 650~750MB · 자동 폴백 시 최대 약 1.4GB 전송 · Chrome 캐시에 보관</p>
+    <p id="model-setting-detail">TranslateGemma 4B · 약 3.1GB · WebGPU 전용 · 미지원 시 M2M100 WASM 폴백 · Chrome 캐시에 보관</p>
   </details>
 
   <footer>
@@ -722,6 +725,8 @@ function updateModelSettingDetail(): void {
   const automaticFallbackNote =
     preference === "m2m100"
       ? " · 자동 폴백 시 최대 약 1.4GB 전송"
+      : preference === "translategemma"
+        ? " · 폴백 시 M2M100 약 650MB 추가"
       : "";
   elements.modelSettingDetail.textContent =
     `${definition.label} · ${definition.downloadSize}${automaticFallbackNote} · ` +
@@ -760,7 +765,7 @@ function updateEngineStatus(status: EngineStatus): void {
     elements.engineDetail.textContent = status.fallbackFromDevice === "webgpu"
       ? `WebGPU 오류로 WASM 폴백 · ${runtime}`
       : status.fallbackFromModelId
-        ? `SMaLL-100 로드 실패로 M2M100 폴백 · ${runtime}`
+        ? `${modelLabelFromId(status.fallbackFromModelId)} 대신 M2M100 폴백 · ${runtime}`
         : runtime;
   } else if (status.state === "error") {
     elements.engineTitle.textContent = "모델을 준비하지 못했어요";
@@ -772,11 +777,16 @@ function updateEngineStatus(status: EngineStatus): void {
     elements.engineDetail.textContent =
       elements.modelPreference.value === "m2m100"
         ? `${selected.downloadSize} · 자동 폴백 시 최대 약 1.4GB`
+        : elements.modelPreference.value === "translategemma"
+          ? `${selected.downloadSize} · WebGPU 미지원 시 M2M100 WASM 폴백`
         : `첫 번역 때 ${selected.downloadSize} 모델을 한 번 내려받습니다.`;
   }
 }
 
 function modelLabelFromId(modelId: string): string {
+  if (modelId === TRANSLATEGEMMA_MODEL_ID) {
+    return MODEL_DEFINITIONS.translategemma.label;
+  }
   if (modelId === SMALL100_MODEL_ID) return MODEL_DEFINITIONS.small100.label;
   if (modelId === M2M100_MODEL_ID) return MODEL_DEFINITIONS.m2m100.label;
   return "로컬 모델";

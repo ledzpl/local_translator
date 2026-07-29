@@ -4,6 +4,7 @@ import {
   Tensor,
   env,
   pipeline,
+  type TextGenerationPipeline,
   type TranslationPipeline
 } from "@huggingface/transformers";
 import {
@@ -25,10 +26,13 @@ import {
   M2M100_MODEL_ID,
   SMALL100_MODEL_ID,
   SMALL100_REVISION,
+  TRANSLATEGEMMA_MODEL_ID,
+  TRANSLATEGEMMA_REVISION,
   TTS_VOICE_STYLE,
   createSmall100InputIds,
   getTtsModelFileUrl,
-  isM2m100WebGpuWeightUrl
+  isM2m100WebGpuWeightUrl,
+  isTranslateGemmaWebGpuWeightUrl
 } from "../shared/models";
 import { SerialTaskQueue } from "../shared/serial-queue";
 import {
@@ -55,12 +59,23 @@ type TranslationEngine =
   | {
       kind: "m2m100";
       pipeline: TranslationPipeline;
+    }
+  | {
+      kind: "translategemma";
+      pipeline: TextGenerationPipeline;
     };
 
 class WebGpuFallbackRequiredError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "WebGpuFallbackRequiredError";
+  }
+}
+
+class TranslationOutputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TranslationOutputError";
   }
 }
 
@@ -466,13 +481,13 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
       );
     } catch (error) {
       if (
-        activeEngine.kind !== "m2m100" ||
+        error instanceof TranslationOutputError ||
+        activeEngine.kind === "small100" ||
         status.device !== "webgpu" ||
         request.devicePreference === "wasm"
       ) {
         throw error;
       }
-      await discardFailedM2m100WebGpuWeights();
       throw new WebGpuFallbackRequiredError(friendlyError(error));
     }
     if (!translation) throw new Error("모델이 번역 결과를 만들지 못했습니다.");
@@ -535,6 +550,37 @@ async function translateChunk(
   sourceLanguage: string
 ): Promise<string> {
   const maxNewTokens = Math.min(512, Math.max(80, Math.ceil(text.length * 1.8)));
+  if (activeEngine.kind === "translategemma") {
+    const messages = [{
+      role: "user",
+      content: [{
+        type: "text",
+        source_lang_code: sourceLanguage,
+        target_lang_code: "ko",
+        text
+      }]
+    }];
+    const output = await activeEngine.pipeline(messages as never, {
+      max_new_tokens: maxNewTokens,
+      do_sample: false
+    } as never) as unknown as Array<{
+      generated_text?: string | Array<{ role?: string; content?: string }>;
+    }>;
+    const generated = output[0]?.generated_text;
+    const result =
+      typeof generated === "string"
+        ? generated.trim()
+        : generated
+          ?.findLast((message) => message.role === "assistant")
+          ?.content?.trim() ?? "";
+    if (!result) {
+      throw new TranslationOutputError(
+        "TranslateGemma가 빈 번역 결과를 만들었습니다."
+      );
+    }
+    return result;
+  }
+
   if (activeEngine.kind === "m2m100") {
     const output = await activeEngine.pipeline(text, {
       src_lang: sourceLanguage,
@@ -614,7 +660,11 @@ async function getEngine(
   loadedRuntimeDevice = runtimeDevice;
   loadedModelPreference = modelPreference;
   const modelId =
-    modelPreference === "small100" ? SMALL100_MODEL_ID : M2M100_MODEL_ID;
+    modelPreference === "small100"
+      ? SMALL100_MODEL_ID
+      : modelPreference === "translategemma"
+        ? TRANSLATEGEMMA_MODEL_ID
+        : M2M100_MODEL_ID;
   status = {
     state: "loading",
     modelId,
@@ -660,6 +710,40 @@ async function loadRequestedEngine(
     );
   }
 
+  if (modelPreference === "translategemma") {
+    const requestedDevice =
+      runtimeDeviceOverride ?? chooseDevice(devicePreference);
+    if (requestedDevice === "webgpu") {
+      return loadTranslateGemma(
+        fallbackFromDevice,
+        deviceFallbackReason
+      );
+    }
+
+    const fallbackReason =
+      deviceFallbackReason ??
+      "TranslateGemma 4B는 WebGPU가 필요해 M2M100 WASM을 사용합니다.";
+    status = {
+      state: "loading",
+      modelId: M2M100_MODEL_ID,
+      device: "wasm",
+      progress: 0,
+      file: "M2M100 WASM 호환 모델로 전환 중",
+      fallbackFromModelId: TRANSLATEGEMMA_MODEL_ID,
+      fallbackReason,
+      fallbackFromDevice,
+      deviceFallbackReason
+    };
+    broadcastStatus();
+    return loadM2m100(
+      "wasm",
+      TRANSLATEGEMMA_MODEL_ID,
+      fallbackReason,
+      fallbackFromDevice,
+      deviceFallbackReason
+    );
+  }
+
   try {
     return await loadSmall100();
   } catch (error) {
@@ -684,6 +768,56 @@ async function loadRequestedEngine(
       fallbackFromDevice,
       deviceFallbackReason
     );
+  }
+}
+
+async function loadTranslateGemma(
+  fallbackFromDevice?: RuntimeDevice,
+  deviceFallbackReason?: string
+): Promise<TranslationEngine> {
+  const options: Record<string, unknown> = {
+    revision: TRANSLATEGEMMA_REVISION,
+    device: "webgpu",
+    dtype: "q4",
+    progress_callback: createProgressCallback(
+      TRANSLATEGEMMA_MODEL_ID,
+      "webgpu",
+      undefined,
+      undefined,
+      fallbackFromDevice,
+      deviceFallbackReason
+    )
+  };
+
+  try {
+    const loaded = await pipeline(
+      "text-generation",
+      TRANSLATEGEMMA_MODEL_ID,
+      options
+    );
+    status = {
+      state: "ready",
+      modelId: TRANSLATEGEMMA_MODEL_ID,
+      device: "webgpu",
+      progress: 1,
+      fallbackFromDevice,
+      deviceFallbackReason
+    };
+    broadcastStatus();
+    return { kind: "translategemma", pipeline: loaded };
+  } catch (error) {
+    const webGpuError = friendlyError(error);
+    await discardFailedWebGpuWeights();
+    status = {
+      state: "error",
+      modelId: TRANSLATEGEMMA_MODEL_ID,
+      device: "webgpu",
+      error: webGpuError,
+      fallbackFromDevice: "webgpu",
+      deviceFallbackReason: webGpuError
+    };
+    broadcastStatus();
+    throw new WebGpuFallbackRequiredError(webGpuError);
   }
 }
 
@@ -741,6 +875,9 @@ async function loadM2m100(
     revision: M2M100_REVISION,
     device,
     dtype: device === "webgpu" ? "q4f16" : "q8",
+    // ORT 1.26's extended QDQ optimizer rejects this older, reviewed M2M100
+    // conversion even though the graph itself remains executable.
+    session_options: { graphOptimizationLevel: "basic" },
     progress_callback: createProgressCallback(
       M2M100_MODEL_ID,
       device,
@@ -768,7 +905,7 @@ async function loadM2m100(
   } catch (error) {
     if (device === "webgpu") {
       const webGpuError = friendlyError(error);
-      await discardFailedM2m100WebGpuWeights();
+      await discardFailedWebGpuWeights();
       status = {
         state: "error",
         modelId: M2M100_MODEL_ID,
@@ -799,13 +936,16 @@ async function loadM2m100(
   }
 }
 
-async function discardFailedM2m100WebGpuWeights(): Promise<void> {
+async function discardFailedWebGpuWeights(): Promise<void> {
   try {
     const cache = await caches.open("transformers-cache");
     const requests = await cache.keys();
     await Promise.all(
       requests
-        .filter((request) => isM2m100WebGpuWeightUrl(request.url))
+        .filter((request) =>
+          isM2m100WebGpuWeightUrl(request.url) ||
+          isTranslateGemmaWebGpuWeightUrl(request.url)
+        )
         .map((request) => cache.delete(request))
     );
   } catch {
@@ -868,7 +1008,7 @@ async function resetEngine(): Promise<void> {
     if (engine?.kind === "small100") {
       await engine.model.dispose();
     } else if (
-      engine?.kind === "m2m100" &&
+      engine &&
       "dispose" in engine.pipeline &&
       typeof engine.pipeline.dispose === "function"
     ) {
