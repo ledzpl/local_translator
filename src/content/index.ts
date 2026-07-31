@@ -42,7 +42,12 @@ if (!window.__ongeulContentLoaded) {
 function initialize(): void {
   const view = new OverlayView();
   const pageTranslator = new InPageTranslator();
-  const youtube = new YouTubeCaptionTranslator(view);
+  const youtube = new YouTubeCaptionTranslator(view, () => {
+    // A YouTube SPA navigation discards the translated content but not the
+    // toolbar/speech timers. Tear the page translator down if it is still
+    // showing anything so no orphaned toolbar or TTS polling survives.
+    if (pageTranslator.getStatus().state !== "idle") pageTranslator.restore();
+  });
 
   chrome.runtime.onMessage.addListener(
     (message: ContentMessage | { type: "PING" }, _sender, sendResponse): boolean | undefined => {
@@ -120,7 +125,11 @@ class OverlayView {
     body.replaceChildren(
       createElement("div", "badge", "LOCAL AI"),
       createElement("div", "source", sourceText),
-      createElement("div", "loading", "브라우저에서 번역 모델을 준비하고 있어요…")
+      createElement("div", "loading", "브라우저에서 번역 모델을 준비하고 있어요…"),
+      // Keep the close button in the loading state too, so the card does not
+      // grow (and shift) when the result adds it. It also lets users dismiss
+      // a slow first-run model download.
+      this.createCloseButton()
     );
     this.positionSelectionCard();
   }
@@ -133,13 +142,17 @@ class OverlayView {
     if (requestId !== this.latestSelectionRequestId) return;
     const body = this.ensureSelectionCard();
     const result = response.ok ? response.translation : response.error;
+    const closeButton = this.createCloseButton();
     body.replaceChildren(
       createElement("div", "badge", response.ok ? "한국어 번역" : "번역 오류"),
       createElement("div", "source", sourceText),
       createElement("div", response.ok ? "translation" : "error", result),
-      this.createCloseButton()
+      closeButton
     );
     this.positionSelectionCard();
+    // Move focus onto the result so keyboard and screen-reader users land on it
+    // and can dismiss it, instead of the focus staying behind in page content.
+    closeButton.focus();
 
     if (this.hideTimer) window.clearTimeout(this.hideTimer);
     this.hideTimer = window.setTimeout(() => this.selectionHost?.remove(), 18_000);
@@ -152,11 +165,19 @@ class OverlayView {
     bubble.textContent = text;
     bubble.style.fontSize = `${settings.subtitleSize}px`;
     host.style.bottom = settings.showOriginalCaptions ? "19%" : "11%";
-    host.hidden = !settings.youtubeEnabled || !text;
+    // The host carries an inline `display: flex`, which outranks the UA
+    // `[hidden] { display: none }` rule. Toggle `display` directly so hiding
+    // actually removes the bubble instead of leaving it stuck over the video.
+    const visible = settings.youtubeEnabled && Boolean(text);
+    host.hidden = !visible;
+    host.style.display = visible ? "block" : "none";
   }
 
   hideSubtitle(): void {
-    if (this.subtitleHost) this.subtitleHost.hidden = true;
+    if (this.subtitleHost) {
+      this.subtitleHost.hidden = true;
+      this.subtitleHost.style.display = "none";
+    }
   }
 
   private ensureSelectionCard(): ShadowRoot {
@@ -168,6 +189,12 @@ class OverlayView {
     host.style.position = "fixed";
     host.style.zIndex = "2147483647";
     host.style.maxWidth = "min(420px, calc(100vw - 28px))";
+    // Announce the overlay to assistive tech: dynamically inserted content is
+    // otherwise silent and never receives focus, so screen-reader users have
+    // no way to know the translation appeared.
+    host.setAttribute("role", "dialog");
+    host.setAttribute("aria-live", "assertive");
+    host.setAttribute("aria-label", "온글 번역 결과");
     const shadow = host.attachShadow({ mode: "open" });
     shadow.append(createStyle(SELECTION_STYLES));
     document.documentElement.append(host);
@@ -180,14 +207,15 @@ class OverlayView {
     const player = document.querySelector<HTMLElement>(".html5-video-player") ?? document.body;
     const host = document.createElement("div");
     host.dataset.ongeulOverlay = "subtitle";
+    // Use block + centered text (not flex) so the inline `.subtitle` keeps its
+    // `box-decoration-break: clone` pill effect when the caption wraps.
     Object.assign(host.style, {
       position: "absolute",
       left: "5%",
       right: "5%",
       bottom: "19%",
       zIndex: "60",
-      display: "flex",
-      justifyContent: "center",
+      display: "block",
       pointerEvents: "none",
       textAlign: "center"
     });
@@ -461,7 +489,14 @@ class InPageTranslator {
   private pollSpeechStatus(request: number): void {
     if (this.speechPollTimer) window.clearTimeout(this.speechPollTimer);
     const poll = async (): Promise<void> => {
-      if (request !== this.speechRequest || !this.speechButton?.isConnected) return;
+      if (request !== this.speechRequest) return;
+      // If the button was detached (e.g. its block was removed or the page
+      // navigated), drop the references so the detached shadow subtree can be
+      // collected instead of lingering on this instance.
+      if (!this.speechButton?.isConnected) {
+        if (request === this.speechRequest) this.resetSpeechButton();
+        return;
+      }
       try {
         const status = await chrome.runtime.sendMessage({
           target: "background",
@@ -530,6 +565,10 @@ class InPageTranslator {
   }
 
   private resetSpeechButton(): void {
+    if (this.speechPollTimer !== null) {
+      window.clearTimeout(this.speechPollTimer);
+      this.speechPollTimer = null;
+    }
     if (this.speechButton?.isConnected) {
       updatePageSpeechButton(this.speechButton, {
         state: "idle",
@@ -552,6 +591,10 @@ class InPageTranslator {
     if (this.toolbarHost?.isConnected) return;
     const host = document.createElement("div");
     host.dataset.ongeulOverlay = "page-toolbar";
+    // The host only positions the card. All visual styling (padding, width,
+    // background, border) lives on an inner `.card` wrapper so host-level CSS
+    // that some pages strip or override on bare elements cannot collapse the
+    // padding and clip the toolbar contents.
     Object.assign(host.style, {
       position: "fixed",
       top: "18px",
@@ -559,6 +602,7 @@ class InPageTranslator {
       zIndex: "2147483647"
     });
     const shadow = host.attachShadow({ mode: "open" });
+    const card = createElement("div", "card", "");
     const status = createElement("div", "status", "");
     const progress = document.createElement("progress");
     progress.className = "progress";
@@ -569,14 +613,15 @@ class InPageTranslator {
     const restore = createElement("button", "restore", "번역 지우기");
     restore.type = "button";
     restore.addEventListener("click", () => this.restore());
-    shadow.append(
-      createStyle(PAGE_TOOLBAR_STYLES),
+    const actions = createElement("div", "actions", "");
+    actions.append(stop, restore);
+    card.append(
       createElement("div", "brand", "온글 · 페이지 번역"),
       status,
       progress,
-      createElement("div", "actions", "")
+      actions
     );
-    shadow.querySelector(".actions")?.append(stop, restore);
+    shadow.append(createStyle(PAGE_TOOLBAR_STYLES), card);
     document.documentElement.append(host);
     this.toolbarHost = host;
   }
@@ -623,6 +668,8 @@ class YouTubeCaptionTranslator {
   private observer: MutationObserver | null = null;
   private debounceTimer: number | null = null;
   private retryTimer: number | null = null;
+  private navigationTimer: number | null = null;
+  private captionButtonTimer: number | null = null;
   private lastRequestedKey = "";
   private currentCaption = "";
   private pendingCaption = "";
@@ -632,7 +679,10 @@ class YouTubeCaptionTranslator {
   private readonly cache = new LruCache<string>(180);
   private readonly retryAttempts = new Map<string, number>();
 
-  constructor(private readonly view: OverlayView) {}
+  constructor(
+    private readonly view: OverlayView,
+    private readonly onNavigate?: () => void
+  ) {}
 
   start(): void {
     void this.loadSettings().then(() => {
@@ -666,6 +716,10 @@ class YouTubeCaptionTranslator {
       this.applyOriginalCaptionVisibility();
       if (!hasPrivacyConsent(this.settings) || !this.settings.youtubeEnabled) {
         this.settingsGeneration += 1;
+        // Stop observing and polling while disabled so a disabled feature does
+        // not keep firing MutationObserver callbacks on every YouTube DOM
+        // change. observe()/scan() re-arm the observer when re-enabled.
+        this.suspend();
         this.view.hideSubtitle();
         return;
       }
@@ -674,7 +728,7 @@ class YouTubeCaptionTranslator {
       this.scan();
     });
 
-    window.setInterval(() => {
+    this.navigationTimer = window.setInterval(() => {
       if (this.navigationUrl === location.href) return;
       this.navigationUrl = location.href;
       this.settingsGeneration += 1;
@@ -685,9 +739,29 @@ class YouTubeCaptionTranslator {
       this.clearRetry();
       this.view.hideSubtitle();
       this.applyOriginalCaptionVisibility(false);
+      // A YouTube SPA navigation replaces the watch content but leaves the
+      // page-translation toolbar (attached to documentElement) orphaned. Let
+      // the owner tear it down before we rescan captions for the new video.
+      this.onNavigate?.();
       this.maybeEnableCaptions();
       this.scheduleScan();
     }, 900);
+  }
+
+  private suspend(): void {
+    if (this.observer) {
+      this.observer.disconnect();
+      this.observer = null;
+    }
+    if (this.debounceTimer !== null) {
+      window.clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
+    if (this.captionButtonTimer !== null) {
+      window.clearTimeout(this.captionButtonTimer);
+      this.captionButtonTimer = null;
+    }
+    this.clearRetry();
   }
 
   private async loadSettings(): Promise<void> {
@@ -878,7 +952,17 @@ class YouTubeCaptionTranslator {
     ) {
       return;
     }
-    window.setTimeout(() => {
+    // Only one pending auto-enable at a time. Rapid navigations/setting changes
+    // would otherwise stack timers that fire on the wrong page and toggle
+    // captions unexpectedly.
+    if (this.captionButtonTimer !== null) {
+      window.clearTimeout(this.captionButtonTimer);
+    }
+    this.captionButtonTimer = window.setTimeout(() => {
+      this.captionButtonTimer = null;
+      if (!hasPrivacyConsent(this.settings) || !this.settings.youtubeEnabled) {
+        return;
+      }
       const button = document.querySelector<HTMLButtonElement>(".ytp-subtitles-button");
       if (button && button.getAttribute("aria-pressed") === "false") button.click();
     }, 1200);
@@ -1013,6 +1097,9 @@ const SELECTION_STYLES = `
     white-space: nowrap;
   }
   .translation, .error, .loading {
+    /* Reserve ~2 lines so the card keeps a stable height between the loading
+       message and a multi-line translation instead of jumping on arrival. */
+    min-height: 50px;
     margin-top: 8px;
     color: #fff;
     font: 700 16px/1.55 system-ui;
@@ -1104,7 +1191,9 @@ const PAGE_TRANSLATION_STYLES = `
 `;
 
 const PAGE_TOOLBAR_STYLES = `
-  :host {
+  :host { all: initial; }
+  .card {
+    box-sizing: border-box;
     display: block;
     width: 250px;
     padding: 14px;
@@ -1114,6 +1203,7 @@ const PAGE_TOOLBAR_STYLES = `
     color: #f5f7f2;
     box-shadow: 0 18px 55px rgba(0, 0, 0, .32);
     font-family: Pretendard, Inter, system-ui, -apple-system, sans-serif;
+    line-height: 1.4;
     backdrop-filter: blur(16px);
   }
   * { box-sizing: border-box; }

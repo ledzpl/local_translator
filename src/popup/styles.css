@@ -25,6 +25,31 @@ input {
   font: inherit;
 }
 
+/* Visible keyboard focus. Several controls set outline:0 or hide the native
+   input, so a shared focus-visible ring keeps keyboard navigation usable. */
+:focus-visible {
+  outline: 2px solid #ddff44;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid #ddff44;
+  outline-offset: 2px;
+}
+
+.switch input:focus-visible + span {
+  outline: 2px solid #ddff44;
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .primary-button {
+    transition: none;
+  }
+}
+
 #app {
   padding: 22px 20px 18px;
 }
@@ -195,7 +220,7 @@ footer a {
 
 .page-card > p {
   margin: 10px 0 0;
-  color: #858c87;
+  color: #a7ada7;
   font-size: 10px;
   line-height: 1.45;
 }
@@ -279,8 +304,13 @@ select {
   font-weight: 700;
 }
 
+select:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
 #character-count {
-  color: #696f6b;
+  color: #a7ada7;
   font-size: 10px;
 }
 
@@ -351,6 +381,9 @@ select {
 
 .result-text {
   margin-top: 10px;
+  /* Reserve room up front so the card does not visibly grow when the loading
+     skeleton is replaced by a multi-line translation. */
+  min-height: 74px;
   color: #fff;
   font-size: 16px;
   font-weight: 700;
@@ -363,9 +396,41 @@ select {
   font-size: 13px;
 }
 
+.result-text.loading-lines {
+  /* Hide the loading sentence visually (skeleton bars replace it) while
+     leaving it in the accessibility tree via the card's aria-live region.
+     Skeleton lines are painted as a repeating background so they fill the
+     reserved min-height without any per-line markup. */
+  font-size: 0;
+  background-image:
+    linear-gradient(#242a27 0 0),
+    linear-gradient(#242a27 0 0),
+    linear-gradient(#242a27 0 0);
+  background-repeat: no-repeat;
+  background-size: 100% 15px, 100% 15px, 62% 15px;
+  background-position: 0 4px, 0 30px, 0 56px;
+  animation: loading-shimmer 1.2s ease-in-out infinite;
+}
+
+@keyframes loading-shimmer {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: .55;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .result-text.loading-lines,
+  .progress-bar.indeterminate {
+    animation: none;
+  }
+}
+
 .result-meta {
   margin-top: 9px;
-  color: #737a75;
+  color: #a7ada7;
   font-size: 9px;
 }
 
@@ -427,7 +492,7 @@ select {
 
 .engine-copy span {
   overflow: hidden;
-  color: #7d847f;
+  color: #a7ada7;
   font-size: 9px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -529,7 +594,7 @@ select {
 }
 
 .setting-row span {
-  color: #747b76;
+  color: #a7ada7;
   font-size: 9px;
 }
 
@@ -588,7 +653,7 @@ input[type="range"] {
 .advanced {
   margin-top: 10px;
   padding: 12px 14px;
-  color: #8c938e;
+  color: #a7ada7;
   font-size: 10px;
 }
 
@@ -607,7 +672,7 @@ input[type="range"] {
 
 .advanced p {
   margin: 9px 0 0;
-  color: #626863;
+  color: #9ba19b;
   line-height: 1.4;
 }
 
@@ -615,7 +680,7 @@ footer {
   display: grid;
   gap: 7px;
   margin-top: 13px;
-  color: #626864;
+  color: #a7ada7;
   font-size: 9px;
   text-align: center;
 }

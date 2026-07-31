@@ -57,7 +57,7 @@ app.innerHTML = `
     <button id="privacy-consent-button" class="primary-button" type="button" disabled>
       <span>동의하고 시작</span><span aria-hidden="true">→</span>
     </button>
-    <p id="privacy-consent-error" class="consent-error" hidden></p>
+    <p id="privacy-consent-error" class="consent-error" role="alert" hidden></p>
   </section>
 
   <div id="product-ui" hidden>
@@ -77,7 +77,7 @@ app.innerHTML = `
         <h2>페이지 안에서 번역</h2>
       </div>
     </div>
-    <p id="page-status">본문 원문 아래에 한국어를 순서대로 표시합니다.</p>
+    <p id="page-status" role="status" aria-live="polite">본문 원문 아래에 한국어를 순서대로 표시합니다.</p>
     <div class="page-actions">
       <button id="page-translate-button" type="button">페이지 안에 한국어 표시</button>
       <button id="page-restore-button" type="button" hidden>번역 지우기</button>
@@ -103,28 +103,36 @@ app.innerHTML = `
       <span>한국어</span>
       <div class="result-actions">
         <button id="speak-button" type="button">▶ 듣기</button>
-        <button id="copy-button" type="button">복사</button>
+        <button id="copy-button" type="button" disabled>복사</button>
       </div>
     </div>
-    <div id="result-text" class="result-text"></div>
+    <div id="result-text" class="result-text" role="status" aria-live="polite"></div>
     <div id="result-meta" class="result-meta"></div>
   </section>
 
   <section class="engine-card">
     <div class="engine-row">
       <div class="engine-icon">AI</div>
-      <div class="engine-copy">
+      <div class="engine-copy" role="status" aria-live="polite">
         <strong id="engine-title">로컬 모델 대기 중</strong>
         <span id="engine-detail">TranslateGemma 4B 약 3.1GB · WebGPU 우선</span>
       </div>
       <span id="engine-state" class="engine-state idle">대기</span>
     </div>
-    <div id="progress-track" class="progress-track" hidden>
+    <div
+      id="progress-track"
+      class="progress-track"
+      role="progressbar"
+      aria-label="모델 준비 진행률"
+      aria-valuemin="0"
+      aria-valuemax="100"
+      hidden
+    >
       <div id="progress-bar" class="progress-bar"></div>
     </div>
     <div class="engine-row speech-row">
       <div class="engine-icon">VO</div>
-      <div class="engine-copy">
+      <div class="engine-copy" role="status" aria-live="polite">
         <strong id="tts-title">한국어 음성 AI 대기 중</strong>
         <span id="tts-detail">첫 듣기 때 약 400MB 모델을 내려받습니다.</span>
       </div>
@@ -140,7 +148,7 @@ app.innerHTML = `
         <h2>자막 번역</h2>
       </div>
       <label class="switch">
-        <input id="youtube-enabled" type="checkbox" />
+        <input id="youtube-enabled" type="checkbox" aria-label="YouTube 자막 번역" />
         <span></span>
       </label>
     </div>
@@ -435,6 +443,7 @@ async function translate(): Promise<void> {
   setBusy(true);
   currentTranslation = "";
   elements.speak.disabled = true;
+  elements.copy.disabled = true;
   elements.resultCard.hidden = false;
   elements.resultText.className = "result-text loading-lines";
   elements.resultText.textContent = "브라우저에서 번역하고 있어요…";
@@ -459,6 +468,7 @@ async function translate(): Promise<void> {
     if (response.ok) {
       currentTranslation = response.translation;
       elements.speak.disabled = false;
+      elements.copy.disabled = false;
       elements.resultText.textContent = response.translation;
       const device = response.device === "webgpu"
         ? "WebGPU"
@@ -638,10 +648,15 @@ function normalizeEngineStatus(value: unknown): EngineStatus {
 }
 
 async function copyResult(): Promise<void> {
-  const text = elements.resultText.textContent ?? "";
+  // Copy the actual translation, never an error message shown in #result-text.
+  const text = currentTranslation;
   if (!text) return;
-  await navigator.clipboard.writeText(text);
-  elements.copy.textContent = "복사됨";
+  try {
+    await navigator.clipboard.writeText(text);
+    elements.copy.textContent = "복사됨";
+  } catch {
+    elements.copy.textContent = "복사 실패";
+  }
   window.setTimeout(() => {
     elements.copy.textContent = "복사";
   }, 1200);
@@ -773,8 +788,13 @@ function updateEngineStatus(status: EngineStatus): void {
   const progress = status.progress ?? 0;
   const isIndeterminate = status.state === "loading" && progress <= 0;
   elements.progressBar.classList.toggle("indeterminate", isIndeterminate);
-  elements.progressBar.style.width =
-    isIndeterminate ? "35%" : `${Math.round(progress * 100)}%`;
+  const percent = Math.round(progress * 100);
+  elements.progressBar.style.width = isIndeterminate ? "35%" : `${percent}%`;
+  if (isIndeterminate) {
+    elements.progressTrack.removeAttribute("aria-valuenow");
+  } else {
+    elements.progressTrack.setAttribute("aria-valuenow", String(percent));
+  }
   const modelLabel = modelLabelFromId(status.modelId);
 
   if (status.state === "loading") {
