@@ -129,7 +129,7 @@ class OverlayView {
       // Keep the close button in the loading state too, so the card does not
       // grow (and shift) when the result adds it. It also lets users dismiss
       // a slow first-run model download.
-      this.createCloseButton()
+      this.createCloseButton(requestId)
     );
     this.positionSelectionCard();
   }
@@ -142,7 +142,7 @@ class OverlayView {
     if (requestId !== this.latestSelectionRequestId) return;
     const body = this.ensureSelectionCard();
     const result = response.ok ? response.translation : response.error;
-    const closeButton = this.createCloseButton();
+    const closeButton = this.createCloseButton(requestId);
     body.replaceChildren(
       createElement("div", "badge", response.ok ? "한국어 번역" : "번역 오류"),
       createElement("div", "source", sourceText),
@@ -155,7 +155,10 @@ class OverlayView {
     closeButton.focus();
 
     if (this.hideTimer) window.clearTimeout(this.hideTimer);
-    this.hideTimer = window.setTimeout(() => this.selectionHost?.remove(), 18_000);
+    this.hideTimer = window.setTimeout(
+      () => this.dismissSelection(requestId),
+      18_000
+    );
   }
 
   showSubtitle(text: string, settings: ExtensionSettings): void {
@@ -189,6 +192,8 @@ class OverlayView {
     host.style.position = "fixed";
     host.style.zIndex = "2147483647";
     host.style.maxWidth = "min(420px, calc(100vw - 28px))";
+    host.style.overflowY = "auto";
+    host.style.overscrollBehavior = "contain";
     // Announce the overlay to assistive tech: dynamically inserted content is
     // otherwise silent and never receives focus, so screen-reader users have
     // no way to know the translation appeared.
@@ -239,18 +244,36 @@ class OverlayView {
     const top = rect && rect.bottom + 12 < window.innerHeight - 170
       ? rect.bottom + 12
       : 18;
+    const safeTop = Math.max(14, top);
     this.selectionHost.style.width = `${width}px`;
     this.selectionHost.style.left = `${left}px`;
-    this.selectionHost.style.top = `${Math.max(14, top)}px`;
+    this.selectionHost.style.top = `${safeTop}px`;
+    this.selectionHost.style.maxHeight =
+      `${Math.max(80, window.innerHeight - safeTop - 14)}px`;
   }
 
-  private createCloseButton(): HTMLButtonElement {
+  private createCloseButton(requestId: string): HTMLButtonElement {
     const button = document.createElement("button");
     button.className = "close";
     button.type = "button";
     button.textContent = "닫기";
-    button.addEventListener("click", () => this.selectionHost?.remove(), { once: true });
+    button.addEventListener(
+      "click",
+      () => this.dismissSelection(requestId),
+      { once: true }
+    );
     return button;
+  }
+
+  private dismissSelection(requestId: string): void {
+    if (this.latestSelectionRequestId !== requestId) return;
+    this.latestSelectionRequestId = null;
+    if (this.hideTimer !== null) {
+      window.clearTimeout(this.hideTimer);
+      this.hideTimer = null;
+    }
+    this.selectionHost?.remove();
+    this.selectionHost = null;
   }
 }
 
@@ -1068,6 +1091,7 @@ const SELECTION_STYLES = `
   :host { all: initial; }
   * { box-sizing: border-box; }
   :host {
+    box-sizing: border-box;
     display: block;
     color: #f8f7f2;
     background: rgba(16, 18, 18, 0.97);
@@ -1103,12 +1127,16 @@ const SELECTION_STYLES = `
     margin-top: 8px;
     color: #fff;
     font: 700 16px/1.55 system-ui;
+    overflow-wrap: anywhere;
     white-space: pre-wrap;
   }
   .error { color: #ff958c; }
   .loading { color: #ddff44; }
   .close {
-    margin-top: 12px;
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    z-index: 1;
     border: 0;
     border-radius: 999px;
     background: #2d302f;

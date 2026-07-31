@@ -824,6 +824,104 @@ try {
   }
   console.log("SELECTION_LATEST_REQUEST_GUARD=PASS");
 
+  await popup.evaluate(async (pageUrl) => {
+    const tabs = await chrome.tabs.query({});
+    const tab = tabs.find((candidate) => candidate.url === pageUrl);
+    if (!tab?.id) throw new Error("선택 번역 닫기 테스트 탭을 찾지 못했습니다.");
+    await chrome.tabs.sendMessage(tab.id, {
+      type: "TRANSLATION_STARTED",
+      requestId: "selection-dismissed",
+      sourceText: "Dismiss this loading result"
+    });
+  }, webPage.url());
+  const dismissedWhileLoading = await webPage.evaluate(() => {
+    const host = document.querySelector('[data-ongeul-overlay="selection"]');
+    const close = host?.shadowRoot?.querySelector(".close");
+    if (!(close instanceof HTMLButtonElement)) return false;
+    close.click();
+    return !host?.isConnected;
+  });
+  if (!dismissedWhileLoading) {
+    throw new Error("선택 번역 로딩 오버레이를 닫지 못했습니다.");
+  }
+  await popup.evaluate(async (pageUrl) => {
+    const tabs = await chrome.tabs.query({});
+    const tab = tabs.find((candidate) => candidate.url === pageUrl);
+    if (!tab?.id) throw new Error("선택 번역 닫기 테스트 탭을 찾지 못했습니다.");
+    await chrome.tabs.sendMessage(tab.id, {
+      type: "SHOW_TRANSLATION",
+      requestId: "selection-dismissed",
+      sourceText: "Dismiss this loading result",
+      response: {
+        ok: true,
+        requestId: "selection-dismissed",
+        translation: "닫힌 뒤 나타나면 안 되는 결과",
+        sourceLanguage: "en",
+        device: "wasm",
+        elapsedMs: 1
+      }
+    });
+  }, webPage.url());
+  if (await webPage.locator('[data-ongeul-overlay="selection"]').count()) {
+    throw new Error("닫은 선택 번역 오버레이가 완료 응답 뒤 다시 나타났습니다.");
+  }
+  console.log("SELECTION_DISMISS_GUARD=PASS");
+
+  await popup.evaluate(async (pageUrl) => {
+    const tabs = await chrome.tabs.query({});
+    const tab = tabs.find((candidate) => candidate.url === pageUrl);
+    if (!tab?.id) throw new Error("긴 선택 번역 테스트 탭을 찾지 못했습니다.");
+    await chrome.tabs.sendMessage(tab.id, {
+      type: "TRANSLATION_STARTED",
+      requestId: "selection-long-result",
+      sourceText: "Long selection result"
+    });
+    await chrome.tabs.sendMessage(tab.id, {
+      type: "SHOW_TRANSLATION",
+      requestId: "selection-long-result",
+      sourceText: "Long selection result",
+      response: {
+        ok: true,
+        requestId: "selection-long-result",
+        translation: "아주 긴 선택 번역 결과입니다. ".repeat(420),
+        sourceLanguage: "en",
+        device: "wasm",
+        elapsedMs: 1
+      }
+    });
+  }, webPage.url());
+  const longSelectionLayout = await webPage.evaluate(() => {
+    const host = document.querySelector('[data-ongeul-overlay="selection"]');
+    const close = host?.shadowRoot?.querySelector(".close");
+    if (!(host instanceof HTMLElement) || !(close instanceof HTMLElement)) {
+      return null;
+    }
+    const hostRect = host.getBoundingClientRect();
+    const closeRect = close.getBoundingClientRect();
+    const result = {
+      scrollable: host.scrollHeight > host.clientHeight,
+      bounded:
+        hostRect.top >= 0 &&
+        hostRect.bottom <= window.innerHeight,
+      closeVisible:
+        closeRect.top >= hostRect.top &&
+        closeRect.bottom <= Math.min(hostRect.bottom, window.innerHeight)
+    };
+    close.click();
+    return result;
+  });
+  if (
+    !longSelectionLayout?.scrollable ||
+    !longSelectionLayout.bounded ||
+    !longSelectionLayout.closeVisible
+  ) {
+    throw new Error(
+      `긴 선택 번역 오버레이가 화면 안에서 닫히지 않습니다: ` +
+      JSON.stringify(longSelectionLayout)
+    );
+  }
+  console.log("SELECTION_LONG_RESULT_LAYOUT=PASS");
+
   if (withModel) {
     const preTranslationHost = webPage.locator(
       "#pre-copy > [data-ongeul-page-translation]"

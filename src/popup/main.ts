@@ -26,6 +26,7 @@ import {
   CURRENT_PRIVACY_CONSENT_VERSION,
   hasPrivacyConsent
 } from "../shared/privacy";
+import { shouldApplyInitialSelection } from "../shared/popup-state";
 import { RevisionedCommitter } from "../shared/revisioned-committer";
 import { isSpeechStatusFor } from "../shared/tts";
 
@@ -236,6 +237,7 @@ let currentTranslation = "";
 let currentTtsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
 let currentSpeechId: string | null = null;
 let translationInFlight = false;
+let sourceEditRevision = 0;
 const subtitleSizeCommitter = new RevisionedCommitter(saveSettingsSafely);
 
 for (const language of LANGUAGE_OPTIONS) {
@@ -280,6 +282,7 @@ async function initialize(): Promise<void> {
 }
 
 async function loadRuntimeState(): Promise<void> {
+  const sourceRevisionAtRequest = sourceEditRevision;
   const [selection, status, pageStatus, ttsStatus] = await Promise.all([
     chrome.runtime.sendMessage({
       target: "background",
@@ -299,8 +302,14 @@ async function loadRuntimeState(): Promise<void> {
     }).catch(() => ({ state: "idle", modelId: TTS_MODEL_ID }))
   ]);
 
-  if (selection?.text) {
-    elements.source.value = selection.text;
+  const initialSelectionText = selection?.text ?? "";
+  if (shouldApplyInitialSelection({
+    requestRevision: sourceRevisionAtRequest,
+    currentRevision: sourceEditRevision,
+    currentValue: elements.source.value,
+    selectionText: initialSelectionText
+  })) {
+    elements.source.value = initialSelectionText;
     updateCharacterCount();
   }
   updateEngineStatus(normalizeEngineStatus(status));
@@ -350,7 +359,10 @@ function updatePrivacyGate(settings: ExtensionSettings): void {
   elements.productUi.hidden = !accepted;
 }
 
-elements.source.addEventListener("input", updateCharacterCount);
+elements.source.addEventListener("input", () => {
+  sourceEditRevision += 1;
+  updateCharacterCount();
+});
 elements.translate.addEventListener("click", () => void translate());
 elements.source.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key === "Enter") void translate();

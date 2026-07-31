@@ -45,6 +45,7 @@ import {
   friendlyError,
   hasUsableTranslationOutput
 } from "../shared/text";
+import { shouldRetryTranslationOnWasm } from "../shared/translation-recovery";
 import {
   type ActiveSpeechEngine,
   canControlSpeech,
@@ -546,13 +547,11 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
         request.sourceLanguage
       );
     } catch (error) {
-      if (
-        (error instanceof TranslationOutputError &&
-          activeEngine.kind !== "m2m100") ||
-        activeEngine.kind === "small100" ||
-        status.device !== "webgpu" ||
-        request.devicePreference === "wasm"
-      ) {
+      if (!shouldRetryTranslationOnWasm({
+        engineKind: activeEngine.kind,
+        runtimeDevice: status.device,
+        devicePreference: request.devicePreference
+      })) {
         throw error;
       }
       throw new WebGpuFallbackRequiredError(friendlyError(error));
