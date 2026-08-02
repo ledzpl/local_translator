@@ -18,7 +18,7 @@ try {
   if (!extensionId) throw new Error("확장 프로그램 ID를 확인하지 못했습니다.");
 
   const popup = await context.newPage();
-  await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+  await popup.goto(`chrome-extension://${extensionId}/sidepanel.html`);
   await popup.addStyleTag({
     content: `
       html, body {
@@ -92,6 +92,24 @@ try {
   });
   await popup.screenshot({
     path: join(outputDir, "screenshot-translator-1280x800.png")
+  });
+
+  await popup.addStyleTag({
+    content: "#app { width: 560px !important; zoom: .82; }"
+  });
+  await popup.locator("#youtube-translation-mode").selectOption("context");
+  await popup.locator("details.glossary").evaluate((element) => {
+    element.setAttribute("open", "");
+  });
+  await popup.locator("#glossary-source").fill("WebGPU");
+  await popup.locator("#glossary-target").fill("WebGPU");
+  await popup.locator("#glossary-preserve").check();
+  await popup.locator("#glossary-add").click();
+  await popup.locator(".glossary-entry").waitFor();
+  await popup.locator(".model-center").scrollIntoViewIfNeeded();
+  await popup.evaluate(() => window.scrollBy(0, -18));
+  await popup.screenshot({
+    path: join(outputDir, "screenshot-workspace-1280x800.png")
   });
 
   const promo = await context.newPage();

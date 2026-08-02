@@ -12,6 +12,7 @@ import {
   TTS_MODEL_ID,
   type DevicePreference,
   type EngineStatus,
+  type ModelCacheStatus,
   type ModelPreference,
   type OffscreenMessage,
   type RuntimeDevice,
@@ -55,6 +56,15 @@ import {
   validateTtsAudio
 } from "../shared/tts";
 import { createTranslationCacheKey } from "../shared/translation-cache";
+import {
+  createGlossarySignature,
+  protectGlossaryTerms,
+  restoreGlossaryTerms
+} from "../shared/glossary";
+import {
+  createContextualTranslationInput,
+  extractContextualTranslation
+} from "../shared/translation-context";
 
 type Small100Tokenizer = Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>>;
 type Small100Model = Awaited<ReturnType<typeof AutoModelForSeq2SeqLM.from_pretrained>>;
@@ -104,6 +114,7 @@ let status: EngineStatus = { state: "idle", modelId: MODEL_ID };
 // page translation cannot dispatch GPU work at the same time as speech.
 const runtimeQueue = new SerialTaskQueue();
 const translationCache = new LruCache<string>(220);
+const cancelledTranslationRequests = new Set<string>();
 let ttsEngine: SupertonicEngine | null = null;
 let ttsEnginePromise: Promise<SupertonicEngine> | null = null;
 let forceTtsWasm = false;
@@ -122,6 +133,11 @@ chrome.runtime.onMessage.addListener(
   ): boolean | undefined => {
     if (!message || message.target !== "offscreen") return undefined;
 
+    if (message.type === "PING_OFFSCREEN") {
+      sendResponse({ ok: true });
+      return false;
+    }
+
     if (message.type === "TRANSLATE_OFFSCREEN") {
       const task = runtimeQueue.run(() => translate(message));
       void task.then(sendResponse, (error) => {
@@ -135,9 +151,64 @@ chrome.runtime.onMessage.addListener(
       return true;
     }
 
+    if (message.type === "CANCEL_TRANSLATION_OFFSCREEN") {
+      cancelledTranslationRequests.add(message.requestId);
+      sendResponse({ ok: true, requestId: message.requestId });
+      return false;
+    }
+
     if (message.type === "GET_ENGINE_STATUS_OFFSCREEN") {
       sendResponse(status);
       return false;
+    }
+
+    if (message.type === "PREPARE_MODEL_OFFSCREEN") {
+      const task = runtimeQueue.run(async () => {
+        await getEngine(
+          message.devicePreference,
+          message.modelPreference,
+          message.runtimeDeviceOverride,
+          message.fallbackFromDevice,
+          message.deviceFallbackReason
+        );
+        return status;
+      });
+      void task.then(sendResponse, (error) => {
+        status = {
+          ...status,
+          state: "error",
+          error: friendlyError(error)
+        };
+        broadcastStatus();
+        sendResponse(status);
+      });
+      return true;
+    }
+
+    if (message.type === "GET_MODEL_CACHE_STATUS_OFFSCREEN") {
+      void getModelCacheStatus().then(sendResponse, () => {
+        sendResponse({ cachedModelIds: [], ttsCached: false } satisfies ModelCacheStatus);
+      });
+      return true;
+    }
+
+    if (message.type === "CLEAR_MODEL_CACHE_OFFSCREEN") {
+      const task = runtimeQueue.run(async () => {
+        await clearSelectedModelCache(
+          message.modelPreference,
+          message.includeTts === true,
+          message.includeTranslation !== false
+        );
+        return getModelCacheStatus();
+      });
+      void task.then(sendResponse, (error) => {
+        sendResponse({
+          cachedModelIds: [],
+          ttsCached: false,
+          error: friendlyError(error)
+        });
+      });
+      return true;
     }
 
     if (message.type === "SPEAK_KOREAN_OFFSCREEN") {
@@ -495,14 +566,21 @@ function broadcastTtsStatus(): void {
 
 async function translate(request: TranslateOffscreenRequest): Promise<TranslationResponse> {
   const started = performance.now();
+  if (cancelledTranslationRequests.has(request.requestId)) {
+    return cancelledTranslationResponse(request.requestId);
+  }
+  const glossarySignature = createGlossarySignature(request.glossary);
   const cacheKey = createTranslationCacheKey(
     request.modelPreference,
     request.devicePreference,
     request.sourceLanguage,
-    request.text
+    request.text,
+    request.context,
+    glossarySignature
   );
   const cached = translationCache.get(cacheKey);
   if (cached) {
+    cancelledTranslationRequests.delete(request.requestId);
     markEngineReadyAfterTranslation();
     return {
       ok: true,
@@ -539,13 +617,24 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
       fallbackFromModelId,
       fallbackReason
     );
+    if (cancelledTranslationRequests.has(request.requestId)) {
+      return cancelledTranslationResponse(request.requestId);
+    }
+    const protectedValue = protectGlossaryTerms(request.text, request.glossary);
+    const contextualInput = createContextualTranslationInput(
+      protectedValue.text,
+      request.context
+    );
     let translation: string;
     try {
       translation = await translateText(
         activeEngine,
-        request.text,
+        contextualInput,
         request.sourceLanguage
       );
+      if (cancelledTranslationRequests.has(request.requestId)) {
+        return cancelledTranslationResponse(request.requestId);
+      }
     } catch (error) {
       if (!shouldRetryTranslationOnWasm({
         engineKind: activeEngine.kind,
@@ -556,8 +645,26 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
       }
       throw new WebGpuFallbackRequiredError(friendlyError(error));
     }
+    const contextualResult = extractContextualTranslation(
+      translation,
+      Boolean(request.context?.trim())
+    );
+    if (contextualResult === null) {
+      translation = await translateText(
+        activeEngine,
+        protectedValue.text,
+        request.sourceLanguage
+      );
+    } else {
+      translation = contextualResult;
+    }
+    translation = restoreGlossaryTerms(translation, protectedValue.replacements);
+    if (cancelledTranslationRequests.has(request.requestId)) {
+      return cancelledTranslationResponse(request.requestId);
+    }
     if (!translation) throw new Error("모델이 번역 결과를 만들지 못했습니다.");
     translationCache.set(cacheKey, translation);
+    cancelledTranslationRequests.delete(request.requestId);
     markEngineReadyAfterTranslation();
 
     return {
@@ -569,6 +676,9 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
       elapsedMs: Math.round(performance.now() - started)
     };
   } catch (error) {
+    if (cancelledTranslationRequests.has(request.requestId)) {
+      return cancelledTranslationResponse(request.requestId);
+    }
     const message = friendlyError(error);
     if (error instanceof WebGpuFallbackRequiredError) {
       status = {
@@ -596,6 +706,16 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
       error: message
     };
   }
+}
+
+function cancelledTranslationResponse(requestId: string): TranslationResponse {
+  cancelledTranslationRequests.delete(requestId);
+  return {
+    ok: false,
+    requestId,
+    code: "TRANSLATION_CANCELLED",
+    error: "번역을 취소했습니다."
+  };
 }
 
 async function translateText(
@@ -1113,4 +1233,75 @@ async function resetEngine(): Promise<void> {
   }
   status = { state: "idle", modelId: MODEL_ID };
   broadcastStatus();
+}
+
+async function getModelCacheStatus(): Promise<ModelCacheStatus> {
+  const cachedModelIds = new Set<string>();
+  const cacheNames = await caches.keys();
+  for (const cacheName of cacheNames) {
+    if (cacheName === "ongeul-supertonic-model-v1") continue;
+    const cache = await caches.open(cacheName);
+    const requests = await cache.keys();
+    for (const request of requests) {
+      for (const modelId of allTranslationModelIds()) {
+        if (request.url.includes(`/${modelId}/resolve/`)) cachedModelIds.add(modelId);
+      }
+    }
+  }
+  return {
+    cachedModelIds: [...cachedModelIds],
+    ttsCached: cacheNames.includes("ongeul-supertonic-model-v1")
+  };
+}
+
+async function clearSelectedModelCache(
+  preference: ModelPreference | undefined,
+  includeTts: boolean,
+  includeTranslation: boolean
+): Promise<void> {
+  const selectedIds = !includeTranslation
+    ? []
+    : preference
+      ? [modelIdForPreference(preference)]
+      : allTranslationModelIds();
+  if (
+    includeTranslation && (!preference ||
+    (loadedModelPreference !== null && selectedIds.includes(modelIdForPreference(loadedModelPreference)))
+    )
+  ) {
+    await resetEngine();
+  }
+  for (const cacheName of await caches.keys()) {
+    if (cacheName === "ongeul-supertonic-model-v1") continue;
+    const cache = await caches.open(cacheName);
+    const requests = await cache.keys();
+    await Promise.all(requests
+      .filter((request) => selectedIds.some((modelId) =>
+        request.url.includes(`/${modelId}/resolve/`)
+      ))
+      .map((request) => cache.delete(request)));
+  }
+  if (includeTts) {
+    stopSpeech({ broadcast: false });
+    if (ttsEngine) await ttsEngine.release();
+    ttsEngine = null;
+    ttsEnginePromise = null;
+    forceTtsWasm = false;
+    ttsStatus = { state: "idle", modelId: TTS_MODEL_ID };
+    await clearSupertonicModelCache();
+    broadcastTtsStatus();
+  }
+  translationCache.clear();
+}
+
+function allTranslationModelIds(): string[] {
+  return [TRANSLATEGEMMA_MODEL_ID, M2M100_MODEL_ID, SMALL100_MODEL_ID];
+}
+
+function modelIdForPreference(preference: ModelPreference): string {
+  return preference === "translategemma"
+    ? TRANSLATEGEMMA_MODEL_ID
+    : preference === "m2m100"
+      ? M2M100_MODEL_ID
+      : SMALL100_MODEL_ID;
 }

@@ -18,6 +18,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         popup: resolve(import.meta.dirname, "popup.html"),
+        sidepanel: resolve(import.meta.dirname, "sidepanel.html"),
         offscreen: resolve(import.meta.dirname, "offscreen.html")
       },
       output: {

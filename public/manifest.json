@@ -10,6 +10,7 @@
     "contextMenus",
     "offscreen",
     "scripting",
+    "sidePanel",
     "storage",
     "unlimitedStorage"
   ],
@@ -36,6 +37,9 @@
       "16": "icons/icon-16.png",
       "32": "icons/icon-32.png"
     }
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
   },
   "commands": {
     "translate-selection": {

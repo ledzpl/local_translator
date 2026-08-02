@@ -25,4 +25,12 @@ describe("createTranslationCacheKey", () => {
     expect(wasm).not.toBe(webgpu);
     expect(wasm).not.toBe(otherModel);
   });
+
+  it("separates contextual and glossary-specific results", () => {
+    const base = createTranslationCacheKey("m2m100", "wasm", "en", "hello");
+    expect(createTranslationCacheKey("m2m100", "wasm", "en", "hello", "before"))
+      .not.toBe(base);
+    expect(createTranslationCacheKey("m2m100", "wasm", "en", "hello", "", "term"))
+      .not.toBe(base);
+  });
 });

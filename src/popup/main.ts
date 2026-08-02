@@ -7,11 +7,16 @@ import {
   type DevicePreference,
   type EngineStatus,
   type ExtensionSettings,
+  type GlossaryEntry,
+  type ModelCacheStatus,
+  type PageDisplayMode,
   type ModelPreference,
   type PageTranslationStatus,
   type SpeakResponse,
   type TtsStatus,
   type TranslationResponse,
+  type TranslationJobState,
+  type UiTranslationJobMessage,
   type UiProgressMessage,
   type UiTtsProgressMessage
 } from "../shared/protocol";
@@ -29,6 +34,11 @@ import {
 import { shouldApplyInitialSelection } from "../shared/popup-state";
 import { RevisionedCommitter } from "../shared/revisioned-committer";
 import { isSpeechStatusFor } from "../shared/tts";
+import {
+  GLOSSARY_STORAGE_KEY,
+  MAX_GLOSSARY_ENTRIES,
+  normalizeGlossaryEntries
+} from "../shared/glossary";
 
 const app = document.querySelector<HTMLElement>("#app");
 if (!app) throw new Error("앱 루트를 찾을 수 없습니다.");
@@ -48,7 +58,8 @@ app.innerHTML = `
       <li>기본 TranslateGemma 4B는 약 3.1GB이며 WebGPU가 필요합니다. 미지원·실패 시 M2M100 WASM 약 650MB를 추가로 받을 수 있습니다.</li>
       <li>TranslateGemma 사용에는 <a href="https://ai.google.dev/gemma/terms" target="_blank" rel="noreferrer">Gemma 이용약관</a>과 금지 용도 정책이 적용됩니다.</li>
       <li>한국어 음성에는 <a href="/LICENSES/supertonic-model-OpenRAIL-M.txt" target="_blank" rel="noreferrer">Supertonic 3 OpenRAIL-M</a> 사용 제한이 적용됩니다.</li>
-      <li>모델·언어·자막 설정과 이 확인 기록은 Chrome 동기화를 켠 경우 Google의 Chrome 동기화 인프라에서 처리될 수 있습니다. 페이지 내용은 저장하지 않습니다.</li>
+      <li>수동 번역 입력과 결과는 작업 복구를 위해 브라우저 세션 동안만 저장되며, 용어집은 사용자가 지울 때까지 이 기기의 확장 저장소에 보관됩니다. 페이지 본문·선택 텍스트·자막은 저장하지 않습니다.</li>
+      <li>모델·언어·자막 설정과 이 확인 기록은 Chrome 동기화를 켠 경우 Google의 Chrome 동기화 인프라에서 처리될 수 있습니다.</li>
     </ul>
     <a href="/privacy.html" target="_blank" rel="noreferrer">개인정보처리방침 전체 보기</a>
     <label class="consent-check">
@@ -84,6 +95,20 @@ app.innerHTML = `
       <button id="page-restore-button" type="button" hidden>번역 지우기</button>
       <button id="extension-reload-button" type="button" hidden>확장 새로고침</button>
     </div>
+    <div class="page-options">
+      <label>
+        <input id="page-continuous" type="checkbox" />
+        <span>스크롤할 때 다음 문단 계속 번역</span>
+      </label>
+      <label>
+        <span>표시</span>
+        <select id="page-display-mode">
+          <option value="bilingual">원문 + 한국어</option>
+          <option value="translation">한국어만</option>
+          <option value="hover">한국어 중심 · 올리면 원문</option>
+        </select>
+      </label>
+    </div>
   </section>
 
   <section class="translator-card">
@@ -105,10 +130,29 @@ app.innerHTML = `
       <div class="result-actions">
         <button id="speak-button" type="button">▶ 듣기</button>
         <button id="copy-button" type="button" disabled>복사</button>
+        <button id="translation-cancel-button" type="button" hidden>취소</button>
+        <button id="translation-clear-button" type="button" hidden>기록 지우기</button>
       </div>
     </div>
     <div id="result-text" class="result-text" role="status" aria-live="polite"></div>
     <div id="result-meta" class="result-meta"></div>
+  </section>
+
+  <section class="model-center">
+    <div class="section-title">
+      <div>
+        <span class="kicker">MODEL CENTER</span>
+        <h2>로컬 모델 관리</h2>
+      </div>
+      <span id="device-readiness" class="model-readiness">확인 중</span>
+    </div>
+    <p id="storage-status">브라우저 저장 공간과 캐시를 확인하고 있습니다.</p>
+    <div class="model-actions">
+      <button id="prepare-model-button" type="button">선택 모델 미리 준비</button>
+      <button id="clear-model-button" type="button">선택 모델 삭제</button>
+      <button id="clear-tts-button" type="button">음성 모델 삭제</button>
+    </div>
+    <p id="model-center-status" role="status" aria-live="polite"></p>
   </section>
 
   <section class="engine-card">
@@ -166,6 +210,13 @@ app.innerHTML = `
       <div><strong>한국어 자막 크기</strong><span id="subtitle-size-value">28px</span></div>
       <input id="subtitle-size" type="range" min="18" max="42" step="1" />
     </label>
+    <label class="setting-row">
+      <div><strong>자막 번역 방식</strong><span>이전 자막을 참고하거나 현재 자막을 빠르게 번역</span></div>
+      <select id="youtube-translation-mode">
+        <option value="speed">속도 우선</option>
+        <option value="context">문맥 우선</option>
+      </select>
+    </label>
   </section>
 
   <details class="advanced">
@@ -189,6 +240,19 @@ app.innerHTML = `
     <p id="model-setting-detail">TranslateGemma 4B · 약 3.1GB · WebGPU 전용 · 미지원 시 M2M100 WASM 폴백 · Chrome 캐시에 보관</p>
   </details>
 
+  <details class="glossary">
+    <summary>내 기기 용어집</summary>
+    <p>제품명과 전문용어를 이 기기 안에서만 고정합니다.</p>
+    <div class="glossary-form">
+      <input id="glossary-source" type="text" maxlength="120" placeholder="원문 용어" />
+      <input id="glossary-target" type="text" maxlength="120" placeholder="한국어 표기" />
+      <label><input id="glossary-preserve" type="checkbox" /> 원문 그대로 유지</label>
+      <button id="glossary-add" type="button">용어 추가</button>
+    </div>
+    <div id="glossary-list" class="glossary-list"></div>
+    <p id="glossary-status" role="status" aria-live="polite"></p>
+  </details>
+
   <footer>
     <span>선택한 텍스트는 우클릭 또는 <kbd>⌥</kbd><kbd>⇧</kbd><kbd>K</kbd>로 바로 번역</span>
     <a href="/privacy.html" target="_blank" rel="noreferrer">개인정보처리방침</a>
@@ -210,6 +274,8 @@ const elements = {
   resultText: getElement<HTMLElement>("result-text"),
   resultMeta: getElement<HTMLElement>("result-meta"),
   copy: getElement<HTMLButtonElement>("copy-button"),
+  translationCancel: getElement<HTMLButtonElement>("translation-cancel-button"),
+  translationClear: getElement<HTMLButtonElement>("translation-clear-button"),
   speak: getElement<HTMLButtonElement>("speak-button"),
   engineTitle: getElement<HTMLElement>("engine-title"),
   engineDetail: getElement<HTMLElement>("engine-detail"),
@@ -225,15 +291,35 @@ const elements = {
   showOriginal: getElement<HTMLInputElement>("show-original"),
   subtitleSize: getElement<HTMLInputElement>("subtitle-size"),
   subtitleSizeValue: getElement<HTMLElement>("subtitle-size-value"),
+  youtubeTranslationMode: getElement<HTMLSelectElement>("youtube-translation-mode"),
+  pageContinuous: getElement<HTMLInputElement>("page-continuous"),
+  pageDisplayMode: getElement<HTMLSelectElement>("page-display-mode"),
   modelPreference: getElement<HTMLSelectElement>("model-preference"),
   devicePreference: getElement<HTMLSelectElement>("device-preference"),
   modelSettingDetail: getElement<HTMLElement>("model-setting-detail"),
   pageStatus: getElement<HTMLElement>("page-status"),
   pageTranslate: getElement<HTMLButtonElement>("page-translate-button"),
   pageRestore: getElement<HTMLButtonElement>("page-restore-button"),
-  extensionReload: getElement<HTMLButtonElement>("extension-reload-button")
+  extensionReload: getElement<HTMLButtonElement>("extension-reload-button"),
+  deviceReadiness: getElement<HTMLElement>("device-readiness"),
+  storageStatus: getElement<HTMLElement>("storage-status"),
+  prepareModel: getElement<HTMLButtonElement>("prepare-model-button"),
+  clearModel: getElement<HTMLButtonElement>("clear-model-button"),
+  clearTts: getElement<HTMLButtonElement>("clear-tts-button"),
+  modelCenterStatus: getElement<HTMLElement>("model-center-status"),
+  glossarySource: getElement<HTMLInputElement>("glossary-source"),
+  glossaryTarget: getElement<HTMLInputElement>("glossary-target"),
+  glossaryPreserve: getElement<HTMLInputElement>("glossary-preserve"),
+  glossaryAdd: getElement<HTMLButtonElement>("glossary-add"),
+  glossaryList: getElement<HTMLElement>("glossary-list"),
+  glossaryStatus: getElement<HTMLElement>("glossary-status")
 };
 let currentTranslation = "";
+let currentTranslationJob: TranslationJobState | null = null;
+let glossaryEntries: GlossaryEntry[] = [];
+let modelPreparationInFlight = false;
+let modelCacheActionInFlight = false;
+let currentEngineStatus: EngineStatus = { state: "idle", modelId: MODEL_ID };
 let currentTtsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
 let currentSpeechId: string | null = null;
 let translationInFlight = false;
@@ -265,6 +351,8 @@ async function initialize(): Promise<void> {
     applySettings(previewSettings);
     updatePrivacyGate(previewSettings);
     updateEngineStatus({ state: "idle", modelId: MODEL_ID });
+    updateDeviceAndStorageStatus(null);
+    renderGlossary();
     return;
   }
 
@@ -283,7 +371,7 @@ async function initialize(): Promise<void> {
 
 async function loadRuntimeState(): Promise<void> {
   const sourceRevisionAtRequest = sourceEditRevision;
-  const [selection, status, pageStatus, ttsStatus] = await Promise.all([
+  const [selection, status, pageStatus, ttsStatus, job] = await Promise.all([
     chrome.runtime.sendMessage({
       target: "background",
       type: "GET_ACTIVE_SELECTION"
@@ -299,7 +387,11 @@ async function loadRuntimeState(): Promise<void> {
     chrome.runtime.sendMessage({
       target: "background",
       type: "GET_TTS_STATUS"
-    }).catch(() => ({ state: "idle", modelId: TTS_MODEL_ID }))
+    }).catch(() => ({ state: "idle", modelId: TTS_MODEL_ID })),
+    chrome.runtime.sendMessage({
+      target: "background",
+      type: "GET_TRANSLATION_JOB"
+    }).catch(() => null)
   ]);
 
   const initialSelectionText = selection?.text ?? "";
@@ -323,6 +415,8 @@ async function loadRuntimeState(): Promise<void> {
       : { state: "idle", modelId: TTS_MODEL_ID }
   );
   updatePageStatus(normalizePageStatus(pageStatus, EXTENSION_RELOAD_MESSAGE));
+  applyTranslationJob(job as TranslationJobState | null);
+  await Promise.all([loadGlossary(), refreshDeviceAndStorageStatus()]);
 }
 
 async function acceptPrivacyDisclosure(): Promise<void> {
@@ -368,6 +462,8 @@ elements.source.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key === "Enter") void translate();
 });
 elements.copy.addEventListener("click", () => void copyResult());
+elements.translationCancel.addEventListener("click", () => void cancelTranslationJob());
+elements.translationClear.addEventListener("click", () => void clearTranslationJob());
 elements.speak.addEventListener("click", () => void toggleSpeech());
 elements.ttsStop.addEventListener("click", () => void stopSpeech());
 elements.pageTranslate.addEventListener("click", () => void handlePageTranslation());
@@ -377,6 +473,9 @@ elements.extensionReload.addEventListener("click", () => chrome.runtime.reload()
 elements.youtubeEnabled.addEventListener("change", () => void saveSettingsSafely());
 elements.autoCaptions.addEventListener("change", () => void saveSettingsSafely());
 elements.showOriginal.addEventListener("change", () => void saveSettingsSafely());
+elements.youtubeTranslationMode.addEventListener("change", () => void saveSettingsSafely());
+elements.pageContinuous.addEventListener("change", () => void saveSettingsSafely());
+elements.pageDisplayMode.addEventListener("change", () => void changePageDisplayMode());
 elements.subtitleSize.addEventListener("input", () => {
   elements.subtitleSizeValue.textContent = `${elements.subtitleSize.value}px`;
   subtitleSizeCommitter.markDirty();
@@ -386,19 +485,28 @@ window.addEventListener("pagehide", flushSubtitleSizeOnPageHide);
 elements.sourceLanguage.addEventListener("change", () => void saveSettingsSafely());
 elements.modelPreference.addEventListener("change", () => void resetEngineForSettings());
 elements.devicePreference.addEventListener("change", () => void resetEngineForSettings());
+elements.prepareModel.addEventListener("click", () => void prepareSelectedModel());
+elements.clearModel.addEventListener("click", () => void clearSelectedModel(false));
+elements.clearTts.addEventListener("click", () => void clearSelectedModel(true));
+elements.glossaryPreserve.addEventListener("change", updateGlossaryTargetState);
+elements.glossaryAdd.addEventListener("click", () => {
+  void addGlossaryEntry().catch(reportGlossaryError);
+});
 
 if (isExtensionRuntime) {
   chrome.runtime.onMessage.addListener((
-    message: UiProgressMessage | UiTtsProgressMessage
+    message: UiProgressMessage | UiTtsProgressMessage | UiTranslationJobMessage
   ) => {
     if (message?.target === "ui" && message.type === "ENGINE_PROGRESS") {
       updateEngineStatus(message.status);
     } else if (message?.target === "ui" && message.type === "TTS_PROGRESS") {
       handleTtsProgress(message.status);
+    } else if (message?.target === "ui" && message.type === "TRANSLATION_JOB_UPDATED") {
+      applyTranslationJob(message.job);
     }
   });
   window.setInterval(() => {
-    if (elements.pageTranslate.dataset.state === "translating") {
+    if (elements.pageTranslate.dataset.active === "true") {
       void refreshPageStatus();
     }
   }, 900);
@@ -414,11 +522,20 @@ async function handlePageTranslation(): Promise<void> {
     return;
   }
   const type =
-    elements.pageTranslate.dataset.state === "translating"
+    elements.pageTranslate.dataset.active === "true"
       ? "STOP_PAGE_TRANSLATION"
       : "START_PAGE_TRANSLATION";
   elements.pageTranslate.disabled = true;
-  const status = await chrome.runtime.sendMessage({ target: "background", type })
+  const status = await chrome.runtime.sendMessage({
+    target: "background",
+    type,
+    ...(type === "START_PAGE_TRANSLATION"
+      ? {
+          continuous: elements.pageContinuous.checked,
+          displayMode: elements.pageDisplayMode.value as PageDisplayMode
+        }
+      : {})
+  })
     .catch(() => null);
   elements.pageTranslate.disabled = false;
   updatePageStatus(normalizePageStatus(status, EXTENSION_RELOAD_MESSAGE));
@@ -451,6 +568,7 @@ async function translate(): Promise<void> {
     return;
   }
 
+  const requestId = createRequestId();
   translationInFlight = true;
   setBusy(true);
   currentTranslation = "";
@@ -470,12 +588,25 @@ async function translate(): Promise<void> {
     const response = await chrome.runtime.sendMessage({
       target: "background",
       type: "TRANSLATE",
-      requestId: createRequestId(),
+      requestId,
       text,
       sourceLanguage: elements.sourceLanguage.value,
       origin: "popup"
     }) as TranslationResponse;
 
+    if (currentTranslationJob?.requestId === requestId) {
+      applyTranslationJob({
+        ...currentTranslationJob,
+        state: response.ok
+          ? "complete"
+          : response.code === "TRANSLATION_CANCELLED"
+            ? "cancelled"
+            : "error",
+        response,
+        updatedAt: Date.now()
+      });
+      return;
+    }
     elements.resultText.className = response.ok ? "result-text" : "result-text error";
     if (response.ok) {
       currentTranslation = response.translation;
@@ -501,9 +632,87 @@ async function translate(): Promise<void> {
     elements.resultText.textContent = formatUiError(error);
     elements.resultMeta.textContent = "확장 프로그램을 새로고침한 뒤 다시 시도해 주세요.";
   } finally {
-    translationInFlight = false;
-    setBusy(false);
+    if (currentTranslationJob?.state !== "running") {
+      translationInFlight = false;
+      setBusy(false);
+    }
   }
+}
+
+function applyTranslationJob(job: TranslationJobState | null): void {
+  currentTranslationJob = job;
+  const running = job?.state === "running";
+  translationInFlight = running;
+  setBusy(running);
+  elements.translationCancel.hidden = !running;
+  elements.translationClear.hidden = !job || running;
+  if (!job) return;
+
+  if (!elements.source.value || sourceEditRevision === 0) {
+    elements.source.value = job.text;
+    updateCharacterCount();
+  }
+  elements.resultCard.hidden = false;
+  elements.resultMeta.textContent = "";
+  if (running) {
+    currentTranslation = "";
+    elements.resultText.className = "result-text loading-lines";
+    elements.resultText.textContent = "작업공간을 닫아도 브라우저에서 번역을 계속합니다…";
+    elements.copy.disabled = true;
+    elements.speak.disabled = true;
+    return;
+  }
+
+  const response = job.response;
+  if (response?.ok) {
+    currentTranslation = response.translation;
+    elements.resultText.className = "result-text";
+    elements.resultText.textContent = response.translation;
+    elements.copy.disabled = false;
+    elements.speak.disabled = false;
+    const device = response.device === "webgpu"
+      ? "WebGPU"
+      : response.device === "wasm"
+        ? "WASM"
+        : "번역 생략";
+    elements.resultMeta.textContent = `${device} · ${(response.elapsedMs / 1000).toFixed(1)}초`;
+  } else {
+    currentTranslation = "";
+    elements.resultText.className = "result-text error";
+    elements.resultText.textContent = response?.error ??
+      (job.state === "cancelled" ? "번역을 취소했습니다." : "번역을 완료하지 못했습니다.");
+    elements.copy.disabled = true;
+    elements.speak.disabled = true;
+    elements.resultMeta.textContent = job.state === "cancelled"
+      ? "입력은 브라우저 세션에 남아 있어 다시 시도할 수 있습니다."
+      : "엔진 상태를 확인한 뒤 다시 시도해 주세요.";
+  }
+}
+
+async function cancelTranslationJob(): Promise<void> {
+  if (!isExtensionRuntime || currentTranslationJob?.state !== "running") return;
+  const job = await chrome.runtime.sendMessage({
+    target: "background",
+    type: "CANCEL_TRANSLATION_JOB",
+    requestId: currentTranslationJob.requestId
+  }).catch(() => null) as TranslationJobState | null;
+  applyTranslationJob(job);
+}
+
+async function clearTranslationJob(): Promise<void> {
+  if (isExtensionRuntime) {
+    await chrome.runtime.sendMessage({
+      target: "background",
+      type: "CLEAR_TRANSLATION_JOB"
+    }).catch(() => undefined);
+  }
+  currentTranslationJob = null;
+  currentTranslation = "";
+  elements.resultCard.hidden = true;
+  elements.translationCancel.hidden = true;
+  elements.translationClear.hidden = true;
+  elements.copy.disabled = true;
+  elements.speak.disabled = true;
 }
 
 async function toggleSpeech(): Promise<void> {
@@ -605,6 +814,7 @@ function updateTtsStatus(status: TtsStatus): void {
   elements.ttsState.className = `engine-state ${status.state}`;
   elements.ttsStop.hidden = !active;
   elements.speak.textContent = active ? "■ 정지" : "▶ 듣기";
+  updateModelActionAvailability();
 
   if (status.state === "loading") {
     const percent = status.progress && status.progress > 0
@@ -674,8 +884,234 @@ async function copyResult(): Promise<void> {
   }, 1200);
 }
 
+async function changePageDisplayMode(): Promise<void> {
+  await saveSettingsSafely();
+  if (!isExtensionRuntime) return;
+  const status = await chrome.runtime.sendMessage({
+    target: "background",
+    type: "SET_PAGE_DISPLAY_MODE",
+    displayMode: elements.pageDisplayMode.value as PageDisplayMode
+  }).catch(() => null);
+  if (status) updatePageStatus(normalizePageStatus(status));
+}
+
+async function prepareSelectedModel(): Promise<void> {
+  if (!isExtensionRuntime || modelPreparationInFlight || modelCacheActionInFlight) return;
+  modelPreparationInFlight = true;
+  updateModelActionAvailability();
+  elements.prepareModel.textContent = "모델 준비 중…";
+  elements.modelCenterStatus.textContent = "선택한 모델을 브라우저 캐시에 준비하고 있습니다.";
+  try {
+    await saveSettings();
+    const status = await chrome.runtime.sendMessage({
+      target: "background",
+      type: "PREPARE_MODEL"
+    }) as EngineStatus;
+    updateEngineStatus(status);
+    elements.modelCenterStatus.textContent = status.state === "ready"
+      ? "모델 준비를 마쳤습니다. 이제 바로 번역할 수 있습니다."
+      : status.error ?? "모델 준비 상태를 확인해 주세요.";
+  } catch (error) {
+    elements.modelCenterStatus.textContent = formatUiError(error);
+  } finally {
+    modelPreparationInFlight = false;
+    updateModelActionAvailability();
+    elements.prepareModel.textContent = "선택 모델 미리 준비";
+    await refreshDeviceAndStorageStatus();
+  }
+}
+
+async function clearSelectedModel(ttsOnly: boolean): Promise<void> {
+  if (
+    !isExtensionRuntime ||
+    modelPreparationInFlight ||
+    modelCacheActionInFlight ||
+    (!ttsOnly && currentEngineStatus.state === "loading") ||
+    (ttsOnly && isTtsActive(currentTtsStatus))
+  ) return;
+  const confirmed = window.confirm(
+    ttsOnly
+      ? "음성 모델 캐시를 삭제할까요? 다음 듣기 때 약 400MB를 다시 내려받습니다."
+      : "선택한 번역 모델 캐시를 삭제할까요? 다음 번역 때 모델을 다시 내려받습니다."
+  );
+  if (!confirmed) return;
+  modelCacheActionInFlight = true;
+  updateModelActionAvailability();
+  elements.modelCenterStatus.textContent = ttsOnly
+    ? "음성 모델 캐시를 삭제하고 있습니다."
+    : "선택한 번역 모델 캐시를 삭제하고 있습니다.";
+  try {
+    await chrome.runtime.sendMessage({
+      target: "background",
+      type: "CLEAR_MODEL_CACHE",
+      modelPreference: ttsOnly
+        ? undefined
+        : elements.modelPreference.value as ModelPreference,
+      includeTts: ttsOnly,
+      includeTranslation: !ttsOnly
+    });
+    elements.modelCenterStatus.textContent = ttsOnly
+      ? "음성 모델을 삭제했습니다. 다음 듣기 때 다시 받습니다."
+      : "선택한 번역 모델을 삭제했습니다. 다음 사용 때 다시 받습니다.";
+    await refreshDeviceAndStorageStatus();
+  } catch (error) {
+    elements.modelCenterStatus.textContent = formatUiError(error);
+  } finally {
+    modelCacheActionInFlight = false;
+    updateModelActionAvailability();
+  }
+}
+
+function updateModelActionAvailability(): void {
+  const modelControlsLocked = modelPreparationInFlight || modelCacheActionInFlight;
+  elements.modelPreference.disabled = modelControlsLocked;
+  elements.devicePreference.disabled =
+    modelControlsLocked || elements.modelPreference.value === "small100";
+  elements.prepareModel.disabled = modelPreparationInFlight || modelCacheActionInFlight;
+  elements.clearModel.disabled =
+    modelPreparationInFlight || modelCacheActionInFlight || currentEngineStatus.state === "loading";
+  elements.clearTts.disabled =
+    modelCacheActionInFlight || isTtsActive(currentTtsStatus);
+}
+
+async function refreshDeviceAndStorageStatus(): Promise<void> {
+  if (!isExtensionRuntime) {
+    updateDeviceAndStorageStatus(null);
+    return;
+  }
+  const cacheStatus = await chrome.runtime.sendMessage({
+    target: "background",
+    type: "GET_MODEL_CACHE_STATUS"
+  }).catch(() => null) as ModelCacheStatus | null;
+  updateDeviceAndStorageStatus(cacheStatus);
+}
+
+async function updateDeviceAndStorageStatus(
+  cacheStatus: ModelCacheStatus | null
+): Promise<void> {
+  const hasWebGpu = Boolean(navigator.gpu);
+  elements.deviceReadiness.textContent = hasWebGpu ? "WebGPU 사용 가능" : "WASM 호환 모드";
+  elements.deviceReadiness.classList.toggle("ready", hasWebGpu);
+  let storageText = "저장 공간 정보 없음";
+  try {
+    const estimate = await navigator.storage.estimate();
+    if (typeof estimate.usage === "number" && typeof estimate.quota === "number") {
+      storageText = `${formatBytes(estimate.usage)} 사용 · ${formatBytes(estimate.quota)} 할당`;
+    }
+  } catch {
+    // Some extension test contexts do not expose storage estimates.
+  }
+  const cachedCount = cacheStatus?.cachedModelIds.length ?? 0;
+  const ttsText = cacheStatus?.ttsCached ? "음성 캐시 있음" : "음성 캐시 없음";
+  elements.storageStatus.textContent =
+    `${storageText} · 번역 모델 ${cachedCount}종 캐시 · ${ttsText}`;
+}
+
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
+  return `${(value / 1024 ** index).toFixed(index > 2 ? 1 : 0)}${units[index]}`;
+}
+
+async function loadGlossary(): Promise<void> {
+  if (!isExtensionRuntime) {
+    renderGlossary();
+    return;
+  }
+  const stored = await chrome.storage.local.get(GLOSSARY_STORAGE_KEY);
+  glossaryEntries = normalizeGlossaryEntries(stored[GLOSSARY_STORAGE_KEY]);
+  renderGlossary();
+}
+
+function updateGlossaryTargetState(): void {
+  elements.glossaryTarget.disabled = elements.glossaryPreserve.checked;
+  elements.glossaryTarget.placeholder = elements.glossaryPreserve.checked
+    ? "원문을 그대로 유지합니다"
+    : "한국어 표기";
+}
+
+async function addGlossaryEntry(): Promise<void> {
+  const source = elements.glossarySource.value.trim();
+  const preserve = elements.glossaryPreserve.checked;
+  const target = preserve ? source : elements.glossaryTarget.value.trim();
+  if (!source || !target) {
+    elements.glossaryStatus.textContent = "원문 용어와 사용할 표기를 입력해 주세요.";
+    return;
+  }
+  const existing = glossaryEntries.find((entry) =>
+    entry.source.toLocaleLowerCase() === source.toLocaleLowerCase()
+  );
+  if (!existing && glossaryEntries.length >= MAX_GLOSSARY_ENTRIES) {
+    elements.glossaryStatus.textContent =
+      `용어는 최대 ${MAX_GLOSSARY_ENTRIES}개까지 저장할 수 있습니다. 기존 항목을 지워 주세요.`;
+    return;
+  }
+  const nextEntries = normalizeGlossaryEntries([
+    ...glossaryEntries.filter((entry) => entry.source.toLocaleLowerCase() !== source.toLocaleLowerCase()),
+    {
+      id: crypto.randomUUID(),
+      source,
+      target,
+      mode: preserve ? "preserve" : "translate"
+    }
+  ]);
+  await persistGlossary(nextEntries);
+  glossaryEntries = nextEntries;
+  elements.glossarySource.value = "";
+  elements.glossaryTarget.value = "";
+  elements.glossaryStatus.textContent = "용어를 이 기기에 저장했습니다.";
+  renderGlossary();
+}
+
+async function removeGlossaryEntry(id: string): Promise<void> {
+  const nextEntries = glossaryEntries.filter((entry) => entry.id !== id);
+  await persistGlossary(nextEntries);
+  glossaryEntries = nextEntries;
+  elements.glossaryStatus.textContent = "용어를 삭제했습니다.";
+  renderGlossary();
+}
+
+async function persistGlossary(entries: readonly GlossaryEntry[]): Promise<void> {
+  if (isExtensionRuntime) {
+    await chrome.storage.local.set({ [GLOSSARY_STORAGE_KEY]: entries });
+  }
+}
+
+function renderGlossary(): void {
+  elements.glossaryList.replaceChildren();
+  if (glossaryEntries.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "glossary-empty";
+    empty.textContent = "아직 저장한 용어가 없습니다.";
+    elements.glossaryList.append(empty);
+    return;
+  }
+  for (const entry of glossaryEntries) {
+    const row = document.createElement("div");
+    row.className = "glossary-entry";
+    const copy = document.createElement("span");
+    copy.textContent = entry.mode === "preserve"
+      ? `${entry.source} · 원문 유지`
+      : `${entry.source} → ${entry.target}`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "삭제";
+    remove.addEventListener("click", () => {
+      void removeGlossaryEntry(entry.id).catch(reportGlossaryError);
+    });
+    row.append(copy, remove);
+    elements.glossaryList.append(row);
+  }
+}
+
 function updateCharacterCount(): void {
   elements.characterCount.textContent = `${elements.source.value.length.toLocaleString()} / 5,000`;
+}
+
+function reportGlossaryError(error: unknown): void {
+  elements.glossaryStatus.textContent =
+    `용어집을 저장하지 못했습니다: ${formatUiError(error)}`;
 }
 
 function setBusy(busy: boolean): void {
@@ -689,6 +1125,9 @@ function applySettings(settings: ExtensionSettings): void {
   elements.showOriginal.checked = settings.showOriginalCaptions;
   elements.subtitleSize.value = String(settings.subtitleSize);
   elements.subtitleSizeValue.textContent = `${settings.subtitleSize}px`;
+  elements.youtubeTranslationMode.value = settings.youtubeTranslationMode;
+  elements.pageContinuous.checked = settings.pageContinuous;
+  elements.pageDisplayMode.value = settings.pageDisplayMode;
   elements.sourceLanguage.value = settings.sourceLanguage;
   elements.modelPreference.value = settings.modelPreference;
   elements.devicePreference.value = settings.devicePreference;
@@ -702,6 +1141,9 @@ async function saveSettings(): Promise<void> {
     autoEnableCaptions: elements.autoCaptions.checked,
     showOriginalCaptions: elements.showOriginal.checked,
     subtitleSize: Number(elements.subtitleSize.value),
+    youtubeTranslationMode: elements.youtubeTranslationMode.value as ExtensionSettings["youtubeTranslationMode"],
+    pageContinuous: elements.pageContinuous.checked,
+    pageDisplayMode: elements.pageDisplayMode.value as PageDisplayMode,
     sourceLanguage: elements.sourceLanguage.value,
     modelPreference: elements.modelPreference.value as ModelPreference,
     devicePreference: elements.devicePreference.value as DevicePreference
@@ -788,6 +1230,7 @@ function updateModelSettingDetail(): void {
 }
 
 function updateEngineStatus(status: EngineStatus): void {
+  currentEngineStatus = status;
   const stateLabel = {
     idle: "대기",
     loading: "준비 중",
@@ -796,6 +1239,7 @@ function updateEngineStatus(status: EngineStatus): void {
   }[status.state];
   elements.engineState.textContent = stateLabel;
   elements.engineState.className = `engine-state ${status.state}`;
+  updateModelActionAvailability();
   elements.progressTrack.hidden = status.state !== "loading";
   const progress = status.progress ?? 0;
   const isIndeterminate = status.state === "loading" && progress <= 0;
@@ -852,15 +1296,24 @@ function modelLabelFromId(modelId: string): string {
 }
 
 function updatePageStatus(status: PageTranslationStatus): void {
+  const continuousActive = Boolean(
+    status.continuous &&
+    status.hasMore &&
+    !["idle", "stopped", "error"].includes(status.state)
+  );
   elements.pageTranslate.dataset.state = status.state;
+  elements.pageTranslate.dataset.active =
+    status.state === "translating" || continuousActive ? "true" : "false";
   elements.pageRestore.hidden = status.state === "idle";
   elements.extensionReload.hidden = status.error !== EXTENSION_RELOAD_MESSAGE;
   elements.pageTranslate.textContent =
     status.state === "translating"
       ? "번역 중지"
-      : status.state === "idle"
-        ? "페이지 안에 한국어 표시"
-        : "다시 번역";
+      : continuousActive
+        ? "연속 번역 중지"
+        : status.state === "idle"
+          ? "페이지 안에 한국어 표시"
+          : "다시 번역";
 
   if (status.state === "translating") {
     elements.pageStatus.textContent =
@@ -869,7 +1322,9 @@ function updatePageStatus(status: PageTranslationStatus): void {
     elements.pageStatus.textContent = "번역할 외국어 본문을 찾지 못했습니다.";
   } else if (status.state === "complete") {
     elements.pageStatus.textContent =
-      `${status.completed}개 문장을 원문 아래에 표시했습니다.`;
+      status.continuous
+        ? `${status.completed}개 문장을 표시했습니다. 스크롤하면 다음 문단을 계속 번역합니다.`
+        : `${status.completed}개 문장을 원문 아래에 표시했습니다.`;
   } else if (status.state === "partial") {
     elements.pageStatus.textContent =
       `${status.completed}개 문장을 표시했고 ${status.failed}개 문장은 실패했습니다.`;

@@ -57,12 +57,21 @@ try {
     if (message.type() === "error") errors.push(`worker: ${message.text()}`);
   });
 
+  const launcher = await context.newPage();
+  await launcher.goto(`chrome-extension://${extensionId}/popup.html`);
+  await launcher.getByRole("button", { name: "번역 작업공간 열기" }).waitFor();
+  await launcher.getByRole("button", { name: "현재 페이지 번역 시작" }).waitFor();
+  const launcherClosed = launcher.waitForEvent("close", { timeout: 3_000 });
+  await launcher.getByRole("button", { name: "번역 작업공간 열기" }).click();
+  await launcherClosed;
+  console.log("SIDE_PANEL_LAUNCHER=PASS");
+
   const popup = await context.newPage();
   popup.on("console", (message) => {
     if (message.type() === "error") errors.push(`popup: ${message.text()}`);
   });
   popup.on("pageerror", (error) => errors.push(`popup: ${error.message}`));
-  await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+  await popup.goto(`chrome-extension://${extensionId}/sidepanel.html`);
 
   await popup.getByRole("heading", {
     name: "번역을 시작하기 전에 확인해 주세요"
@@ -76,14 +85,19 @@ try {
       sourceLanguage: "en",
       origin: "popup"
     });
+    const modelPreparation = await chrome.runtime.sendMessage({
+      target: "background",
+      type: "PREPARE_MODEL"
+    });
     const contexts = await chrome.runtime.getContexts({
       contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT]
     });
-    return { response, offscreenCount: contexts.length };
+    return { response, modelPreparation, offscreenCount: contexts.length };
   });
   if (
     preConsent.response?.ok !== false ||
     preConsent.response?.code !== "CONSENT_REQUIRED" ||
+    preConsent.modelPreparation?.state !== "error" ||
     preConsent.offscreenCount !== 0
   ) {
     throw new Error(
@@ -99,6 +113,58 @@ try {
   await popup.getByRole("heading", { name: "온글." }).waitFor();
   await popup.getByRole("heading", { name: "페이지 안에서 번역" }).waitFor();
   await popup.locator("#tts-title").waitFor();
+  if (
+    !await popup.locator("#page-continuous").isChecked() ||
+    await popup.locator("#page-display-mode").inputValue() !== "bilingual" ||
+    await popup.locator("#youtube-translation-mode").inputValue() !== "speed"
+  ) {
+    throw new Error("연속 페이지 번역·표시·YouTube 기본 모드가 UI에 반영되지 않았습니다.");
+  }
+  const cacheStatus = await popup.evaluate(async () =>
+    chrome.runtime.sendMessage({
+      target: "background",
+      type: "GET_MODEL_CACHE_STATUS"
+    })
+  );
+  if (!Array.isArray(cacheStatus?.cachedModelIds) || typeof cacheStatus?.ttsCached !== "boolean") {
+    throw new Error(`모델 캐시 상태 응답이 올바르지 않습니다: ${JSON.stringify(cacheStatus)}`);
+  }
+  await popup.locator("details.glossary").evaluate((element) => {
+    element.setAttribute("open", "");
+  });
+  await popup.locator("#glossary-source").fill("OngeulSmokeTerm");
+  await popup.locator("#glossary-target").fill("온글검증용어");
+  await popup.locator("#glossary-add").click();
+  await popup.waitForFunction(async () => {
+    const stored = await chrome.storage.local.get("glossaryEntries");
+    return stored.glossaryEntries?.[0]?.target === "온글검증용어";
+  });
+  await popup.locator(".glossary-entry button").click();
+  await popup.waitForFunction(async () => {
+    const stored = await chrome.storage.local.get("glossaryEntries");
+    return Array.isArray(stored.glossaryEntries) && stored.glossaryEntries.length === 0;
+  });
+  console.log("LOCAL_GLOSSARY_STORAGE=PASS");
+
+  await popup.locator("#youtube-translation-mode").selectOption("context");
+  await popup.waitForFunction(async () =>
+    (await chrome.storage.sync.get("youtubeTranslationMode")).youtubeTranslationMode === "context"
+  );
+  await popup.locator("#youtube-translation-mode").selectOption("speed");
+  await popup.waitForFunction(async () =>
+    (await chrome.storage.sync.get("youtubeTranslationMode")).youtubeTranslationMode === "speed"
+  );
+  await popup.locator("#page-display-mode").selectOption("translation");
+  await popup.waitForFunction(async () => {
+    const settings = await chrome.storage.sync.get("pageDisplayMode");
+    return settings.pageDisplayMode === "translation";
+  });
+  await popup.locator("#page-display-mode").selectOption("bilingual");
+  await popup.waitForFunction(async () =>
+    (await chrome.storage.sync.get("pageDisplayMode")).pageDisplayMode === "bilingual"
+  );
+  console.log("VNEXT_SETTINGS_PERSISTENCE=PASS");
+
   await popup.locator("#youtube-enabled").check({ force: true });
   await popup.locator("#auto-captions").check();
   await popup.waitForFunction(async () => {
@@ -107,7 +173,7 @@ try {
       "youtubeEnabled",
       "autoEnableCaptions"
     ]);
-    return settings.privacyConsentVersion === 3 &&
+    return settings.privacyConsentVersion === 4 &&
       settings.youtubeEnabled === true &&
       settings.autoEnableCaptions === true;
   });
@@ -230,6 +296,20 @@ try {
       );
     }
     console.log("POPUP_DUPLICATE_TRANSLATION_GUARD=PASS");
+
+    const recoveredWorkspace = await context.newPage();
+    await recoveredWorkspace.goto(`chrome-extension://${extensionId}/sidepanel.html`);
+    await recoveredWorkspace.locator("#result-text")
+      .filter({ hasText: "브라우저 로컬 번역" }).waitFor();
+    await recoveredWorkspace.locator("#translation-clear-button").click();
+    await recoveredWorkspace.waitForFunction(async () =>
+      await chrome.runtime.sendMessage({
+        target: "background",
+        type: "GET_TRANSLATION_JOB"
+      }) === null
+    );
+    await recoveredWorkspace.close();
+    console.log("TRANSLATION_JOB_RECOVERY_CLEAR=PASS");
   }
 
   if (withModel) {
@@ -749,7 +829,9 @@ try {
   const started = await popup.evaluate(async () =>
     chrome.runtime.sendMessage({
       target: "background",
-      type: "START_PAGE_TRANSLATION"
+      type: "START_PAGE_TRANSLATION",
+      continuous: true,
+      displayMode: "bilingual"
     })
   );
   if (withModel && (!started || started.total < 1)) {
@@ -950,6 +1032,48 @@ try {
     ) {
       throw new Error("페이지 번역이 원래 동작 버튼 내부를 변경했습니다.");
     }
+
+    await popup.evaluate(async () =>
+      chrome.runtime.sendMessage({
+        target: "background",
+        type: "SET_PAGE_DISPLAY_MODE",
+        displayMode: "translation"
+      })
+    );
+    const hiddenOriginalDisplay = await webPage.locator(
+      "#custom-copy > [data-ongeul-page-original]"
+    ).evaluate((element) => getComputedStyle(element).display);
+    if (hiddenOriginalDisplay !== "none") {
+      throw new Error(`한국어만 표시 모드가 원문을 숨기지 못했습니다: ${hiddenOriginalDisplay}`);
+    }
+    await popup.evaluate(async () =>
+      chrome.runtime.sendMessage({
+        target: "background",
+        type: "SET_PAGE_DISPLAY_MODE",
+        displayMode: "bilingual"
+      })
+    );
+    const bilingualOriginalDisplay = await webPage.locator(
+      "#custom-copy > [data-ongeul-page-original]"
+    ).evaluate((element) => getComputedStyle(element).display);
+    if (bilingualOriginalDisplay === "none") {
+      throw new Error("원문+한국어 표시 모드가 원문을 복원하지 못했습니다.");
+    }
+    console.log("PAGE_DISPLAY_MODES=PASS");
+
+    await webPage.evaluate(() => {
+      const paragraph = document.createElement("p");
+      paragraph.id = "continuous-copy";
+      paragraph.textContent = "A newly appended visible paragraph continues the local page translation.";
+      document.querySelector("main")?.append(paragraph);
+      window.scrollTo(0, document.body.scrollHeight);
+    });
+    const continuousTranslationHost = webPage.locator(
+      "#continuous-copy > [data-ongeul-page-translation]"
+    );
+    await continuousTranslationHost.waitFor({ state: "attached", timeout: 120_000 });
+    console.log("PAGE_CONTINUOUS_TRANSLATION=PASS");
+
     const stoppedForBudget = await popup.evaluate(async () =>
       chrome.runtime.sendMessage({
         target: "background",

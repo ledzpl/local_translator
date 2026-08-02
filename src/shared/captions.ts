@@ -31,9 +31,19 @@ export function captionStillMatches(current: string, translatedSource: string): 
 
 export function captionTranslationKey(
   text: string,
-  settings: Pick<ExtensionSettings, "modelPreference" | "devicePreference">
+  settings: Pick<
+    ExtensionSettings,
+    "modelPreference" | "devicePreference" | "youtubeTranslationMode"
+  >,
+  context = ""
 ): string {
-  return `${settings.modelPreference}\u0000${settings.devicePreference}\u0000${text}`;
+  return [
+    settings.modelPreference,
+    settings.devicePreference,
+    settings.youtubeTranslationMode,
+    context,
+    text
+  ].join("\u0000");
 }
 
 export function shouldRequestPendingCaption(options: {

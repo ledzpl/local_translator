@@ -10,6 +10,7 @@ const dist = join(root, "dist");
 const required = [
   "manifest.json",
   "popup.html",
+  "sidepanel.html",
   "offscreen.html",
   "privacy.html",
   "privacy.css",
@@ -61,6 +62,9 @@ if (manifest.version !== packageJson.version) {
 if (!manifest.permissions.includes("offscreen")) throw new Error("offscreen 권한이 없습니다.");
 if (!manifest.permissions.includes("unlimitedStorage")) {
   throw new Error("대용량 로컬 모델 캐시를 위한 unlimitedStorage 권한이 없습니다.");
+}
+if (!manifest.permissions.includes("sidePanel") || manifest.side_panel?.default_path !== "sidepanel.html") {
+  throw new Error("지속형 번역 작업공간을 위한 sidePanel 설정이 없습니다.");
 }
 if (!manifest.content_security_policy.extension_pages.includes("'wasm-unsafe-eval'")) {
   throw new Error("WASM CSP가 없습니다.");
@@ -229,11 +233,11 @@ async function walkFiles(directory) {
 function isAllowedReleaseFile(file) {
   return [
     /^manifest\.json$/u,
-    /^(?:popup|offscreen)\.html$/u,
+    /^(?:popup|sidepanel|offscreen)\.html$/u,
     /^privacy\.(?:html|css)$/u,
     /^(?:background|content)\.js$/u,
     /^(?:PRIVACY_POLICY|THIRD_PARTY_NOTICES)\.md$/u,
-    /^assets\/(?:popup|offscreen|tts)-[A-Za-z0-9_-]+\.(?:js|css)$/u,
+    /^assets\/(?:popup|sidepanel|offscreen|tts|glossary|privacy|protocol)-[A-Za-z0-9_-]+\.(?:js|css)$/u,
     /^icons\/icon-(?:16|32|48|128)\.png$/u,
     /^wasm\/ort-wasm-simd-threaded\.(?:jsep|asyncify)\.(?:mjs|wasm)$/u,
     /^LICENSES\/[A-Za-z0-9_.-]+\.txt$/u

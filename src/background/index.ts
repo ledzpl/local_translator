@@ -10,14 +10,22 @@ import {
   type DevicePreference,
   type EngineStatus,
   type ExtensionSettings,
+  type ModelCacheStatus,
   type OffscreenMessage,
+  type PageDisplayMode,
   type PageTranslationStatus,
   type SpeakResponse,
   type TtsStatus,
   type TranslationOrigin,
+  type TranslationJobState,
   type TranslationResponse,
+  type UiTranslationJobMessage,
   type UiTtsProgressMessage
 } from "../shared/protocol";
+import {
+  GLOSSARY_STORAGE_KEY,
+  normalizeGlossaryEntries
+} from "../shared/glossary";
 import {
   containsMostlyKorean,
   normalizeLanguageCode,
@@ -42,6 +50,8 @@ const translationRequests = new SerialTaskQueue();
 const speechStarts = new Map<string, Promise<SpeakResponse>>();
 let latestSpeechStartId: string | null = null;
 const WEBGPU_FALLBACK_REASON_KEY = "runtimeWebGpuFallbackReason";
+const TRANSLATION_JOB_KEY = "activeTranslationJob";
+const cancelledTranslationRequests = new Set<string>();
 
 chrome.runtime.onInstalled.addListener(() => {
   void chrome.contextMenus.removeAll().then(() => {
@@ -89,8 +99,16 @@ chrome.runtime.onMessage.addListener(
 
     void handleBackgroundMessage(message)
       .then(sendResponse)
-      .catch((error) => {
-        sendResponse(createBackgroundErrorResponse(message, error));
+      .catch(async (error) => {
+        const response = createBackgroundErrorResponse(message, error);
+        if (message.type === "TRANSLATE" && message.origin === "popup") {
+          cancelledTranslationRequests.delete(message.requestId);
+          await completeTranslationJob(
+            message.requestId,
+            response as TranslationResponse
+          ).catch(() => undefined);
+        }
+        sendResponse(response);
       });
     return true;
   }
@@ -124,8 +142,31 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
         return consentRequiredTranslation(message.requestId);
       }
       const sourceLanguage = await resolveSourceLanguage(text, message.sourceLanguage);
+      if (message.origin === "popup") {
+        cancelledTranslationRequests.delete(message.requestId);
+        const existingJob = await getTranslationJob();
+        if (existingJob?.state === "running" && existingJob.requestId !== message.requestId) {
+          return {
+            ok: false,
+            requestId: message.requestId,
+            code: "TRANSLATION_FAILED",
+            error: "이미 진행 중인 번역이 있습니다. 작업공간에서 완료하거나 취소해 주세요."
+          } satisfies TranslationResponse;
+        }
+        await setTranslationJob({
+          requestId: message.requestId,
+          state: "running",
+          text,
+          sourceLanguage,
+          startedAt: Date.now(),
+          updatedAt: Date.now()
+        });
+      }
+      const glossaryValue = await chrome.storage.local.get(GLOSSARY_STORAGE_KEY);
+      const glossary = normalizeGlossaryEntries(glossaryValue[GLOSSARY_STORAGE_KEY]);
+      let response: TranslationResponse;
       if (sourceLanguage === "ko") {
-        return {
+        response = {
           ok: true,
           requestId: message.requestId,
           translation: text,
@@ -133,20 +174,35 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
           device: "none",
           elapsedMs: 0
         } satisfies TranslationResponse;
-      }
-
-      return translationRequests.run(() =>
-        translateWithDeviceRecovery({
+      } else {
+        response = await translationRequests.run(() =>
+          translateWithDeviceRecovery({
           target: "offscreen",
           type: "TRANSLATE_OFFSCREEN",
           requestId: message.requestId,
           text,
           sourceLanguage,
+          context: message.context,
+          glossary,
           modelPreference: settings.modelPreference,
           devicePreference: settings.devicePreference,
           origin: message.origin
         })
-      );
+        );
+      }
+      if (message.origin === "popup") {
+        const completed = await completeTranslationJob(message.requestId, response);
+        cancelledTranslationRequests.delete(message.requestId);
+        if (!completed) {
+          return {
+            ok: false,
+            requestId: message.requestId,
+            code: "TRANSLATION_CANCELLED",
+            error: "번역을 취소했습니다."
+          } satisfies TranslationResponse;
+        }
+      }
+      return response;
     }
     case "GET_ACTIVE_SELECTION": {
       if (!hasPrivacyConsent(await getSettings())) return { text: "" };
@@ -173,22 +229,112 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
           total: 0,
           completed: 0,
           failed: 0,
-          error: "팝업에서 데이터 처리 안내를 확인한 뒤 사용할 수 있습니다."
+          error: "사이드 패널에서 데이터 처리 안내를 확인한 뒤 사용할 수 있습니다."
         } satisfies PageTranslationStatus;
       }
-      return sendPageCommand("START_PAGE_TRANSLATION");
+      return sendPageCommand({
+        type: "START_PAGE_TRANSLATION",
+        continuous: message.continuous,
+        displayMode: message.displayMode
+      });
     case "GET_PAGE_TRANSLATION_STATUS":
-      return sendPageCommand("GET_PAGE_TRANSLATION_STATUS");
+      return sendPageCommand({ type: "GET_PAGE_TRANSLATION_STATUS" });
     case "STOP_PAGE_TRANSLATION":
-      return sendPageCommand("STOP_PAGE_TRANSLATION");
+      return sendPageCommand({ type: "STOP_PAGE_TRANSLATION" });
     case "RESTORE_PAGE_TRANSLATION":
-      return sendPageCommand("RESTORE_PAGE_TRANSLATION");
+      return sendPageCommand({ type: "RESTORE_PAGE_TRANSLATION" });
+    case "SET_PAGE_DISPLAY_MODE":
+      return sendPageCommand({
+        type: "SET_PAGE_DISPLAY_MODE",
+        displayMode: message.displayMode
+      });
+    case "GET_TRANSLATION_JOB":
+      return getTranslationJob();
+    case "CANCEL_TRANSLATION_JOB": {
+      const job = await getTranslationJob();
+      if (job?.requestId !== message.requestId || job.state !== "running") return job;
+      cancelledTranslationRequests.add(message.requestId);
+      const cancelled: TranslationJobState = {
+        ...job,
+        state: "cancelled",
+        updatedAt: Date.now(),
+        response: {
+          ok: false,
+          requestId: job.requestId,
+          code: "TRANSLATION_CANCELLED",
+          error: "번역을 취소했습니다."
+        }
+      };
+      await setTranslationJob(cancelled);
+      await sendToExistingOffscreen({
+        target: "offscreen",
+        type: "CANCEL_TRANSLATION_OFFSCREEN",
+        requestId: message.requestId
+      }).catch(() => undefined);
+      return cancelled;
+    }
+    case "CLEAR_TRANSLATION_JOB":
+      await chrome.storage.session.remove(TRANSLATION_JOB_KEY);
+      broadcastTranslationJob(null);
+      return null;
+    case "PREPARE_MODEL": {
+      const settings = await getSettings();
+      if (!hasPrivacyConsent(settings)) {
+        return {
+          state: "error",
+          modelId: MODEL_ID,
+          error: "사이드 패널에서 데이터 처리 안내를 확인한 뒤 모델을 준비할 수 있습니다."
+        } satisfies EngineStatus;
+      }
+      const prepared = await sendToOffscreen({
+        target: "offscreen",
+        type: "PREPARE_MODEL_OFFSCREEN",
+        modelPreference: settings.modelPreference,
+        devicePreference: settings.devicePreference
+      }) as EngineStatus;
+      if (
+        settings.modelPreference === "translategemma" &&
+        settings.devicePreference !== "wasm" &&
+        prepared.state === "error" &&
+        prepared.fallbackFromDevice === "webgpu"
+      ) {
+        const fallbackReason = prepared.error ??
+          "TranslateGemma WebGPU를 준비하지 못해 M2M100 WASM으로 전환합니다.";
+        await recreateOffscreenDocumentForWasm(fallbackReason);
+        return sendToOffscreen({
+          target: "offscreen",
+          type: "PREPARE_MODEL_OFFSCREEN",
+          modelPreference: settings.modelPreference,
+          devicePreference: settings.devicePreference,
+          runtimeDeviceOverride: "wasm",
+          fallbackFromDevice: "webgpu",
+          deviceFallbackReason: fallbackReason
+        });
+      }
+      return prepared;
+    }
+    case "GET_MODEL_CACHE_STATUS":
+      return sendToOffscreen({
+        target: "offscreen",
+        type: "GET_MODEL_CACHE_STATUS_OFFSCREEN"
+      });
+    case "CLEAR_MODEL_CACHE":
+      return sendToOffscreen({
+        target: "offscreen",
+        type: "CLEAR_MODEL_CACHE_OFFSCREEN",
+        modelPreference: message.modelPreference,
+        includeTts: message.includeTts,
+        includeTranslation: message.includeTranslation
+      });
     case "GET_ENGINE_STATUS":
       try {
-        return await sendToOffscreen({
+        return await sendToExistingOffscreen({
           target: "offscreen",
           type: "GET_ENGINE_STATUS_OFFSCREEN"
-        });
+        }) ?? {
+          state: "idle",
+          modelId: MODEL_ID
+        } satisfies EngineStatus;
       } catch {
         return {
           state: "idle",
@@ -294,6 +440,8 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
 async function translateWithDeviceRecovery(
   request: Extract<OffscreenMessage, { type: "TRANSLATE_OFFSCREEN" }>
 ): Promise<TranslationResponse> {
+  const shouldSend = () => !cancelledTranslationRequests.has(request.requestId);
+  if (!shouldSend()) return backgroundCancelledTranslation(request.requestId);
   const storedFallbackReason = await getStoredWebGpuFallbackReason();
   if (storedFallbackReason && !wasmFallbackOffscreenReady) {
     await prepareStoredWasmFallbackDocument();
@@ -310,7 +458,11 @@ async function translateWithDeviceRecovery(
       : request;
 
   try {
-    const response = await sendToOffscreen(firstRequest) as TranslationResponse;
+    const firstResponse = await sendToOffscreen(firstRequest, shouldSend);
+    if (firstResponse === null) {
+      return backgroundCancelledTranslation(request.requestId);
+    }
+    const response = firstResponse as TranslationResponse;
     if (
       !isDeviceFallbackRequired(response) ||
       request.devicePreference === "wasm"
@@ -319,25 +471,41 @@ async function translateWithDeviceRecovery(
     }
 
     await recreateOffscreenDocumentForWasm(response.error);
-    return sendToOffscreen({
+    const fallbackResponse = await sendToOffscreen({
       ...request,
       runtimeDeviceOverride: "wasm",
       fallbackFromDevice: "webgpu",
       deviceFallbackReason: response.error
-    }) as Promise<TranslationResponse>;
+    }, shouldSend);
+    return fallbackResponse === null
+      ? backgroundCancelledTranslation(request.requestId)
+      : fallbackResponse as TranslationResponse;
   } catch (error) {
+    if (!shouldSend()) return backgroundCancelledTranslation(request.requestId);
     const recoveryReason = await getStoredWebGpuFallbackReason();
     if (!recoveryReason || request.devicePreference === "wasm") throw error;
     if (!wasmFallbackOffscreenReady) {
       await recreateOffscreenDocumentForWasm();
     }
-    return sendToOffscreen({
+    const recoveryResponse = await sendToOffscreen({
       ...request,
       runtimeDeviceOverride: "wasm",
       fallbackFromDevice: "webgpu",
       deviceFallbackReason: recoveryReason
-    }) as Promise<TranslationResponse>;
+    }, shouldSend);
+    return recoveryResponse === null
+      ? backgroundCancelledTranslation(request.requestId)
+      : recoveryResponse as TranslationResponse;
   }
+}
+
+function backgroundCancelledTranslation(requestId: string): TranslationResponse {
+  return {
+    ok: false,
+    requestId,
+    code: "TRANSLATION_CANCELLED",
+    error: "번역을 취소했습니다."
+  };
 }
 
 function isDeviceFallbackRequired(
@@ -386,7 +554,7 @@ async function startKoreanSpeech(
     return {
       ok: false,
       speechId: message.speechId,
-      error: "팝업에서 데이터 처리 안내를 확인한 뒤 사용할 수 있습니다."
+      error: "사이드 패널에서 데이터 처리 안내를 확인한 뒤 사용할 수 있습니다."
     };
   }
   const text = normalizeText(message.text);
@@ -450,7 +618,7 @@ function consentRequiredTranslation(requestId: string): TranslationResponse {
     ok: false,
     requestId,
     code: "CONSENT_REQUIRED",
-    error: "팝업에서 데이터 처리 안내를 확인한 뒤 번역할 수 있습니다."
+    error: "사이드 패널에서 데이터 처리 안내를 확인한 뒤 번역할 수 있습니다."
   };
 }
 
@@ -514,6 +682,7 @@ function createBackgroundErrorResponse(
     case "GET_PAGE_TRANSLATION_STATUS":
     case "STOP_PAGE_TRANSLATION":
     case "RESTORE_PAGE_TRANSLATION":
+    case "SET_PAGE_DISPLAY_MODE":
       return {
         state: "error",
         total: 0,
@@ -523,6 +692,7 @@ function createBackgroundErrorResponse(
       } satisfies PageTranslationStatus;
     case "GET_ENGINE_STATUS":
     case "RESET_ENGINE":
+    case "PREPARE_MODEL":
       return {
         state: "error",
         modelId: MODEL_ID,
@@ -536,15 +706,23 @@ function createBackgroundErrorResponse(
       } satisfies TtsStatus;
     case "GET_ACTIVE_SELECTION":
       return { text: "" };
+    case "GET_TRANSLATION_JOB":
+    case "CANCEL_TRANSLATION_JOB":
+    case "CLEAR_TRANSLATION_JOB":
+      return null;
+    case "GET_MODEL_CACHE_STATUS":
+    case "CLEAR_MODEL_CACHE":
+      return { cachedModelIds: [], ttsCached: false } satisfies ModelCacheStatus;
   }
 }
 
 async function sendPageCommand(
-  type:
-    | "START_PAGE_TRANSLATION"
-    | "GET_PAGE_TRANSLATION_STATUS"
-    | "STOP_PAGE_TRANSLATION"
-    | "RESTORE_PAGE_TRANSLATION"
+  command:
+    | Extract<ContentMessage, { type: "START_PAGE_TRANSLATION" }>
+    | Extract<ContentMessage, { type: "GET_PAGE_TRANSLATION_STATUS" }>
+    | Extract<ContentMessage, { type: "STOP_PAGE_TRANSLATION" }>
+    | Extract<ContentMessage, { type: "RESTORE_PAGE_TRANSLATION" }>
+    | Extract<ContentMessage, { type: "SET_PAGE_DISPLAY_MODE" }>
 ): Promise<PageTranslationStatus> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) {
@@ -561,7 +739,7 @@ async function sendPageCommand(
     await ensureContentScript(tab.id);
     const response = await chrome.tabs.sendMessage(
       tab.id,
-      { type } satisfies ContentMessage
+      command
     ) as PageTranslationStatus | undefined;
     if (!response?.state) throw new Error("페이지 번역 상태 응답이 없습니다.");
     return response;
@@ -574,6 +752,40 @@ async function sendPageCommand(
       error: "이 페이지에서는 번역 결과를 표시할 수 없습니다."
     };
   }
+}
+
+async function getTranslationJob(): Promise<TranslationJobState | null> {
+  const stored = await chrome.storage.session.get(TRANSLATION_JOB_KEY);
+  const value = stored[TRANSLATION_JOB_KEY];
+  return value && typeof value === "object" ? value as TranslationJobState : null;
+}
+
+async function setTranslationJob(job: TranslationJobState): Promise<void> {
+  await chrome.storage.session.set({ [TRANSLATION_JOB_KEY]: job });
+  broadcastTranslationJob(job);
+}
+
+async function completeTranslationJob(
+  requestId: string,
+  response: TranslationResponse
+): Promise<boolean> {
+  const current = await getTranslationJob();
+  if (current?.requestId !== requestId || current.state !== "running") return false;
+  await setTranslationJob({
+    ...current,
+    state: response.ok ? "complete" : "error",
+    response,
+    updatedAt: Date.now()
+  });
+  return true;
+}
+
+function broadcastTranslationJob(job: TranslationJobState | null): void {
+  void chrome.runtime.sendMessage({
+    target: "ui",
+    type: "TRANSLATION_JOB_UPDATED",
+    job
+  } satisfies UiTranslationJobMessage).catch(() => undefined);
 }
 
 async function resolveSourceLanguage(text: string, requested?: string): Promise<string> {
@@ -593,7 +805,10 @@ async function ensureOffscreenDocument(): Promise<void> {
     contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT],
     documentUrls: [url]
   });
-  if (existing.length > 0) return;
+  if (existing.length > 0) {
+    await waitForOffscreenReady();
+    return;
+  }
 
   if (!creatingOffscreen) {
     creatingOffscreen = chrome.offscreen.createDocument({
@@ -609,6 +824,23 @@ async function ensureOffscreenDocument(): Promise<void> {
     });
   }
   await creatingOffscreen;
+  await waitForOffscreenReady();
+}
+
+async function waitForOffscreenReady(): Promise<void> {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      const response = await chrome.runtime.sendMessage({
+        target: "offscreen",
+        type: "PING_OFFSCREEN"
+      } satisfies OffscreenMessage);
+      if (response?.ok === true) return;
+    } catch {
+      // The document exists before its module listener is ready on some starts.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)));
+  }
+  throw new Error("로컬 번역 엔진 문서가 준비되지 않았습니다.");
 }
 
 async function prepareStoredWasmFallbackDocument(): Promise<void> {

@@ -1,17 +1,22 @@
 {
   "schemaVersion": 1,
   "extensionVersion": "0.1.0",
-  "uiSourceSha256": "02929c6f5c83be74ac9b0ea25a92c80d5ad5d60268dbdf8190c9dc8bb5353468",
+  "uiSourceSha256": "da2330be07af906eb8beb505d1652d90b021ca6dc74a439d95c707b12bf4196e",
   "assets": {
     "screenshot-privacy-1280x800.png": {
       "width": 1280,
       "height": 800,
-      "sha256": "37d5d54d5602e386d7b76cc4926bfb6bf60902f2ec314728a8a83d76d38fc4fd"
+      "sha256": "2b5961c3016a76fc72504d8582bff996c2f7d66b30360a0d8e21592a5a8d4f5c"
     },
     "screenshot-translator-1280x800.png": {
       "width": 1280,
       "height": 800,
-      "sha256": "3b85cd289ddd1d10a492be748a8bdf5ea94db6e028252886f29e73d28d69f90f"
+      "sha256": "bd9f4a0d7bca882fdd917dfb0699d6903798e65892a4eaa842bca9f2bbf6e0f5"
+    },
+    "screenshot-workspace-1280x800.png": {
+      "width": 1280,
+      "height": 800,
+      "sha256": "a4d43b2bd59e7760933a75e8bdc8b5a95fb49df331fc08d010f559ce3ae4280b"
     },
     "promo-small-440x280.png": {
       "width": 440,

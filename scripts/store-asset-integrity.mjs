@@ -5,6 +5,7 @@ import { join } from "node:path";
 export const STORE_ASSET_SPECS = {
   "screenshot-privacy-1280x800.png": { width: 1280, height: 800 },
   "screenshot-translator-1280x800.png": { width: 1280, height: 800 },
+  "screenshot-workspace-1280x800.png": { width: 1280, height: 800 },
   "promo-small-440x280.png": { width: 440, height: 280 }
 };
 
@@ -60,6 +61,7 @@ async function computeUiSourceHash(dist) {
   const files = [
     "manifest.json",
     "popup.html",
+    "sidepanel.html",
     "privacy.html",
     "privacy.css",
     "background.js",

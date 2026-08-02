@@ -57,13 +57,25 @@ describe("YouTube caption helpers", () => {
     const text = "A visible caption";
     const wasm = captionTranslationKey(text, {
       modelPreference: "small100",
-      devicePreference: "wasm"
+      devicePreference: "wasm",
+      youtubeTranslationMode: "speed"
     });
     const webgpu = captionTranslationKey(text, {
       modelPreference: "m2m100",
-      devicePreference: "webgpu"
+      devicePreference: "webgpu",
+      youtubeTranslationMode: "context"
     });
     expect(wasm).not.toBe(webgpu);
+  });
+
+  it("separates the same caption by preceding context", () => {
+    const settings = {
+      modelPreference: "m2m100" as const,
+      devicePreference: "wasm" as const,
+      youtubeTranslationMode: "context" as const
+    };
+    expect(captionTranslationKey("It works", settings, "The browser is ready"))
+      .not.toBe(captionTranslationKey("It works", settings, "The model is ready"));
   });
 
   it("requeues the same visible caption when settings changed in flight", () => {

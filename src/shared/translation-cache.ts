@@ -7,12 +7,16 @@ export function createTranslationCacheKey(
   modelPreference: ModelPreference,
   devicePreference: DevicePreference,
   sourceLanguage: string,
-  text: string
+  text: string,
+  context = "",
+  glossarySignature = ""
 ): string {
   return [
     modelPreference,
     devicePreference,
     sourceLanguage,
-    text
+    text,
+    context,
+    glossarySignature
   ].join("\u0000");
 }
