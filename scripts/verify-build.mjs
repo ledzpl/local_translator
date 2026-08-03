@@ -237,7 +237,7 @@ function isAllowedReleaseFile(file) {
     /^privacy\.(?:html|css)$/u,
     /^(?:background|content)\.js$/u,
     /^(?:PRIVACY_POLICY|THIRD_PARTY_NOTICES)\.md$/u,
-    /^assets\/(?:popup|sidepanel|offscreen|tts|glossary|privacy|protocol)-[A-Za-z0-9_-]+\.(?:js|css)$/u,
+    /^assets\/(?:popup|sidepanel|offscreen|tts|glossary|privacy|protocol|settings|languages)-[A-Za-z0-9_-]+\.(?:js|css)$/u,
     /^icons\/icon-(?:16|32|48|128)\.png$/u,
     /^wasm\/ort-wasm-simd-threaded\.(?:jsep|asyncify)\.(?:mjs|wasm)$/u,
     /^LICENSES\/[A-Za-z0-9_.-]+\.txt$/u

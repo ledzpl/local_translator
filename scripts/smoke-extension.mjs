@@ -936,6 +936,53 @@ try {
   await popup.locator("#product-ui").waitFor({ state: "visible" });
   console.log("REMOVED_SYNC_SETTINGS_DEFAULT_GUARD=PASS");
 
+  await popup.evaluate(async () => {
+    await chrome.storage.sync.set({
+      youtubeEnabled: "yes",
+      subtitleSize: 500,
+      youtubeTranslationMode: "slow",
+      pageDisplayMode: "replace",
+      sourceLanguage: "xx",
+      modelPreference: "removed-model",
+      devicePreference: "cpu"
+    });
+  });
+  await popup.waitForFunction(() => {
+    const value = (selector) => document.querySelector(selector)?.value;
+    const checked = document.querySelector("#youtube-enabled")?.checked;
+    return checked === false &&
+      value("#subtitle-size") === "42" &&
+      value("#youtube-translation-mode") === "speed" &&
+      value("#page-display-mode") === "bilingual" &&
+      value("#source-language") === "auto" &&
+      value("#model-preference") === "translategemma" &&
+      value("#device-preference") === "webgpu";
+  });
+  await popup.evaluate(async ({ modelPreference, devicePreference }) => {
+    await chrome.storage.sync.set({
+      youtubeEnabled: true,
+      subtitleSize: 28,
+      youtubeTranslationMode: "speed",
+      pageDisplayMode: "bilingual",
+      sourceLanguage: "auto",
+      modelPreference,
+      devicePreference
+    });
+  }, {
+    modelPreference: requestedModel,
+    devicePreference: requestedDevice
+  });
+  await popup.waitForFunction(
+    ({ modelPreference, devicePreference }) =>
+      document.querySelector("#model-preference")?.value === modelPreference &&
+      document.querySelector("#device-preference")?.value === devicePreference,
+    {
+      modelPreference: requestedModel,
+      devicePreference: requestedDevice
+    }
+  );
+  console.log("MALFORMED_SYNC_SETTINGS_GUARD=PASS");
+
   let pageTranslation;
   const webPage = await context.newPage();
   webPage.on("console", (message) => {

@@ -41,6 +41,10 @@ import {
   shouldLockModelControls
 } from "../shared/popup-state";
 import { RevisionedCommitter } from "../shared/revisioned-committer";
+import {
+  normalizeExtensionSettings,
+  normalizeExtensionSettingValue
+} from "../shared/settings";
 import { isSpeechStatusFor } from "../shared/tts";
 import {
   GLOSSARY_STORAGE_KEY,
@@ -583,7 +587,11 @@ async function synchronizeExternalPrivacyConsent(): Promise<void> {
 async function readStableSettings(): Promise<ExtensionSettings> {
   while (true) {
     const revisionAtRequest = settingsRevision;
-    const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS) as ExtensionSettings;
+    const settings = normalizeExtensionSettings(
+      await chrome.storage.sync.get(
+        DEFAULT_SETTINGS as unknown as Record<string, unknown>
+      )
+    );
     if (shouldApplyRuntimeSnapshot(revisionAtRequest, settingsRevision)) {
       return settings;
     }
@@ -1342,58 +1350,70 @@ function applyExternalSettingChanges(
   changes: Record<string, chrome.storage.StorageChange>
 ): void {
   if (changes.youtubeEnabled) {
-    elements.youtubeEnabled.checked = Boolean(
-      changes.youtubeEnabled.newValue ?? DEFAULT_SETTINGS.youtubeEnabled
+    elements.youtubeEnabled.checked = normalizeExtensionSettingValue(
+      "youtubeEnabled",
+      changes.youtubeEnabled.newValue
     );
   }
   if (changes.autoEnableCaptions) {
-    elements.autoCaptions.checked = Boolean(
-      changes.autoEnableCaptions.newValue ?? DEFAULT_SETTINGS.autoEnableCaptions
+    elements.autoCaptions.checked = normalizeExtensionSettingValue(
+      "autoEnableCaptions",
+      changes.autoEnableCaptions.newValue
     );
   }
   if (changes.showOriginalCaptions) {
-    elements.showOriginal.checked = Boolean(
-      changes.showOriginalCaptions.newValue ?? DEFAULT_SETTINGS.showOriginalCaptions
+    elements.showOriginal.checked = normalizeExtensionSettingValue(
+      "showOriginalCaptions",
+      changes.showOriginalCaptions.newValue
     );
   }
   // A sync notification from an earlier range commit can arrive after the
   // user has already dragged to a newer value. Keep the local in-progress
   // edit authoritative until its own commit/flush finishes.
   if (changes.subtitleSize && !subtitleSizeCommitter.isDirty()) {
-    const value = Number(changes.subtitleSize.newValue ?? DEFAULT_SETTINGS.subtitleSize);
+    const value = normalizeExtensionSettingValue(
+      "subtitleSize",
+      changes.subtitleSize.newValue
+    );
     elements.subtitleSize.value = String(value);
     elements.subtitleSizeValue.textContent = `${value}px`;
   }
   if (changes.youtubeTranslationMode) {
-    elements.youtubeTranslationMode.value = String(
-      changes.youtubeTranslationMode.newValue ?? DEFAULT_SETTINGS.youtubeTranslationMode
+    elements.youtubeTranslationMode.value = normalizeExtensionSettingValue(
+      "youtubeTranslationMode",
+      changes.youtubeTranslationMode.newValue
     );
   }
   if (changes.pageContinuous) {
-    elements.pageContinuous.checked = Boolean(
-      changes.pageContinuous.newValue ?? DEFAULT_SETTINGS.pageContinuous
+    elements.pageContinuous.checked = normalizeExtensionSettingValue(
+      "pageContinuous",
+      changes.pageContinuous.newValue
     );
   }
   if (changes.pageDisplayMode) {
-    elements.pageDisplayMode.value = String(
-      changes.pageDisplayMode.newValue ?? DEFAULT_SETTINGS.pageDisplayMode
+    elements.pageDisplayMode.value = normalizeExtensionSettingValue(
+      "pageDisplayMode",
+      changes.pageDisplayMode.newValue
     );
   }
   if (changes.sourceLanguage) {
-    elements.sourceLanguage.value = String(
-      changes.sourceLanguage.newValue ?? DEFAULT_SETTINGS.sourceLanguage
+    elements.sourceLanguage.value = normalizeExtensionSettingValue(
+      "sourceLanguage",
+      changes.sourceLanguage.newValue
     );
   }
   if (changes.modelPreference) {
-    persistedModelPreference = String(
-      changes.modelPreference.newValue ?? DEFAULT_SETTINGS.modelPreference
-    ) as ModelPreference;
+    persistedModelPreference = normalizeExtensionSettingValue(
+      "modelPreference",
+      changes.modelPreference.newValue
+    );
     elements.modelPreference.value = persistedModelPreference;
   }
   if (changes.devicePreference) {
-    persistedDevicePreference = String(
-      changes.devicePreference.newValue ?? DEFAULT_SETTINGS.devicePreference
-    ) as DevicePreference;
+    persistedDevicePreference = normalizeExtensionSettingValue(
+      "devicePreference",
+      changes.devicePreference.newValue
+    );
     elements.devicePreference.value = persistedDevicePreference;
   }
   if (changes.modelPreference || changes.devicePreference) {

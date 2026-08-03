@@ -32,7 +32,11 @@ import { normalizeText } from "../shared/text";
 import { isSpeechStatusFor } from "../shared/tts";
 import { createCaptionContext } from "../shared/translation-context";
 import { GLOSSARY_STORAGE_KEY } from "../shared/glossary";
-import { applyExtensionSettingChanges } from "../shared/settings";
+import {
+  applyExtensionSettingChanges,
+  normalizeExtensionSettings,
+  normalizeExtensionSettingValue
+} from "../shared/settings";
 
 declare global {
   interface Window {
@@ -113,8 +117,10 @@ function initialize(): void {
     }
     if (area === "sync" && changes.pageDisplayMode) {
       pageTranslator.setDisplayMode(
-        (changes.pageDisplayMode.newValue ??
-          DEFAULT_SETTINGS.pageDisplayMode) as PageDisplayMode
+        normalizeExtensionSettingValue(
+          "pageDisplayMode",
+          changes.pageDisplayMode.newValue
+        )
       );
     }
   });
@@ -1190,9 +1196,11 @@ class YouTubeCaptionTranslator {
   private async loadSettings(): Promise<void> {
     while (true) {
       const revisionAtRequest = this.settingsRevision;
-      const settings = await chrome.storage.sync.get(
-        DEFAULT_SETTINGS
-      ) as ExtensionSettings;
+      const settings = normalizeExtensionSettings(
+        await chrome.storage.sync.get(
+          DEFAULT_SETTINGS as unknown as Record<string, unknown>
+        )
+      );
       if (revisionAtRequest !== this.settingsRevision) continue;
       this.settings = settings;
       break;

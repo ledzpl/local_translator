@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_SETTINGS } from "./protocol";
-import { applyExtensionSettingChanges } from "./settings";
+import {
+  applyExtensionSettingChanges,
+  normalizeExtensionSettings
+} from "./settings";
 
 describe("extension setting changes", () => {
   it("applies explicit values without replacing unrelated settings", () => {
@@ -38,6 +41,43 @@ describe("extension setting changes", () => {
       youtubeEnabled: DEFAULT_SETTINGS.youtubeEnabled,
       autoEnableCaptions: DEFAULT_SETTINGS.autoEnableCaptions,
       pageDisplayMode: DEFAULT_SETTINGS.pageDisplayMode
+    });
+  });
+
+  it("repairs malformed sync values before they reach UI and engine code", () => {
+    expect(normalizeExtensionSettings({
+      ...DEFAULT_SETTINGS,
+      privacyConsentVersion: "4",
+      youtubeEnabled: "yes",
+      subtitleSize: 500,
+      youtubeTranslationMode: "slow",
+      pageDisplayMode: "replace",
+      sourceLanguage: "xx",
+      modelPreference: "unknown-model",
+      devicePreference: "cpu"
+    })).toEqual({
+      ...DEFAULT_SETTINGS,
+      subtitleSize: 42
+    });
+  });
+
+  it("normalizes malformed live sync changes without replacing valid settings", () => {
+    const current = {
+      ...DEFAULT_SETTINGS,
+      privacyConsentVersion: 4,
+      youtubeEnabled: true,
+      sourceLanguage: "fr",
+      modelPreference: "m2m100" as const,
+      devicePreference: "wasm" as const
+    };
+
+    expect(applyExtensionSettingChanges(current, {
+      subtitleSize: { newValue: Number.NaN },
+      modelPreference: { newValue: "removed-model" }
+    })).toEqual({
+      ...current,
+      subtitleSize: DEFAULT_SETTINGS.subtitleSize,
+      modelPreference: DEFAULT_SETTINGS.modelPreference
     });
   });
 });

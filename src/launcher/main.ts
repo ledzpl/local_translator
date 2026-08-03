@@ -10,6 +10,10 @@ import {
 } from "../shared/protocol";
 import { hasPrivacyConsent } from "../shared/privacy";
 import { shouldApplyRuntimeSnapshot } from "../shared/popup-state";
+import {
+  applyExtensionSettingChanges,
+  normalizeExtensionSettings
+} from "../shared/settings";
 
 const app = document.querySelector<HTMLElement>("#app");
 if (!app) throw new Error("앱 루트를 찾을 수 없습니다.");
@@ -76,12 +80,7 @@ chrome.runtime.onMessage.addListener((message: UiProgressMessage | UiTranslation
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
   settingsRevision += 1;
-  for (const key of Object.keys(DEFAULT_SETTINGS) as Array<keyof ExtensionSettings>) {
-    if (!changes[key]) continue;
-    Object.assign(settings, {
-      [key]: changes[key].newValue ?? DEFAULT_SETTINGS[key]
-    });
-  }
+  settings = applyExtensionSettingChanges(settings, changes);
   renderStatus();
 });
 
@@ -114,7 +113,7 @@ async function readStableSettings(): Promise<ExtensionSettings> {
       DEFAULT_SETTINGS as unknown as Record<string, unknown>
     );
     if (shouldApplyRuntimeSnapshot(revisionAtRequest, settingsRevision)) {
-      return stored as unknown as ExtensionSettings;
+      return normalizeExtensionSettings(stored);
     }
   }
 }

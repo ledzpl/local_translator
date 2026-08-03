@@ -33,6 +33,7 @@ import {
   pickDetectedLanguage
 } from "../shared/languages";
 import { hasPrivacyConsent } from "../shared/privacy";
+import { normalizeExtensionSettings } from "../shared/settings";
 import { SerialTaskQueue } from "../shared/serial-queue";
 import {
   createTextPreview,
@@ -42,6 +43,10 @@ import {
 } from "../shared/text";
 import { shouldMarkSpeechIdle } from "../shared/tts";
 import { TranslationJobCoordinator } from "../shared/translation-job";
+import {
+  shouldRetryModelPreparationOnWasm,
+  shouldUseStoredWasmFallback
+} from "../shared/translation-recovery";
 
 let creatingOffscreen: Promise<void> | null = null;
 let recoveringOffscreen: Promise<void> | null = null;
@@ -320,20 +325,42 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
           error: "사이드 패널에서 데이터 처리 안내를 확인한 뒤 모델을 준비할 수 있습니다."
         } satisfies EngineStatus;
       }
+      const storedFallbackReason = await getStoredWebGpuFallbackReason();
+      const useStoredFallback = shouldUseStoredWasmFallback({
+        fallbackReason: storedFallbackReason,
+        modelPreference: settings.modelPreference,
+        devicePreference: settings.devicePreference
+      });
+      const fallbackReason = useStoredFallback
+        ? storedFallbackReason ?? undefined
+        : undefined;
+      if (fallbackReason && !wasmFallbackOffscreenReady) {
+        await prepareStoredWasmFallbackDocument();
+      }
       const prepared = await sendToOffscreen({
         target: "offscreen",
         type: "PREPARE_MODEL_OFFSCREEN",
         modelPreference: settings.modelPreference,
-        devicePreference: settings.devicePreference
+        devicePreference: settings.devicePreference,
+        ...(fallbackReason
+          ? {
+              runtimeDeviceOverride: "wasm" as const,
+              fallbackFromDevice: "webgpu" as const,
+              deviceFallbackReason: fallbackReason
+            }
+          : {})
       }) as EngineStatus;
       if (
-        settings.modelPreference === "translategemma" &&
-        settings.devicePreference !== "wasm" &&
-        prepared.state === "error" &&
-        prepared.fallbackFromDevice === "webgpu"
+        !useStoredFallback &&
+        shouldRetryModelPreparationOnWasm({
+          modelPreference: settings.modelPreference,
+          devicePreference: settings.devicePreference,
+          state: prepared.state,
+          fallbackFromDevice: prepared.fallbackFromDevice
+        })
       ) {
         const fallbackReason = prepared.error ??
-          "TranslateGemma WebGPU를 준비하지 못해 M2M100 WASM으로 전환합니다.";
+          "WebGPU 모델을 준비하지 못해 WASM으로 전환합니다.";
         await recreateOffscreenDocumentForWasm(fallbackReason);
         return sendToOffscreen({
           target: "offscreen",
@@ -477,17 +504,25 @@ async function translateWithDeviceRecovery(
   const shouldSend = () => !cancelledTranslationRequests.has(request.requestId);
   if (!shouldSend()) return backgroundCancelledTranslation(request.requestId);
   const storedFallbackReason = await getStoredWebGpuFallbackReason();
-  if (storedFallbackReason && !wasmFallbackOffscreenReady) {
+  const useStoredFallback = shouldUseStoredWasmFallback({
+    fallbackReason: storedFallbackReason,
+    modelPreference: request.modelPreference,
+    devicePreference: request.devicePreference
+  });
+  const fallbackReason = useStoredFallback
+    ? storedFallbackReason ?? undefined
+    : undefined;
+  if (fallbackReason && !wasmFallbackOffscreenReady) {
     await prepareStoredWasmFallbackDocument();
   }
 
   const firstRequest =
-    storedFallbackReason && request.devicePreference !== "wasm"
+    fallbackReason
       ? {
           ...request,
           runtimeDeviceOverride: "wasm" as const,
           fallbackFromDevice: "webgpu" as const,
-          deviceFallbackReason: storedFallbackReason
+          deviceFallbackReason: fallbackReason
         }
       : request;
 
@@ -517,7 +552,11 @@ async function translateWithDeviceRecovery(
   } catch (error) {
     if (!shouldSend()) return backgroundCancelledTranslation(request.requestId);
     const recoveryReason = await getStoredWebGpuFallbackReason();
-    if (!recoveryReason || request.devicePreference === "wasm") throw error;
+    if (!shouldUseStoredWasmFallback({
+      fallbackReason: recoveryReason,
+      modelPreference: request.modelPreference,
+      devicePreference: request.devicePreference
+    }) || !recoveryReason) throw error;
     if (!wasmFallbackOffscreenReady) {
       await recreateOffscreenDocumentForWasm();
     }
@@ -561,7 +600,11 @@ async function clearWebGpuFallback(): Promise<void> {
 }
 
 async function getSettings(): Promise<ExtensionSettings> {
-  return chrome.storage.sync.get(DEFAULT_SETTINGS) as Promise<ExtensionSettings>;
+  return normalizeExtensionSettings(
+    await chrome.storage.sync.get(
+      DEFAULT_SETTINGS as unknown as Record<string, unknown>
+    )
+  );
 }
 
 async function hasStoredPrivacyConsent(): Promise<boolean> {
