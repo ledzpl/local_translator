@@ -70,6 +70,7 @@ import {
   createContextualTranslationInput,
   extractContextualTranslation
 } from "../shared/translation-context";
+import { CancellableRequestRegistry } from "../shared/cancellable-requests";
 
 type Small100Tokenizer = Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>>;
 type Small100Model = Awaited<ReturnType<typeof AutoModelForSeq2SeqLM.from_pretrained>>;
@@ -120,7 +121,7 @@ let status: EngineStatus = { state: "idle", modelId: MODEL_ID };
 const runtimeQueue = new SerialTaskQueue();
 const modelCacheQueue = new SerialTaskQueue();
 const translationCache = new LruCache<string>(220);
-const cancelledTranslationRequests = new Set<string>();
+const translationRequestRegistry = new CancellableRequestRegistry();
 let ttsEngine: SupertonicEngine | null = null;
 let ttsEnginePromise: Promise<SupertonicEngine> | null = null;
 let ttsEngineLoadGeneration = 0;
@@ -148,21 +149,29 @@ chrome.runtime.onMessage.addListener(
     }
 
     if (message.type === "TRANSLATE_OFFSCREEN") {
+      translationRequestRegistry.start(message.requestId);
       const task = runtimeQueue.run(() => translate(message));
-      void task.then(sendResponse, (error) => {
-        sendResponse({
-          ok: false,
-          requestId: message.requestId,
-          code: "TRANSLATION_FAILED",
-          error: friendlyError(error)
-        } satisfies TranslationResponse);
-      });
+      void task.then(
+        (response) => {
+          translationRequestRegistry.finish(message.requestId);
+          sendResponse(response);
+        },
+        (error) => {
+          translationRequestRegistry.finish(message.requestId);
+          sendResponse({
+            ok: false,
+            requestId: message.requestId,
+            code: "TRANSLATION_FAILED",
+            error: friendlyError(error)
+          } satisfies TranslationResponse);
+        }
+      );
       return true;
     }
 
     if (message.type === "CANCEL_TRANSLATION_OFFSCREEN") {
-      cancelledTranslationRequests.add(message.requestId);
-      sendResponse({ ok: true, requestId: message.requestId });
+      const accepted = translationRequestRegistry.cancel(message.requestId);
+      sendResponse({ ok: true, accepted, requestId: message.requestId });
       return false;
     }
 
@@ -606,7 +615,7 @@ function broadcastTtsStatus(): void {
 
 async function translate(request: TranslateOffscreenRequest): Promise<TranslationResponse> {
   const started = performance.now();
-  if (cancelledTranslationRequests.has(request.requestId)) {
+  if (translationRequestRegistry.isCancelled(request.requestId)) {
     return cancelledTranslationResponse(request.requestId);
   }
   const glossarySignature = createGlossarySignature(request.glossary);
@@ -620,7 +629,6 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
   );
   const cached = translationCache.get(cacheKey);
   if (cached) {
-    cancelledTranslationRequests.delete(request.requestId);
     markEngineReadyAfterTranslation();
     return {
       ok: true,
@@ -657,7 +665,7 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
       fallbackFromModelId,
       fallbackReason
     );
-    if (cancelledTranslationRequests.has(request.requestId)) {
+    if (translationRequestRegistry.isCancelled(request.requestId)) {
       return cancelledTranslationResponse(request.requestId);
     }
     const protectedValue = protectGlossaryTerms(request.text, request.glossary);
@@ -670,7 +678,7 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
       contextualInput,
       request
     );
-    if (cancelledTranslationRequests.has(request.requestId)) {
+    if (translationRequestRegistry.isCancelled(request.requestId)) {
       return cancelledTranslationResponse(request.requestId);
     }
     const contextualResult = extractContextualTranslation(
@@ -678,7 +686,7 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
       Boolean(request.context?.trim())
     );
     if (contextualResult === null) {
-      if (cancelledTranslationRequests.has(request.requestId)) {
+      if (translationRequestRegistry.isCancelled(request.requestId)) {
         return cancelledTranslationResponse(request.requestId);
       }
       // The context marker can be lost by a model. The plain retry must use
@@ -693,12 +701,11 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
       translation = contextualResult;
     }
     translation = restoreGlossaryTerms(translation, protectedValue.replacements);
-    if (cancelledTranslationRequests.has(request.requestId)) {
+    if (translationRequestRegistry.isCancelled(request.requestId)) {
       return cancelledTranslationResponse(request.requestId);
     }
     if (!translation) throw new Error("모델이 번역 결과를 만들지 못했습니다.");
     translationCache.set(cacheKey, translation);
-    cancelledTranslationRequests.delete(request.requestId);
     markEngineReadyAfterTranslation();
 
     return {
@@ -710,7 +717,7 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
       elapsedMs: Math.round(performance.now() - started)
     };
   } catch (error) {
-    if (cancelledTranslationRequests.has(request.requestId)) {
+    if (translationRequestRegistry.isCancelled(request.requestId)) {
       return cancelledTranslationResponse(request.requestId);
     }
     const message = friendlyError(error);
@@ -752,7 +759,7 @@ async function translateTextWithDeviceRecovery(
       activeEngine,
       text,
       request.sourceLanguage,
-      () => cancelledTranslationRequests.has(request.requestId)
+      () => translationRequestRegistry.isCancelled(request.requestId)
     );
   } catch (error) {
     if (error instanceof TaskCancelledError) throw error;
@@ -768,7 +775,6 @@ async function translateTextWithDeviceRecovery(
 }
 
 function cancelledTranslationResponse(requestId: string): TranslationResponse {
-  cancelledTranslationRequests.delete(requestId);
   return {
     ok: false,
     requestId,

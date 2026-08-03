@@ -32,6 +32,7 @@ import { normalizeText } from "../shared/text";
 import { isSpeechStatusFor } from "../shared/tts";
 import { createCaptionContext } from "../shared/translation-context";
 import { GLOSSARY_STORAGE_KEY } from "../shared/glossary";
+import { applyExtensionSettingChanges } from "../shared/settings";
 
 declare global {
   interface Window {
@@ -95,14 +96,26 @@ function initialize(): void {
   );
 
   chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "sync" && changes.privacyConsentVersion) {
+      const privacyConsentVersion = Number(
+        changes.privacyConsentVersion.newValue ??
+        DEFAULT_SETTINGS.privacyConsentVersion
+      );
+      if (!hasPrivacyConsent({ privacyConsentVersion })) {
+        pageTranslator.restore();
+      }
+    }
     if (
       area === "sync" &&
       (changes.modelPreference || changes.devicePreference)
     ) {
       pageTranslator.stop();
     }
-    if (area === "sync" && changes.pageDisplayMode?.newValue) {
-      pageTranslator.setDisplayMode(changes.pageDisplayMode.newValue as PageDisplayMode);
+    if (area === "sync" && changes.pageDisplayMode) {
+      pageTranslator.setDisplayMode(
+        (changes.pageDisplayMode.newValue ??
+          DEFAULT_SETTINGS.pageDisplayMode) as PageDisplayMode
+      );
     }
   });
 
@@ -1077,6 +1090,7 @@ class YouTubeCaptionTranslator {
   private pendingCaption = "";
   private translationInFlight = false;
   private settingsGeneration = 0;
+  private settingsRevision = 0;
   private navigationUrl = location.href;
   private readonly cache = new LruCache<string>(180);
   private readonly retryAttempts = new Map<string, number>();
@@ -1109,14 +1123,11 @@ class YouTubeCaptionTranslator {
         return;
       }
       if (area !== "sync") return;
+      this.settingsRevision += 1;
       const previousTranslationSettings =
         `${this.settings.modelPreference}\u0000${this.settings.devicePreference}\u0000${this.settings.youtubeTranslationMode}`;
       const wasEnabled = this.settings.youtubeEnabled;
-      for (const key of Object.keys(DEFAULT_SETTINGS) as Array<keyof ExtensionSettings>) {
-        if (changes[key]?.newValue !== undefined) {
-          Object.assign(this.settings, { [key]: changes[key]?.newValue });
-        }
-      }
+      this.settings = applyExtensionSettingChanges(this.settings, changes);
       const nextTranslationSettings =
         `${this.settings.modelPreference}\u0000${this.settings.devicePreference}\u0000${this.settings.youtubeTranslationMode}`;
       if (previousTranslationSettings !== nextTranslationSettings) {
@@ -1177,7 +1188,15 @@ class YouTubeCaptionTranslator {
   }
 
   private async loadSettings(): Promise<void> {
-    this.settings = await chrome.storage.sync.get(DEFAULT_SETTINGS) as ExtensionSettings;
+    while (true) {
+      const revisionAtRequest = this.settingsRevision;
+      const settings = await chrome.storage.sync.get(
+        DEFAULT_SETTINGS
+      ) as ExtensionSettings;
+      if (revisionAtRequest !== this.settingsRevision) continue;
+      this.settings = settings;
+      break;
+    }
     this.applyOriginalCaptionVisibility();
   }
 
@@ -1395,6 +1414,10 @@ class YouTubeCaptionTranslator {
       !this.settings.youtubeEnabled ||
       !this.settings.autoEnableCaptions
     ) {
+      if (this.captionButtonTimer !== null) {
+        window.clearTimeout(this.captionButtonTimer);
+        this.captionButtonTimer = null;
+      }
       return;
     }
     // Only one pending auto-enable at a time. Rapid navigations/setting changes
@@ -1405,7 +1428,11 @@ class YouTubeCaptionTranslator {
     }
     this.captionButtonTimer = window.setTimeout(() => {
       this.captionButtonTimer = null;
-      if (!hasPrivacyConsent(this.settings) || !this.settings.youtubeEnabled) {
+      if (
+        !hasPrivacyConsent(this.settings) ||
+        !this.settings.youtubeEnabled ||
+        !this.settings.autoEnableCaptions
+      ) {
         return;
       }
       const button = document.querySelector<HTMLButtonElement>(".ytp-subtitles-button");

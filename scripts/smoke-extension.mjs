@@ -735,6 +735,44 @@ try {
     }
     subtitle = "KOREAN_SOURCE_SKIPPED";
   }
+
+  await popup.evaluate(async () => {
+    await chrome.storage.sync.set({ autoEnableCaptions: false });
+  });
+  await mockYoutube.waitForTimeout(150);
+  await mockYoutube.evaluate(() => {
+    const button = document.querySelector(".ytp-subtitles-button");
+    globalThis.__ongeulAutoCaptionClickCount = 0;
+    button?.setAttribute("aria-pressed", "false");
+    button?.addEventListener("click", () => {
+      globalThis.__ongeulAutoCaptionClickCount += 1;
+    });
+  });
+  await popup.evaluate(async () => {
+    await chrome.storage.sync.set({ autoEnableCaptions: true });
+  });
+  await mockYoutube.waitForTimeout(300);
+  await popup.evaluate(async () => {
+    await chrome.storage.sync.set({ autoEnableCaptions: false });
+  });
+  await mockYoutube.waitForTimeout(1_300);
+  const autoCaptionClicks = await mockYoutube.evaluate(
+    () => globalThis.__ongeulAutoCaptionClickCount
+  );
+  if (autoCaptionClicks !== 0) {
+    throw new Error(
+      `사용자가 자동 자막을 끈 뒤 대기 타이머가 CC를 눌렀습니다: ${autoCaptionClicks}`
+    );
+  }
+  await mockYoutube.evaluate(() => {
+    document.querySelector(".ytp-subtitles-button")
+      ?.setAttribute("aria-pressed", "true");
+  });
+  await popup.evaluate(async () => {
+    await chrome.storage.sync.set({ autoEnableCaptions: true });
+  });
+  console.log("YOUTUBE_AUTO_CAPTION_CANCEL_GUARD=PASS");
+
   if (withModel && requestedModel === "m2m100") {
     assertSemanticTranslation({
       id: "private_local_caption",
@@ -863,6 +901,40 @@ try {
     }
     console.log("YOUTUBE_SPA_NAVIGATION_RESCAN=PASS");
   }
+
+  await popup.evaluate(async () => {
+    await chrome.storage.sync.remove([
+      "privacyConsentVersion",
+      "youtubeEnabled",
+      "autoEnableCaptions",
+      "pageDisplayMode"
+    ]);
+  });
+  await popup.locator("#privacy-onboarding").waitFor({ state: "visible" });
+  await mockYoutube.evaluate(() => {
+    const segment = document.querySelector(".ytp-caption-segment");
+    if (segment) segment.textContent = "Removed consent must stop caption processing.";
+  });
+  await mockYoutube.waitForTimeout(700);
+  if (await subtitleHost.isVisible()) {
+    throw new Error("삭제된 동의·YouTube 설정이 기본값으로 복원되지 않았습니다.");
+  }
+  await mockYoutube.evaluate(() => {
+    const segment = document.querySelector(".ytp-caption-segment");
+    if (segment) segment.textContent = "브라우저 로컬 번역";
+    document.querySelector(".ytp-subtitles-button")
+      ?.setAttribute("aria-pressed", "true");
+  });
+  await popup.evaluate(async () => {
+    await chrome.storage.sync.set({
+      privacyConsentVersion: 4,
+      youtubeEnabled: true,
+      autoEnableCaptions: true,
+      pageDisplayMode: "bilingual"
+    });
+  });
+  await popup.locator("#product-ui").waitFor({ state: "visible" });
+  console.log("REMOVED_SYNC_SETTINGS_DEFAULT_GUARD=PASS");
 
   let pageTranslation;
   const webPage = await context.newPage();
