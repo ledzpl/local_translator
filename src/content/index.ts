@@ -842,10 +842,10 @@ class InPageTranslator {
     const poll = async (): Promise<void> => {
       if (request !== this.speechRequest) return;
       // If the button was detached (e.g. its block was removed or the page
-      // navigated), drop the references so the detached shadow subtree can be
-      // collected instead of lingering on this instance.
+      // changed dynamically), stop the matching audio too. Merely dropping the
+      // references leaves speech playing with no remaining control to stop it.
       if (!this.speechButton?.isConnected) {
-        if (request === this.speechRequest) this.resetSpeechButton();
+        if (request === this.speechRequest) this.stopActiveSpeech();
         return;
       }
       try {

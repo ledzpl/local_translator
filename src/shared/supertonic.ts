@@ -99,12 +99,30 @@ export class SupertonicEngine {
       runSessionCreate,
       runSessionRelease
     } = options;
-    const [config, indexer, style] = await Promise.all([
+    const metadata = await Promise.allSettled([
       fetchJson<SupertonicConfig>(`${modelBaseUrl}/tts.json`, signal),
       fetchJson<number[]>(`${modelBaseUrl}/unicode_indexer.json`, signal),
       loadStyle(voiceStyleUrl, signal)
     ]);
-    validateConfig(config);
+    const metadataFailure = metadata.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected"
+    );
+    if (metadataFailure) {
+      const loadedStyle = metadata[2];
+      if (loadedStyle.status === "fulfilled") {
+        disposeSupertonicTensors([loadedStyle.value.ttl, loadedStyle.value.dp]);
+      }
+      throw metadataFailure.reason;
+    }
+    const [config, indexer, style] = metadata.map(
+      (result) => (result as PromiseFulfilledResult<unknown>).value
+    ) as [SupertonicConfig, number[], SupertonicStyle];
+    try {
+      validateConfig(config);
+    } catch (error) {
+      disposeSupertonicTensors([style.ttl, style.dp]);
+      throw error;
+    }
 
     const sessions: ort.InferenceSession[] = [];
     try {
@@ -152,12 +170,15 @@ export class SupertonicEngine {
         sessions[3]!
       );
     } catch (error) {
-      const releaseSessions = async () => {
-        await releaseSupertonicSessions(sessions);
+      const releaseResources = async () => {
+        await releaseSupertonicResources(
+          sessions,
+          [style.ttl, style.dp]
+        );
       };
       await (runSessionRelease
-        ? runSessionRelease(releaseSessions)
-        : releaseSessions()
+        ? runSessionRelease(releaseResources)
+        : releaseResources()
       ).catch(() => undefined);
       throw error;
     }
@@ -179,113 +200,171 @@ export class SupertonicEngine {
       new Float32Array(textIds.length).fill(1),
       [1, 1, textIds.length]
     );
+    let textEmbedding: ort.Tensor | null = null;
+    let latentMaskTensor: ort.Tensor | null = null;
+    let totalStepTensor: ort.Tensor | null = null;
+    try {
+      const durationOutput = await this.durationPredictor.run({
+        text_ids: textIdsTensor,
+        style_dp: this.style.dp,
+        text_mask: textMaskTensor
+      });
+      let duration: number;
+      try {
+        const rawDuration = Number(durationOutput.duration?.data[0]);
+        duration = rawDuration / SPEECH_SPEED;
+        if (!Number.isFinite(duration) || duration <= 0) {
+          throw new Error("Supertonic 3가 올바른 음성 길이를 만들지 못했습니다.");
+        }
+      } finally {
+        disposeSupertonicTensors(Object.values(durationOutput));
+      }
 
-    const durationOutput = await this.durationPredictor.run({
-      text_ids: textIdsTensor,
-      style_dp: this.style.dp,
-      text_mask: textMaskTensor
-    });
-    const rawDuration = Number(durationOutput.duration?.data[0]);
-    const duration = rawDuration / SPEECH_SPEED;
-    if (!Number.isFinite(duration) || duration <= 0) {
-      throw new Error("Supertonic 3가 올바른 음성 길이를 만들지 못했습니다.");
-    }
+      const textEncoderOutput = await this.textEncoder.run({
+        text_ids: textIdsTensor,
+        style_ttl: this.style.ttl,
+        text_mask: textMaskTensor
+      });
+      textEmbedding = textEncoderOutput.text_emb ?? null;
+      disposeSupertonicTensors(
+        Object.values(textEncoderOutput),
+        textEmbedding ? new Set([textEmbedding]) : undefined
+      );
+      if (!textEmbedding) {
+        throw new Error("Supertonic 3 텍스트 인코더의 출력이 없습니다.");
+      }
 
-    const textEncoderOutput = await this.textEncoder.run({
-      text_ids: textIdsTensor,
-      style_ttl: this.style.ttl,
-      text_mask: textMaskTensor
-    });
-    const textEmbedding = textEncoderOutput.text_emb;
-    if (!textEmbedding) {
-      throw new Error("Supertonic 3 텍스트 인코더의 출력이 없습니다.");
-    }
+      const chunkSize =
+        this.config.ae.base_chunk_size *
+        this.config.ttl.chunk_compress_factor;
+      const requestedSamples = Math.floor(duration * this.sampleRate);
+      const latentLength = Math.ceil(requestedSamples / chunkSize);
+      const latentDimension =
+        this.config.ttl.latent_dim *
+        this.config.ttl.chunk_compress_factor;
+      latentMaskTensor = new ort.Tensor(
+        "float32",
+        new Float32Array(latentLength).fill(1),
+        [1, 1, latentLength]
+      );
+      totalStepTensor = new ort.Tensor(
+        "float32",
+        Float32Array.of(TOTAL_STEPS),
+        [1]
+      );
+      let latent = createGaussianNoise(latentDimension * latentLength);
 
-    const chunkSize =
-      this.config.ae.base_chunk_size *
-      this.config.ttl.chunk_compress_factor;
-    const requestedSamples = Math.floor(duration * this.sampleRate);
-    const latentLength = Math.ceil(requestedSamples / chunkSize);
-    const latentDimension =
-      this.config.ttl.latent_dim *
-      this.config.ttl.chunk_compress_factor;
-    const latentMaskTensor = new ort.Tensor(
-      "float32",
-      new Float32Array(latentLength).fill(1),
-      [1, 1, latentLength]
-    );
-    const totalStepTensor = new ort.Tensor(
-      "float32",
-      Float32Array.of(TOTAL_STEPS),
-      [1]
-    );
-    let latent = createGaussianNoise(latentDimension * latentLength);
-
-    for (let step = 0; step < TOTAL_STEPS; step += 1) {
-      onProgress?.({ step: step + 1, total: TOTAL_STEPS });
-      const output = await this.vectorEstimator.run({
-        noisy_latent: new ort.Tensor(
+      for (let step = 0; step < TOTAL_STEPS; step += 1) {
+        onProgress?.({ step: step + 1, total: TOTAL_STEPS });
+        const noisyLatentTensor = new ort.Tensor(
           "float32",
           latent,
           [1, latentDimension, latentLength]
-        ),
-        text_emb: textEmbedding,
-        style_ttl: this.style.ttl,
-        latent_mask: latentMaskTensor,
-        text_mask: textMaskTensor,
-        current_step: new ort.Tensor(
+        );
+        const currentStepTensor = new ort.Tensor(
           "float32",
           Float32Array.of(step),
           [1]
-        ),
-        total_step: totalStepTensor
-      });
-      const denoised = output.denoised_latent?.data;
-      if (!(denoised instanceof Float32Array)) {
-        throw new Error("Supertonic 3 음성 생성기의 출력이 올바르지 않습니다.");
+        );
+        let output: Awaited<ReturnType<ort.InferenceSession["run"]>> | null = null;
+        try {
+          output = await this.vectorEstimator.run({
+            noisy_latent: noisyLatentTensor,
+            text_emb: textEmbedding,
+            style_ttl: this.style.ttl,
+            latent_mask: latentMaskTensor,
+            text_mask: textMaskTensor,
+            current_step: currentStepTensor,
+            total_step: totalStepTensor
+          });
+          const denoised = output.denoised_latent?.data;
+          if (!(denoised instanceof Float32Array)) {
+            throw new Error("Supertonic 3 음성 생성기의 출력이 올바르지 않습니다.");
+          }
+          // Session output buffers belong to their Tensor. Copy before dispose
+          // so the next denoising step never reads a released WebGPU buffer.
+          latent = denoised.slice();
+        } finally {
+          noisyLatentTensor.dispose();
+          currentStepTensor.dispose();
+          if (output) disposeSupertonicTensors(Object.values(output));
+        }
       }
-      latent = denoised;
-    }
 
-    const vocoderOutput = await this.vocoder.run({
-      latent: new ort.Tensor(
+      const latentTensor = new ort.Tensor(
         "float32",
         latent,
         [1, latentDimension, latentLength]
-      )
-    });
-    const waveform = vocoderOutput.wav_tts?.data;
-    if (!(waveform instanceof Float32Array)) {
-      throw new Error("Supertonic 3 보코더의 출력이 올바르지 않습니다.");
+      );
+      let vocoderOutput: Awaited<ReturnType<ort.InferenceSession["run"]>> | null = null;
+      try {
+        vocoderOutput = await this.vocoder.run({ latent: latentTensor });
+        const waveform = vocoderOutput.wav_tts?.data;
+        if (!(waveform instanceof Float32Array)) {
+          throw new Error("Supertonic 3 보코더의 출력이 올바르지 않습니다.");
+        }
+        return {
+          audio: waveform.slice(0, Math.min(requestedSamples, waveform.length)),
+          sampling_rate: this.sampleRate
+        };
+      } finally {
+        latentTensor.dispose();
+        if (vocoderOutput) {
+          disposeSupertonicTensors(Object.values(vocoderOutput));
+        }
+      }
+    } finally {
+      disposeSupertonicTensors([
+        textIdsTensor,
+        textMaskTensor,
+        ...(textEmbedding ? [textEmbedding] : []),
+        ...(latentMaskTensor ? [latentMaskTensor] : []),
+        ...(totalStepTensor ? [totalStepTensor] : [])
+      ]);
     }
-
-    return {
-      audio: waveform.slice(0, Math.min(requestedSamples, waveform.length)),
-      sampling_rate: this.sampleRate
-    };
   }
 
   async release(): Promise<void> {
-    await releaseSupertonicSessions([
-      this.durationPredictor,
-      this.textEncoder,
-      this.vectorEstimator,
-      this.vocoder
-    ]);
+    await releaseSupertonicResources(
+      [
+        this.durationPredictor,
+        this.textEncoder,
+        this.vectorEstimator,
+        this.vocoder
+      ],
+      [this.style.ttl, this.style.dp]
+    );
+  }
+}
+
+export async function releaseSupertonicResources(
+  sessions: readonly Pick<ort.InferenceSession, "release">[],
+  tensors: readonly Pick<ort.Tensor, "dispose">[]
+): Promise<void> {
+  const results = await Promise.allSettled([
+    ...sessions.map((session) => Promise.resolve().then(() => session.release())),
+    ...tensors.map((tensor) => Promise.resolve().then(() => tensor.dispose()))
+  ]);
+  const errors = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : []
+  );
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "Supertonic 3 리소스를 모두 해제하지 못했습니다.");
   }
 }
 
 export async function releaseSupertonicSessions(
   sessions: readonly Pick<ort.InferenceSession, "release">[]
 ): Promise<void> {
-  const results = await Promise.allSettled(
-    sessions.map((session) => session.release())
-  );
-  const errors = results.flatMap((result) =>
-    result.status === "rejected" ? [result.reason] : []
-  );
-  if (errors.length > 0) {
-    throw new AggregateError(errors, "Supertonic 3 세션을 모두 해제하지 못했습니다.");
+  await releaseSupertonicResources(sessions, []);
+}
+
+function disposeSupertonicTensors(
+  tensors: readonly Pick<ort.Tensor, "dispose">[],
+  retained?: ReadonlySet<ort.Tensor>
+): void {
+  for (const tensor of tensors) {
+    if (!retained?.has(tensor as ort.Tensor)) tensor.dispose();
   }
 }
 
@@ -347,10 +426,16 @@ async function loadStyle(
   signal?: AbortSignal
 ): Promise<SupertonicStyle> {
   const serialized = await fetchJson<SerializedStyle>(url, signal);
-  return {
-    ttl: deserializeTensor(serialized.style_ttl, "style_ttl"),
-    dp: deserializeTensor(serialized.style_dp, "style_dp")
-  };
+  const ttl = deserializeTensor(serialized.style_ttl, "style_ttl");
+  try {
+    return {
+      ttl,
+      dp: deserializeTensor(serialized.style_dp, "style_dp")
+    };
+  } catch (error) {
+    ttl.dispose();
+    throw error;
+  }
 }
 
 function deserializeTensor(
@@ -456,6 +541,9 @@ export function shouldRefreshSupertonicCache(error: unknown): boolean {
     /invalid (?:onnx )?model (?:format|file)/iu,
     /(?:model|onnx|external data|file).*(?:corrupt|truncat)/iu,
     /(?:corrupt|truncat).*(?:model|onnx|external data|file)/iu,
+    /Supertonic 3 설정이 올바르지 않습니다/u,
+    /Supertonic 3 .*음성 스타일.*올바르지 않습니다/u,
+    /Supertonic 3 음성 스타일에 숫자가 아닌 값/u,
     /파일이 비어 있습니다/u
   ].some((pattern) => pattern.test(message));
 }

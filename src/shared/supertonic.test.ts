@@ -1,8 +1,10 @@
-import { describe, expect, it } from "vitest";
+import * as ort from "onnxruntime-web/webgpu";
+import { describe, expect, it, vi } from "vitest";
 import {
   SupertonicEngine,
   encodeSupertonicText,
   preprocessSupertonicText,
+  releaseSupertonicResources,
   releaseSupertonicSessions,
   shouldRefreshSupertonicCache
 } from "./supertonic";
@@ -43,6 +45,117 @@ describe("SupertonicEngine loading", () => {
     await expect(release).rejects.toBeInstanceOf(AggregateError);
     expect(slowReleaseFinished).toBe(true);
   });
+
+  it("releases style tensors even when a session release fails", async () => {
+    const released: string[] = [];
+    await expect(releaseSupertonicResources(
+      [{ release: async () => { throw new Error("session release failed"); } }],
+      [
+        { dispose: () => { released.push("ttl"); } },
+        { dispose: () => { released.push("dp"); } }
+      ]
+    )).rejects.toBeInstanceOf(AggregateError);
+    expect(released).toEqual(["ttl", "dp"]);
+  });
+
+  it("waits for sibling metadata loads before rejecting", async () => {
+    let finishIndexer!: () => void;
+    const indexerResponse = new Promise<Response>((resolve) => {
+      finishIndexer = () => resolve(new Response("[0]"));
+    });
+    const originalCaches = globalThis.caches;
+    const originalFetch = globalThis.fetch;
+    Object.assign(globalThis, {
+      caches: {
+        open: async () => ({
+          match: async () => undefined,
+          put: async () => undefined,
+          delete: async () => true
+        })
+      },
+      fetch: (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/tts.json")) {
+          return Promise.reject(new Error("config unavailable"));
+        }
+        if (url.endsWith("/unicode_indexer.json")) return indexerResponse;
+        return Promise.resolve(new Response(JSON.stringify({
+          style_ttl: { type: "float32", dims: [1], data: [0] },
+          style_dp: { type: "float32", dims: [1], data: [0] }
+        })));
+      }
+    });
+    try {
+      const loading = SupertonicEngine.load({
+        modelBaseUrl: "https://example.invalid/onnx",
+        voiceStyleUrl: "https://example.invalid/M1.json",
+        device: "wasm"
+      });
+      let settled = false;
+      void loading.then(
+        () => { settled = true; },
+        () => { settled = true; }
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      finishIndexer();
+      await expect(loading).rejects.toThrow("config unavailable");
+    } finally {
+      finishIndexer();
+      Object.assign(globalThis, {
+        caches: originalCaches,
+        fetch: originalFetch
+      });
+    }
+  });
+});
+
+describe("SupertonicEngine synthesis", () => {
+  it("disposes temporary input and output tensors after synthesis", async () => {
+    const dispose = vi.spyOn(ort.Tensor.prototype, "dispose");
+    let outputDisposals = 0;
+    const outputTensor = (data: Float32Array | number[]) => ({
+      data,
+      dispose: () => { outputDisposals += 1; }
+    }) as unknown as ort.Tensor;
+    const vectorOutputs = Array.from({ length: 8 }, () =>
+      outputTensor(new Float32Array(10).fill(0.1))
+    );
+    const Engine = SupertonicEngine as unknown as new (
+      ...args: unknown[]
+    ) => SupertonicEngine;
+    const engine = new Engine(
+      "wasm",
+      {
+        ae: { sample_rate: 1_000, base_chunk_size: 10 },
+        ttl: { latent_dim: 1, chunk_compress_factor: 1 }
+      },
+      new Array<number>(70_000).fill(1),
+      { ttl: {}, dp: {} },
+      { run: async () => ({ duration: outputTensor([0.106]) }) },
+      { run: async () => ({ text_emb: outputTensor([0.1]) }) },
+      {
+        run: async () => ({
+          denoised_latent: vectorOutputs.shift()!
+        })
+      },
+      {
+        run: async () => ({
+          wav_tts: outputTensor(new Float32Array(100).fill(0.1))
+        })
+      }
+    );
+
+    try {
+      const result = await engine.synthesize("안녕하세요");
+      expect(result.audio).toHaveLength(100);
+      expect(dispose).toHaveBeenCalledTimes(21);
+      expect(outputDisposals).toBe(11);
+    } finally {
+      dispose.mockRestore();
+    }
+  });
 });
 
 describe("preprocessSupertonicText", () => {
@@ -81,6 +194,12 @@ describe("shouldRefreshSupertonicCache", () => {
     )).toBe(true);
     expect(shouldRefreshSupertonicCache(
       new SyntaxError("Unexpected end of JSON input")
+    )).toBe(true);
+    expect(shouldRefreshSupertonicCache(
+      new Error("Supertonic 3 설정이 올바르지 않습니다.")
+    )).toBe(true);
+    expect(shouldRefreshSupertonicCache(
+      new Error("Supertonic 3 style_ttl 음성 스타일 크기가 올바르지 않습니다.")
     )).toBe(true);
     expect(shouldRefreshSupertonicCache(
       new Error("Failed to create WebGPU buffer: out of memory")

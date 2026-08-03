@@ -1309,14 +1309,17 @@ try {
       }
       console.log(`PAGE_TTS_ENGINE=${pageTtsStatus.modelId}`);
       console.log(`PAGE_TTS_STATE=${pageTtsStatus.state}`);
-      await pageSpeechButton.click();
-      await pageSpeechButton.filter({ hasText: "듣기" }).waitFor();
+      await pageSpeechButton.evaluate((button) => {
+        const root = button.getRootNode();
+        if (root instanceof ShadowRoot) root.host.remove();
+      });
       const stoppedPageTtsStatus = await waitForTtsState(popup, "idle", 10_000);
       if (stoppedPageTtsStatus.state !== "idle") {
         throw new Error(
-          `페이지 번역 TTS가 정지되지 않았습니다: ${JSON.stringify(stoppedPageTtsStatus)}`
+          `제거된 페이지 번역의 TTS가 정지되지 않았습니다: ${JSON.stringify(stoppedPageTtsStatus)}`
         );
       }
+      console.log("PAGE_TTS_DETACHED_CONTROL_STOP=PASS");
     }
 
     const completed = await popup.evaluate(async () =>
