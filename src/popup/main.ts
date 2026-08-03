@@ -7,6 +7,7 @@ import {
   type DevicePreference,
   type EngineStatus,
   type ExtensionSettings,
+  type GlossaryActionResponse,
   type GlossaryEntry,
   type ModelCacheStatus,
   type PageDisplayMode,
@@ -42,6 +43,7 @@ import {
 } from "../shared/popup-state";
 import { RevisionedCommitter } from "../shared/revisioned-committer";
 import {
+  applyExtensionSettingChanges,
   normalizeExtensionSettings,
   normalizeExtensionSettingValue
 } from "../shared/settings";
@@ -332,6 +334,7 @@ let glossaryEntries: GlossaryEntry[] = [];
 let modelPreparationInFlight = false;
 let modelCacheActionInFlight = false;
 let modelSettingsUpdateInFlight = false;
+let persistedSettings: ExtensionSettings = { ...DEFAULT_SETTINGS };
 let persistedModelPreference: ModelPreference = DEFAULT_SETTINGS.modelPreference;
 let persistedDevicePreference: DevicePreference = DEFAULT_SETTINGS.devicePreference;
 let currentEngineStatus: EngineStatus = { state: "idle", modelId: MODEL_ID };
@@ -559,6 +562,13 @@ if (isExtensionRuntime) {
     }
   });
   chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes[GLOSSARY_STORAGE_KEY]) {
+      glossaryEntries = normalizeGlossaryEntries(
+        changes[GLOSSARY_STORAGE_KEY].newValue
+      );
+      renderGlossary();
+      return;
+    }
     if (area !== "sync") return;
     settingsRevision += 1;
     if (changes.privacyConsentVersion) {
@@ -1229,8 +1239,14 @@ async function loadGlossary(): Promise<void> {
     renderGlossary();
     return;
   }
-  const stored = await chrome.storage.local.get(GLOSSARY_STORAGE_KEY);
-  glossaryEntries = normalizeGlossaryEntries(stored[GLOSSARY_STORAGE_KEY]);
+  const response = await chrome.runtime.sendMessage({
+    target: "background",
+    type: "GET_GLOSSARY_ENTRIES"
+  }) as GlossaryActionResponse;
+  if (!response?.ok) {
+    throw new Error(response?.error ?? "용어집을 불러오지 못했습니다.");
+  }
+  glossaryEntries = normalizeGlossaryEntries(response.entries);
   renderGlossary();
 }
 
@@ -1249,25 +1265,25 @@ async function addGlossaryEntry(): Promise<void> {
     elements.glossaryStatus.textContent = "원문 용어와 사용할 표기를 입력해 주세요.";
     return;
   }
-  const existing = glossaryEntries.find((entry) =>
-    entry.source.toLocaleLowerCase() === source.toLocaleLowerCase()
-  );
-  if (!existing && glossaryEntries.length >= MAX_GLOSSARY_ENTRIES) {
+  const entry: GlossaryEntry = {
+    id: crypto.randomUUID(),
+    source,
+    target,
+    mode: preserve ? "preserve" : "translate"
+  };
+  const response = isExtensionRuntime
+    ? await chrome.runtime.sendMessage({
+        target: "background",
+        type: "UPSERT_GLOSSARY_ENTRY",
+        entry
+      }) as GlossaryActionResponse
+    : upsertPreviewGlossaryEntry(entry);
+  if (!response?.ok) {
     elements.glossaryStatus.textContent =
-      `용어는 최대 ${MAX_GLOSSARY_ENTRIES}개까지 저장할 수 있습니다. 기존 항목을 지워 주세요.`;
+      response?.error ?? "용어를 저장하지 못했습니다.";
     return;
   }
-  const nextEntries = normalizeGlossaryEntries([
-    ...glossaryEntries.filter((entry) => entry.source.toLocaleLowerCase() !== source.toLocaleLowerCase()),
-    {
-      id: crypto.randomUUID(),
-      source,
-      target,
-      mode: preserve ? "preserve" : "translate"
-    }
-  ]);
-  await persistGlossary(nextEntries);
-  glossaryEntries = nextEntries;
+  glossaryEntries = normalizeGlossaryEntries(response.entries);
   elements.glossarySource.value = "";
   elements.glossaryTarget.value = "";
   elements.glossaryStatus.textContent = "용어를 이 기기에 저장했습니다.";
@@ -1275,17 +1291,47 @@ async function addGlossaryEntry(): Promise<void> {
 }
 
 async function removeGlossaryEntry(id: string): Promise<void> {
-  const nextEntries = glossaryEntries.filter((entry) => entry.id !== id);
-  await persistGlossary(nextEntries);
-  glossaryEntries = nextEntries;
+  const response = isExtensionRuntime
+    ? await chrome.runtime.sendMessage({
+        target: "background",
+        type: "REMOVE_GLOSSARY_ENTRY",
+        id
+      }) as GlossaryActionResponse
+    : {
+        ok: true,
+        entries: glossaryEntries.filter((entry) => entry.id !== id)
+      };
+  if (!response?.ok) {
+    throw new Error(response?.error ?? "용어를 삭제하지 못했습니다.");
+  }
+  glossaryEntries = normalizeGlossaryEntries(response.entries);
   elements.glossaryStatus.textContent = "용어를 삭제했습니다.";
   renderGlossary();
 }
 
-async function persistGlossary(entries: readonly GlossaryEntry[]): Promise<void> {
-  if (isExtensionRuntime) {
-    await chrome.storage.local.set({ [GLOSSARY_STORAGE_KEY]: entries });
+function upsertPreviewGlossaryEntry(entry: GlossaryEntry): GlossaryActionResponse {
+  const sourceKey = entry.source.toLocaleLowerCase();
+  const existing = glossaryEntries.some((candidate) =>
+    candidate.source.toLocaleLowerCase() === sourceKey
+  );
+  if (!existing && glossaryEntries.length >= MAX_GLOSSARY_ENTRIES) {
+    return {
+      ok: false,
+      entries: glossaryEntries,
+      error:
+        `용어는 최대 ${MAX_GLOSSARY_ENTRIES}개까지 저장할 수 있습니다. ` +
+        "기존 항목을 지워 주세요."
+    };
   }
+  return {
+    ok: true,
+    entries: normalizeGlossaryEntries([
+      ...glossaryEntries.filter((candidate) =>
+        candidate.source.toLocaleLowerCase() !== sourceKey
+      ),
+      entry
+    ])
+  };
 }
 
 function renderGlossary(): void {
@@ -1330,6 +1376,7 @@ function setBusy(busy: boolean): void {
 }
 
 function applySettings(settings: ExtensionSettings): void {
+  persistedSettings = { ...settings };
   elements.youtubeEnabled.checked = settings.youtubeEnabled;
   elements.autoCaptions.checked = settings.autoEnableCaptions;
   elements.showOriginal.checked = settings.showOriginalCaptions;
@@ -1349,6 +1396,7 @@ function applySettings(settings: ExtensionSettings): void {
 function applyExternalSettingChanges(
   changes: Record<string, chrome.storage.StorageChange>
 ): void {
+  persistedSettings = applyExtensionSettingChanges(persistedSettings, changes);
   if (changes.youtubeEnabled) {
     elements.youtubeEnabled.checked = normalizeExtensionSettingValue(
       "youtubeEnabled",
@@ -1436,6 +1484,7 @@ async function saveSettingSafely<Key extends keyof ExtensionSettings>(
     await saveSetting(key, value);
     return true;
   } catch (error) {
+    if (key !== "subtitleSize") restorePersistedSettingControl(key);
     updateEngineStatus({
       state: "error",
       modelId: MODEL_DEFINITIONS[
@@ -1444,6 +1493,34 @@ async function saveSettingSafely<Key extends keyof ExtensionSettings>(
       error: `설정을 저장하지 못했습니다: ${formatUiError(error)}`
     });
     return false;
+  }
+}
+
+function restorePersistedSettingControl(key: keyof ExtensionSettings): void {
+  switch (key) {
+    case "youtubeEnabled":
+      elements.youtubeEnabled.checked = persistedSettings.youtubeEnabled;
+      break;
+    case "autoEnableCaptions":
+      elements.autoCaptions.checked = persistedSettings.autoEnableCaptions;
+      break;
+    case "showOriginalCaptions":
+      elements.showOriginal.checked = persistedSettings.showOriginalCaptions;
+      break;
+    case "youtubeTranslationMode":
+      elements.youtubeTranslationMode.value = persistedSettings.youtubeTranslationMode;
+      break;
+    case "pageContinuous":
+      elements.pageContinuous.checked = persistedSettings.pageContinuous;
+      break;
+    case "pageDisplayMode":
+      elements.pageDisplayMode.value = persistedSettings.pageDisplayMode;
+      break;
+    case "sourceLanguage":
+      elements.sourceLanguage.value = persistedSettings.sourceLanguage;
+      break;
+    default:
+      break;
   }
 }
 

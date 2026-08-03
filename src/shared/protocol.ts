@@ -24,6 +24,12 @@ export interface GlossaryEntry {
   mode: "translate" | "preserve";
 }
 
+export interface GlossaryActionResponse {
+  ok: boolean;
+  entries: GlossaryEntry[];
+  error?: string;
+}
+
 export interface ExtensionSettings {
   privacyConsentVersion: number;
   youtubeEnabled: boolean;
@@ -204,6 +210,13 @@ export type BackgroundMessage =
       displayMode: PageDisplayMode;
     }
   | { target: "background"; type: "GET_TRANSLATION_JOB" }
+  | { target: "background"; type: "GET_GLOSSARY_ENTRIES" }
+  | {
+      target: "background";
+      type: "UPSERT_GLOSSARY_ENTRY";
+      entry: GlossaryEntry;
+    }
+  | { target: "background"; type: "REMOVE_GLOSSARY_ENTRY"; id: string }
   | { target: "background"; type: "CANCEL_TRANSLATION_JOB"; requestId: string }
   | { target: "background"; type: "CLEAR_TRANSLATION_JOB"; requestId: string }
   | { target: "background"; type: "CANCEL_TRANSLATION_REQUEST"; requestId: string }

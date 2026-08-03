@@ -146,22 +146,55 @@ try {
   if (!Array.isArray(cacheStatus?.cachedModelIds) || typeof cacheStatus?.ttsCached !== "boolean") {
     throw new Error(`모델 캐시 상태 응답이 올바르지 않습니다: ${JSON.stringify(cacheStatus)}`);
   }
-  await popup.locator("details.glossary").evaluate((element) => {
-    element.setAttribute("open", "");
+  await popup.evaluate(async () => {
+    await chrome.storage.local.remove("glossaryEntries");
   });
-  await popup.locator("#glossary-source").fill("OngeulSmokeTerm");
-  await popup.locator("#glossary-target").fill("온글검증용어");
-  await popup.locator("#glossary-add").click();
+  const glossaryPeer = await context.newPage();
+  glossaryPeer.on("pageerror", (error) => {
+    errors.push(`glossary peer: ${error.message}`);
+  });
+  await glossaryPeer.goto(`chrome-extension://${extensionId}/sidepanel.html`);
+  await glossaryPeer.locator("#product-ui").waitFor({ state: "visible" });
+  for (const panel of [popup, glossaryPeer]) {
+    await panel.locator("details.glossary").evaluate((element) => {
+      element.setAttribute("open", "");
+    });
+  }
+  await popup.locator("#glossary-source").fill("OngeulSmokeTermA");
+  await popup.locator("#glossary-target").fill("온글검증용어A");
+  await glossaryPeer.locator("#glossary-source").fill("OngeulSmokeTermB");
+  await glossaryPeer.locator("#glossary-target").fill("온글검증용어B");
+  await Promise.all([
+    popup.locator("#glossary-add").click(),
+    glossaryPeer.locator("#glossary-add").click()
+  ]);
   await popup.waitForFunction(async () => {
     const stored = await chrome.storage.local.get("glossaryEntries");
-    return stored.glossaryEntries?.[0]?.target === "온글검증용어";
+    const sources = stored.glossaryEntries?.map((entry) => entry.source).sort();
+    return JSON.stringify(sources) === JSON.stringify([
+      "OngeulSmokeTermA",
+      "OngeulSmokeTermB"
+    ]);
   });
-  await popup.locator(".glossary-entry button").click();
+  await Promise.all([
+    popup.waitForFunction(() =>
+      document.querySelectorAll(".glossary-entry").length === 2
+    ),
+    glossaryPeer.waitForFunction(() =>
+      document.querySelectorAll(".glossary-entry").length === 2
+    )
+  ]);
+  await popup.locator(".glossary-entry button").first().click();
+  await glossaryPeer.waitForFunction(() =>
+    document.querySelectorAll(".glossary-entry").length === 1
+  );
+  await glossaryPeer.locator(".glossary-entry button").click();
   await popup.waitForFunction(async () => {
     const stored = await chrome.storage.local.get("glossaryEntries");
     return Array.isArray(stored.glossaryEntries) && stored.glossaryEntries.length === 0;
   });
-  console.log("LOCAL_GLOSSARY_STORAGE=PASS");
+  await glossaryPeer.close();
+  console.log("MULTI_PANEL_GLOSSARY_SERIALIZATION=PASS");
 
   await popup.locator("#youtube-translation-mode").selectOption("context");
   await popup.waitForFunction(async () =>
@@ -181,6 +214,34 @@ try {
     (await chrome.storage.sync.get("pageDisplayMode")).pageDisplayMode === "bilingual"
   );
   console.log("VNEXT_SETTINGS_PERSISTENCE=PASS");
+
+  const settingFailureInjected = await popup.evaluate(() => {
+    const originalSet = chrome.storage.sync.set;
+    globalThis.__ongeulOriginalSyncSet = originalSet;
+    chrome.storage.sync.set = function (items) {
+      if (items && Object.hasOwn(items, "youtubeTranslationMode")) {
+        return Promise.reject(new Error("injected sync write failure"));
+      }
+      return originalSet.call(chrome.storage.sync, items);
+    };
+    return chrome.storage.sync.set !== originalSet;
+  });
+  if (!settingFailureInjected) {
+    throw new Error("설정 저장 실패 주입기를 설치하지 못했습니다.");
+  }
+  try {
+    await popup.locator("#youtube-translation-mode").selectOption("context");
+    await popup.waitForFunction(async () =>
+      document.querySelector("#youtube-translation-mode")?.value === "speed" &&
+      (await chrome.storage.sync.get("youtubeTranslationMode")).youtubeTranslationMode === "speed"
+    );
+  } finally {
+    await popup.evaluate(() => {
+      chrome.storage.sync.set = globalThis.__ongeulOriginalSyncSet;
+      delete globalThis.__ongeulOriginalSyncSet;
+    });
+  }
+  console.log("SETTING_WRITE_FAILURE_ROLLBACK=PASS");
 
   await popup.evaluate(async () => {
     await chrome.storage.sync.set({ pageDisplayMode: "hover" });

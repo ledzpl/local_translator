@@ -28,6 +28,10 @@ import {
   normalizeGlossaryEntries
 } from "../shared/glossary";
 import {
+  GlossaryCoordinator,
+  createChromeGlossaryStorage
+} from "../shared/glossary-coordinator";
+import {
   containsMostlyKorean,
   normalizeLanguageCode,
   pickDetectedLanguage
@@ -54,6 +58,7 @@ let wasmFallbackOffscreenReady = false;
 let ttsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
 let ttsInterruptedByEngineRecovery = false;
 const translationRequests = new SerialTaskQueue();
+const glossaryUpdates = new GlossaryCoordinator(createChromeGlossaryStorage());
 const speechStarts = new Map<string, Promise<SpeakResponse>>();
 let latestSpeechStartId: string | null = null;
 const WEBGPU_FALLBACK_REASON_KEY = "runtimeWebGpuFallbackReason";
@@ -225,6 +230,12 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
       if (!tab?.id) return { text: "" };
       return { text: await getSelectionFromTab(tab.id) };
     }
+    case "GET_GLOSSARY_ENTRIES":
+      return glossaryUpdates.get();
+    case "UPSERT_GLOSSARY_ENTRY":
+      return glossaryUpdates.upsert(message.entry);
+    case "REMOVE_GLOSSARY_ENTRY":
+      return glossaryUpdates.remove(message.id);
     case "SPEAK_KOREAN": {
       latestSpeechStartId = message.speechId;
       const start = startKoreanSpeech(message);
@@ -783,6 +794,14 @@ function createBackgroundErrorResponse(
       } satisfies TtsStatus;
     case "GET_ACTIVE_SELECTION":
       return { text: "" };
+    case "GET_GLOSSARY_ENTRIES":
+    case "UPSERT_GLOSSARY_ENTRY":
+    case "REMOVE_GLOSSARY_ENTRY":
+      return {
+        ok: false,
+        entries: [],
+        error: errorMessage
+      };
     case "GET_TRANSLATION_JOB":
       return null;
     case "CANCEL_TRANSLATION_JOB":
