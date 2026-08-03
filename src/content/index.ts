@@ -14,13 +14,16 @@ import { LruCache } from "../shared/cache";
 import {
   captionStillMatches,
   captionTranslationKey,
+  decideCaptionRetry,
   isYoutubeCaptionWindowVisible,
   joinCaptionSegments,
   shouldRequestPendingCaption
 } from "../shared/captions";
 import {
+  canAttemptPageTranslation,
   getPageTranslationTerminalState,
   getPageTranslationTexts,
+  getTrackedPageTranslationCounts,
   isLikelyProsePreformatted,
   prioritizePageTranslationCandidates
 } from "../shared/page-text";
@@ -28,6 +31,7 @@ import { hasPrivacyConsent } from "../shared/privacy";
 import { normalizeText } from "../shared/text";
 import { isSpeechStatusFor } from "../shared/tts";
 import { createCaptionContext } from "../shared/translation-context";
+import { GLOSSARY_STORAGE_KEY } from "../shared/glossary";
 
 declare global {
   interface Window {
@@ -297,7 +301,18 @@ interface PageTranslationBlock {
   element: HTMLElement;
   sourceText: string;
   sourceSnapshot: string;
+  chunkIndex: number;
+  isRetry: boolean;
 }
+
+interface SeenPageTranslation {
+  sourceSnapshot: string;
+  chunkIndexes: Set<number>;
+  completedChunkIndexes: Set<number>;
+  failureCounts: Map<number, number>;
+}
+
+const PAGE_TRANSLATION_MAX_ATTEMPTS = 2;
 
 class InPageTranslator {
   private status: PageTranslationStatus = {
@@ -314,7 +329,8 @@ class InPageTranslator {
   private speechId: string | null = null;
   private continuous = false;
   private displayMode: PageDisplayMode = "bilingual";
-  private seenElements = new WeakSet<HTMLElement>();
+  private seenTranslations = new Map<HTMLElement, SeenPageTranslation>();
+  private activeTranslationRequestId: string | null = null;
   private scanTimer: number | null = null;
   private mutationObserver: MutationObserver | null = null;
   private readonly scheduleFromViewport = () => this.scheduleContinuousScan();
@@ -326,7 +342,7 @@ class InPageTranslator {
     this.stopContinuousObservers();
     this.continuous = continuous;
     this.displayMode = displayMode;
-    this.seenElements = new WeakSet<HTMLElement>();
+    this.seenTranslations = new Map<HTMLElement, SeenPageTranslation>();
     this.applyDisplayMode();
     const blocks = this.collectBlocks(continuous);
     this.generation += 1;
@@ -348,6 +364,7 @@ class InPageTranslator {
   }
 
   stop(): PageTranslationStatus {
+    this.cancelActiveTranslation();
     this.stopContinuousObservers();
     if (this.status.state !== "idle") {
       this.generation += 1;
@@ -359,9 +376,11 @@ class InPageTranslator {
 
   restore(): PageTranslationStatus {
     this.generation += 1;
+    this.cancelActiveTranslation();
     this.stopActiveSpeech();
     this.stopContinuousObservers();
     this.removeTranslations();
+    this.seenTranslations = new Map<HTMLElement, SeenPageTranslation>();
     this.toolbarHost?.remove();
     this.toolbarHost = null;
     this.status = {
@@ -398,8 +417,13 @@ class InPageTranslator {
       visible: boolean;
     }> = [];
 
+    for (const [element, seen] of this.seenTranslations) {
+      if (!element.isConnected) {
+        this.discardSeenTranslation(element, seen.sourceSnapshot);
+      }
+    }
+
     for (const element of document.querySelectorAll<HTMLElement>(selector)) {
-      if (this.seenElements.has(element)) continue;
       if (element.closest(blocked)) continue;
       if (element.querySelector(selector)) continue;
       if (
@@ -415,12 +439,38 @@ class InPageTranslator {
       if (rect.width === 0 || rect.height === 0) continue;
       const sourceSnapshot = readPageSourceText(element);
       const sourceTexts = getPageTranslationTexts(sourceSnapshot);
+      const seen = this.seenTranslations.get(element);
+      if (seen && seen.sourceSnapshot !== sourceSnapshot) {
+        this.discardSeenTranslation(element, seen.sourceSnapshot);
+      }
       const visible = rect.bottom >= -window.innerHeight * .45 &&
         rect.top <= window.innerHeight * 1.45;
       if (visibleOnly && !visible) continue;
-      for (const sourceText of sourceTexts) {
+      for (let chunkIndex = 0; chunkIndex < sourceTexts.length; chunkIndex += 1) {
+        if (
+          seen?.sourceSnapshot === sourceSnapshot &&
+          (
+            seen.chunkIndexes.has(chunkIndex) ||
+            !canAttemptPageTranslation(
+              seen.failureCounts.get(chunkIndex) ?? 0,
+              PAGE_TRANSLATION_MAX_ATTEMPTS
+            )
+          )
+        ) {
+          continue;
+        }
+        const sourceText = sourceTexts[chunkIndex]!;
+        const failureCount = seen?.sourceSnapshot === sourceSnapshot
+          ? seen.failureCounts.get(chunkIndex) ?? 0
+          : 0;
         candidates.push({
-          value: { element, sourceText, sourceSnapshot },
+          value: {
+            element,
+            sourceText,
+            sourceSnapshot,
+            chunkIndex,
+            isRetry: failureCount > 0
+          },
           sourceText,
           visible
         });
@@ -429,7 +479,19 @@ class InPageTranslator {
 
     const selected = prioritizePageTranslationCandidates(candidates)
       .map((candidate) => candidate.value);
-    for (const block of selected) this.seenElements.add(block.element);
+    for (const block of selected) {
+      let seen = this.seenTranslations.get(block.element);
+      if (!seen || seen.sourceSnapshot !== block.sourceSnapshot) {
+        seen = {
+          sourceSnapshot: block.sourceSnapshot,
+          chunkIndexes: new Set<number>(),
+          completedChunkIndexes: new Set<number>(),
+          failureCounts: new Map<number, number>()
+        };
+        this.seenTranslations.set(block.element, seen);
+      }
+      seen.chunkIndexes.add(block.chunkIndex);
+    }
     return selected;
   }
 
@@ -439,28 +501,54 @@ class InPageTranslator {
   ): Promise<void> {
     for (const block of blocks) {
       if (generation !== this.generation) return;
+      if (
+        !block.element.isConnected ||
+        readPageSourceText(block.element) !== block.sourceSnapshot
+      ) {
+        this.discardSeenTranslation(block.element, block.sourceSnapshot);
+        continue;
+      }
       try {
+        const requestId = createRequestId();
+        this.activeTranslationRequestId = requestId;
         const response = await chrome.runtime.sendMessage({
           target: "background",
           type: "TRANSLATE",
-          requestId: createRequestId(),
+          requestId,
           text: block.sourceText,
           sourceLanguage: "auto",
           origin: "page"
         }) as TranslationResponse;
+        if (this.activeTranslationRequestId === requestId) {
+          this.activeTranslationRequestId = null;
+        }
         if (generation !== this.generation) return;
-        if (
-          response.ok &&
+        const sourceStillMatches =
           block.element.isConnected &&
-          readPageSourceText(block.element) === block.sourceSnapshot
-        ) {
-          this.renderTranslation(block.element, response.translation);
+          readPageSourceText(block.element) === block.sourceSnapshot;
+        if (!sourceStillMatches) {
+          // A SPA replaced this snapshot while inference was running. It is no
+          // longer a failed current sentence; remove it from the batch totals
+          // and let the observer enqueue the element's new snapshot.
+          this.discardSeenTranslation(block.element, block.sourceSnapshot);
+        } else if (response.ok) {
+          this.recordBlockSuccess(block);
+          this.renderTranslation(block, response.translation);
           this.status.completed += 1;
         } else {
-          this.status.failed += 1;
+          this.recordBlockFailure(block);
         }
       } catch {
-        this.status.failed += 1;
+        this.activeTranslationRequestId = null;
+        if (generation !== this.generation) return;
+        if (
+          !block.element.isConnected ||
+          readPageSourceText(block.element) !== block.sourceSnapshot
+        ) {
+          this.discardSeenTranslation(block.element, block.sourceSnapshot);
+        } else {
+          this.recordBlockFailure(block);
+        }
       }
       this.updateToolbar();
     }
@@ -485,10 +573,15 @@ class InPageTranslator {
     }
   }
 
-  private renderTranslation(element: HTMLElement, translation: string): void {
+  private renderTranslation(
+    block: PageTranslationBlock,
+    translation: string
+  ): void {
+    const { element } = block;
     ensurePageOriginalWrapper(element);
     const host = document.createElement("span");
     host.dataset.ongeulPageTranslation = "true";
+    host.dataset.ongeulPageTranslationChunk = String(block.chunkIndex);
     host.lang = "ko";
     host.setAttribute("translate", "no");
     const shadow = host.attachShadow({ mode: "open" });
@@ -506,20 +599,101 @@ class InPageTranslator {
       speak,
       createElement("span", "text", translation)
     );
-    element.append(host);
+    const nextChunk = Array.from(element.children).find((child) =>
+      child instanceof HTMLElement &&
+      child.dataset.ongeulPageTranslation === "true" &&
+      Number(child.dataset.ongeulPageTranslationChunk) > block.chunkIndex
+    );
+    element.insertBefore(host, nextChunk ?? null);
+    element.dataset.ongeulPageHasTranslation = "true";
+  }
+
+  private recordBlockSuccess(block: PageTranslationBlock): void {
+    const seen = this.seenTranslations.get(block.element);
+    if (!seen || seen.sourceSnapshot !== block.sourceSnapshot) return;
+    const previousFailures = seen.failureCounts.get(block.chunkIndex) ?? 0;
+    if (previousFailures > 0) {
+      this.status.failed = Math.max(0, this.status.failed - 1);
+      seen.failureCounts.delete(block.chunkIndex);
+    }
+    seen.completedChunkIndexes.add(block.chunkIndex);
+    if (seen.failureCounts.size === 0) {
+      delete block.element.dataset.ongeulPageTranslationFailed;
+    }
+  }
+
+  private recordBlockFailure(block: PageTranslationBlock): void {
+    const seen = this.seenTranslations.get(block.element);
+    if (seen?.sourceSnapshot === block.sourceSnapshot) {
+      const previousFailures = seen.failureCounts.get(block.chunkIndex) ?? 0;
+      seen.chunkIndexes.delete(block.chunkIndex);
+      seen.failureCounts.set(
+        block.chunkIndex,
+        previousFailures + 1
+      );
+      if (previousFailures === 0) this.status.failed += 1;
+    } else {
+      this.status.failed += 1;
+    }
+    block.element.dataset.ongeulPageTranslationFailed = "true";
+  }
+
+  private discardSeenTranslation(
+    element: HTMLElement,
+    sourceSnapshot: string
+  ): void {
+    const seen = this.seenTranslations.get(element);
+    if (!seen || seen.sourceSnapshot !== sourceSnapshot) return;
+    const counts = getTrackedPageTranslationCounts({
+      chunkIndexes: seen.chunkIndexes,
+      completedChunkIndexes: seen.completedChunkIndexes,
+      failedChunkIndexes: seen.failureCounts.keys()
+    });
+    this.status.total = Math.max(0, this.status.total - counts.total);
+    this.status.completed = Math.max(
+      0,
+      this.status.completed - counts.completed
+    );
+    this.status.failed = Math.max(0, this.status.failed - counts.failed);
+    this.seenTranslations.delete(element);
+    element.querySelectorAll<HTMLElement>(
+      ":scope > [data-ongeul-page-translation]"
+    ).forEach((translation) => translation.remove());
+    delete element.dataset.ongeulPageHasTranslation;
+    delete element.dataset.ongeulPageTranslationFailed;
   }
 
   private startContinuousObservers(): void {
     window.addEventListener("scroll", this.scheduleFromViewport, { passive: true });
+    document.addEventListener("scroll", this.scheduleFromViewport, {
+      passive: true,
+      capture: true
+    });
     window.addEventListener("resize", this.scheduleFromViewport, { passive: true });
     if (document.body) {
       this.mutationObserver = new MutationObserver(() => this.scheduleContinuousScan());
-      this.mutationObserver.observe(document.body, { childList: true, subtree: true });
+      this.mutationObserver.observe(document.body, {
+        attributes: true,
+        attributeFilter: [
+          "class",
+          "style",
+          "hidden",
+          "aria-hidden",
+          "aria-expanded",
+          "aria-selected",
+          "data-state",
+          "open"
+        ],
+        childList: true,
+        characterData: true,
+        subtree: true
+      });
     }
   }
 
   private stopContinuousObservers(): void {
     window.removeEventListener("scroll", this.scheduleFromViewport);
+    document.removeEventListener("scroll", this.scheduleFromViewport, true);
     window.removeEventListener("resize", this.scheduleFromViewport);
     this.mutationObserver?.disconnect();
     this.mutationObserver = null;
@@ -543,12 +717,28 @@ class InPageTranslator {
       return;
     }
     const blocks = this.collectBlocks(true);
-    if (blocks.length === 0) return;
+    if (blocks.length === 0) {
+      this.status = {
+        ...this.status,
+        state: getPageTranslationTerminalState(
+          this.status.total,
+          this.status.failed
+        ),
+        error:
+          this.status.failed === this.status.total && this.status.total > 0
+            ? "페이지 문장을 번역하지 못했습니다."
+            : this.status.failed > 0
+              ? `${this.status.failed}개 문장을 번역하지 못했습니다.`
+              : undefined
+      };
+      this.updateToolbar();
+      return;
+    }
     const generation = this.generation;
     this.status = {
       ...this.status,
       state: "translating",
-      total: this.status.total + blocks.length,
+      total: this.status.total + blocks.filter((block) => !block.isRetry).length,
       hasMore: true,
       error: undefined
     };
@@ -563,6 +753,20 @@ class InPageTranslator {
       html[data-ongeul-page-display-mode="translation"] [data-ongeul-page-original],
       html[data-ongeul-page-display-mode="hover"] [data-ongeul-page-original] {
         display: none !important;
+      }
+      html[data-ongeul-page-display-mode="translation"]
+        [data-ongeul-page-source]:not([data-ongeul-page-has-translation="true"])
+        > [data-ongeul-page-original],
+      html[data-ongeul-page-display-mode="translation"]
+        [data-ongeul-page-translation-failed="true"]
+        > [data-ongeul-page-original],
+      html[data-ongeul-page-display-mode="hover"]
+        [data-ongeul-page-source]:not([data-ongeul-page-has-translation="true"])
+        > [data-ongeul-page-original],
+      html[data-ongeul-page-display-mode="hover"]
+        [data-ongeul-page-translation-failed="true"]
+        > [data-ongeul-page-original] {
+        display: initial !important;
       }
       html[data-ongeul-page-display-mode="hover"] [data-ongeul-page-source]:hover > [data-ongeul-page-original] {
         display: initial !important;
@@ -713,6 +917,17 @@ class InPageTranslator {
     this.speechId = null;
   }
 
+  private cancelActiveTranslation(): void {
+    const requestId = this.activeTranslationRequestId;
+    this.activeTranslationRequestId = null;
+    if (!requestId) return;
+    void chrome.runtime.sendMessage({
+      target: "background",
+      type: "CANCEL_TRANSLATION_REQUEST",
+      requestId
+    }).catch(() => undefined);
+  }
+
   private finishSpeechRequest(request: number, speechId: string): void {
     if (request !== this.speechRequest || this.speechId !== speechId) return;
     if (this.speechPollTimer) window.clearTimeout(this.speechPollTimer);
@@ -825,6 +1040,8 @@ class InPageTranslator {
           original.remove();
         }
         delete element.dataset.ongeulPageSource;
+        delete element.dataset.ongeulPageHasTranslation;
+        delete element.dataset.ongeulPageTranslationFailed;
       });
     delete document.documentElement.dataset.ongeulPageDisplayMode;
   }
@@ -883,6 +1100,14 @@ class YouTubeCaptionTranslator {
     });
 
     chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === "local") {
+        if (!changes[GLOSSARY_STORAGE_KEY]) return;
+        this.invalidateTranslations();
+        if (hasPrivacyConsent(this.settings) && this.settings.youtubeEnabled) {
+          this.scan();
+        }
+        return;
+      }
       if (area !== "sync") return;
       const previousTranslationSettings =
         `${this.settings.modelPreference}\u0000${this.settings.devicePreference}\u0000${this.settings.youtubeTranslationMode}`;
@@ -991,7 +1216,7 @@ class YouTubeCaptionTranslator {
     const captionsButton =
       document.querySelector<HTMLButtonElement>(".ytp-subtitles-button");
     if (captionsButton?.getAttribute("aria-pressed") === "false") {
-      this.resetHiddenCaptionState();
+      this.resetHiddenCaptionState(true);
       return;
     }
     const text = readVisibleYoutubeCaption();
@@ -1012,12 +1237,13 @@ class YouTubeCaptionTranslator {
       this.applyOriginalCaptionVisibility(true);
       return;
     }
-    this.view.showSubtitleProgress(this.settings);
     if (this.translationInFlight) {
       this.pendingCaption = text;
+      this.view.showSubtitleProgress(this.settings);
       return;
     }
     if (requestKey === this.lastRequestedKey) return;
+    this.view.showSubtitleProgress(this.settings);
     this.lastRequestedKey = requestKey;
     void this.requestTranslation(text, requestKey, context);
   }
@@ -1046,13 +1272,18 @@ class YouTubeCaptionTranslator {
         return;
       }
       if (!response?.ok) {
-        this.scheduleRetry(sourceText, requestKey, generation);
+        if (this.scheduleRetry(sourceText, requestKey, generation) === "exhausted") {
+          this.view.hideSubtitle();
+          this.applyOriginalCaptionVisibility(false);
+        }
         return;
       }
       this.retryAttempts.delete(requestKey);
       if (response.sourceLanguage === "ko" || response.device === "none") {
-        this.view.hideSubtitle();
-        this.applyOriginalCaptionVisibility(false);
+        if (captionStillMatches(this.currentCaption, sourceText)) {
+          this.view.hideSubtitle();
+          this.applyOriginalCaptionVisibility(false);
+        }
         return;
       }
       this.cache.set(requestKey, response.translation);
@@ -1062,7 +1293,10 @@ class YouTubeCaptionTranslator {
         this.applyOriginalCaptionVisibility(true);
       }
     } catch {
-      this.scheduleRetry(sourceText, requestKey, generation);
+      if (this.scheduleRetry(sourceText, requestKey, generation) === "exhausted") {
+        this.view.hideSubtitle();
+        this.applyOriginalCaptionVisibility(false);
+      }
     } finally {
       this.translationInFlight = false;
       const pending = this.pendingCaption;
@@ -1094,16 +1328,17 @@ class YouTubeCaptionTranslator {
     sourceText: string,
     requestKey: string,
     generation: number
-  ): void {
-    if (
-      generation !== this.settingsGeneration ||
-      !captionStillMatches(this.currentCaption, sourceText)
-    ) {
-      return;
-    }
+  ): "scheduled" | "stale" | "exhausted" {
     const attempts = (this.retryAttempts.get(requestKey) ?? 0) + 1;
+    const decision = decideCaptionRetry({
+      generationChanged: generation !== this.settingsGeneration,
+      currentCaption: this.currentCaption,
+      sourceText,
+      nextAttempt: attempts
+    });
+    if (decision === "stale") return decision;
     this.retryAttempts.set(requestKey, attempts);
-    if (attempts > 2) return;
+    if (decision === "exhausted") return decision;
 
     this.lastRequestedKey = "";
     this.clearRetry();
@@ -1116,6 +1351,7 @@ class YouTubeCaptionTranslator {
         this.scan();
       }
     }, attempts * 800);
+    return "scheduled";
   }
 
   private invalidateTranslations(): void {
@@ -1136,12 +1372,14 @@ class YouTubeCaptionTranslator {
     }
   }
 
-  private resetHiddenCaptionState(): void {
+  private resetHiddenCaptionState(clearContext = false): void {
     this.lastRequestedKey = "";
     this.currentCaption = "";
     this.pendingCaption = "";
-    this.recentCaptions = [];
-    this.retryAttempts.clear();
+    if (clearContext) {
+      this.recentCaptions = [];
+      this.retryAttempts.clear();
+    }
     this.clearRetry();
     this.view.hideSubtitle();
   }

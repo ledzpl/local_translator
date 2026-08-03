@@ -35,6 +35,7 @@ import {
   getTtsModelFileUrl
 } from "../shared/models";
 import { SerialTaskQueue } from "../shared/serial-queue";
+import { AsyncTeardownBarrier } from "../shared/async-teardown";
 import {
   SupertonicEngine,
   clearSupertonicModelCache,
@@ -56,6 +57,10 @@ import {
   validateTtsAudio
 } from "../shared/tts";
 import { createTranslationCacheKey } from "../shared/translation-cache";
+import {
+  TaskCancelledError,
+  runCancellableTasks
+} from "../shared/cancellable-tasks";
 import {
   createGlossarySignature,
   protectGlossaryTerms,
@@ -113,10 +118,14 @@ let status: EngineStatus = { state: "idle", modelId: MODEL_ID };
 // realm. Serialize model loading, translation, reset, and TTS synthesis so a
 // page translation cannot dispatch GPU work at the same time as speech.
 const runtimeQueue = new SerialTaskQueue();
+const modelCacheQueue = new SerialTaskQueue();
 const translationCache = new LruCache<string>(220);
 const cancelledTranslationRequests = new Set<string>();
 let ttsEngine: SupertonicEngine | null = null;
 let ttsEnginePromise: Promise<SupertonicEngine> | null = null;
+let ttsEngineLoadGeneration = 0;
+let ttsEngineAbortController: AbortController | null = null;
+const ttsEngineTeardown = new AsyncTeardownBarrier();
 let forceTtsWasm = false;
 let ttsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
 let speechRun = 0;
@@ -186,14 +195,18 @@ chrome.runtime.onMessage.addListener(
     }
 
     if (message.type === "GET_MODEL_CACHE_STATUS_OFFSCREEN") {
-      void getModelCacheStatus().then(sendResponse, () => {
-        sendResponse({ cachedModelIds: [], ttsCached: false } satisfies ModelCacheStatus);
+      void getModelCacheStatus().then(sendResponse, (error) => {
+        sendResponse({
+          cachedModelIds: [],
+          ttsCached: false,
+          error: friendlyError(error)
+        } satisfies ModelCacheStatus);
       });
       return true;
     }
 
     if (message.type === "CLEAR_MODEL_CACHE_OFFSCREEN") {
-      const task = runtimeQueue.run(async () => {
+      const task = modelCacheQueue.run(async () => {
         await clearSelectedModelCache(
           message.modelPreference,
           message.includeTts === true,
@@ -206,7 +219,7 @@ chrome.runtime.onMessage.addListener(
           cachedModelIds: [],
           ttsCached: false,
           error: friendlyError(error)
-        });
+        } satisfies ModelCacheStatus);
       });
       return true;
     }
@@ -421,6 +434,7 @@ function synthesizeSpeechChunk(
 }
 
 async function getTtsEngine(): Promise<SupertonicEngine> {
+  await ttsEngineTeardown.wait();
   if (ttsEngine) return ttsEngine;
   if (ttsEnginePromise) return ttsEnginePromise;
 
@@ -428,6 +442,9 @@ async function getTtsEngine(): Promise<SupertonicEngine> {
   const voiceStyleUrl = getTtsModelFileUrl(
     `voice_styles/${TTS_VOICE_STYLE}.json`
   );
+  const loadGeneration = ++ttsEngineLoadGeneration;
+  const abortController = new AbortController();
+  ttsEngineAbortController = abortController;
   const reportProgress = (
     device: "webgpu" | "wasm",
     progress: { file: string; current: number; total: number }
@@ -452,17 +469,20 @@ async function getTtsEngine(): Promise<SupertonicEngine> {
     modelBaseUrl,
     voiceStyleUrl,
     device,
+    signal: abortController.signal,
     onProgress: (progress) => reportProgress(device, progress),
     // Network/cache reads stay outside this queue. Only ORT session creation
     // and inference share the GPU serialization boundary with translation.
-    runSessionCreate: (task) => runtimeQueue.run(task)
+    runSessionCreate: (task) => runtimeQueue.run(task),
+    runSessionRelease: (task) => runtimeQueue.run(task)
   });
 
   ttsEnginePromise = (async () => {
     if (!forceTtsWasm && "gpu" in navigator) {
       try {
         return await load("webgpu");
-      } catch {
+      } catch (error) {
+        if (abortController.signal.aborted) throw error;
         if (ttsProgressRun === speechRun && ttsStatus.state === "loading") {
           ttsStatus = {
             ...ttsStatus,
@@ -476,6 +496,7 @@ async function getTtsEngine(): Promise<SupertonicEngine> {
     try {
       return await load("wasm");
     } catch (error) {
+      if (abortController.signal.aborted) throw error;
       // A malformed Cache Storage response otherwise poisons every retry.
       // Delete the fixed-revision TTS cache only after both the preferred path
       // and WASM fail, then retry WASM exactly once.
@@ -491,14 +512,33 @@ async function getTtsEngine(): Promise<SupertonicEngine> {
       }
       return load("wasm");
     }
-  })().then((loaded) => {
+  })().then(async (loaded) => {
+    if (
+      abortController.signal.aborted ||
+      loadGeneration !== ttsEngineLoadGeneration
+    ) {
+      await runtimeQueue.run(() => loaded.release());
+      throw new DOMException("음성 모델 준비를 취소했습니다.", "AbortError");
+    }
     ttsEngine = loaded;
     return loaded;
-  }).catch((error) => {
-    ttsEnginePromise = null;
-    throw error;
   });
-  return ttsEnginePromise;
+  const activePromise = ttsEnginePromise;
+  void activePromise.then(
+    () => {
+      if (ttsEnginePromise === activePromise) ttsEnginePromise = null;
+      if (ttsEngineAbortController === abortController) {
+        ttsEngineAbortController = null;
+      }
+    },
+    () => {
+      if (ttsEnginePromise === activePromise) ttsEnginePromise = null;
+      if (ttsEngineAbortController === abortController) {
+        ttsEngineAbortController = null;
+      }
+    }
+  );
+  return activePromise;
 }
 
 async function playAudio(
@@ -625,35 +665,29 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
       protectedValue.text,
       request.context
     );
-    let translation: string;
-    try {
-      translation = await translateText(
-        activeEngine,
-        contextualInput,
-        request.sourceLanguage
-      );
-      if (cancelledTranslationRequests.has(request.requestId)) {
-        return cancelledTranslationResponse(request.requestId);
-      }
-    } catch (error) {
-      if (!shouldRetryTranslationOnWasm({
-        engineKind: activeEngine.kind,
-        runtimeDevice: status.device,
-        devicePreference: request.devicePreference
-      })) {
-        throw error;
-      }
-      throw new WebGpuFallbackRequiredError(friendlyError(error));
+    let translation = await translateTextWithDeviceRecovery(
+      activeEngine,
+      contextualInput,
+      request
+    );
+    if (cancelledTranslationRequests.has(request.requestId)) {
+      return cancelledTranslationResponse(request.requestId);
     }
     const contextualResult = extractContextualTranslation(
       translation,
       Boolean(request.context?.trim())
     );
     if (contextualResult === null) {
-      translation = await translateText(
+      if (cancelledTranslationRequests.has(request.requestId)) {
+        return cancelledTranslationResponse(request.requestId);
+      }
+      // The context marker can be lost by a model. The plain retry must use
+      // the same WebGPU recovery policy as the first inference; otherwise a
+      // failure here bypasses the M2M100 WASM fallback entirely.
+      translation = await translateTextWithDeviceRecovery(
         activeEngine,
         protectedValue.text,
-        request.sourceLanguage
+        request
       );
     } else {
       translation = contextualResult;
@@ -708,6 +742,31 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
   }
 }
 
+async function translateTextWithDeviceRecovery(
+  activeEngine: TranslationEngine,
+  text: string,
+  request: TranslateOffscreenRequest
+): Promise<string> {
+  try {
+    return await translateText(
+      activeEngine,
+      text,
+      request.sourceLanguage,
+      () => cancelledTranslationRequests.has(request.requestId)
+    );
+  } catch (error) {
+    if (error instanceof TaskCancelledError) throw error;
+    if (!shouldRetryTranslationOnWasm({
+      engineKind: activeEngine.kind,
+      runtimeDevice: status.device,
+      devicePreference: request.devicePreference
+    })) {
+      throw error;
+    }
+    throw new WebGpuFallbackRequiredError(friendlyError(error));
+  }
+}
+
 function cancelledTranslationResponse(requestId: string): TranslationResponse {
   cancelledTranslationRequests.delete(requestId);
   return {
@@ -721,24 +780,28 @@ function cancelledTranslationResponse(requestId: string): TranslationResponse {
 async function translateText(
   activeEngine: TranslationEngine,
   text: string,
-  sourceLanguage: string
+  sourceLanguage: string,
+  isCancelled: () => boolean
 ): Promise<string> {
-  const translated: string[] = [];
-  for (const chunk of chunkText(text)) {
-    const result = await translateChunk(activeEngine, chunk, sourceLanguage);
-    if (!hasUsableTranslationOutput(chunk, result)) {
-      const modelName =
-        activeEngine.kind === "translategemma"
-          ? "TranslateGemma"
-          : activeEngine.kind === "m2m100"
-            ? "M2M100"
-            : "SMaLL-100";
-      throw new TranslationOutputError(
-        `${modelName}이 올바른 번역 결과를 만들지 못했습니다.`
-      );
-    }
-    translated.push(result);
-  }
+  const translated = await runCancellableTasks(
+    chunkText(text),
+    async (chunk) => {
+      const result = await translateChunk(activeEngine, chunk, sourceLanguage);
+      if (!hasUsableTranslationOutput(chunk, result)) {
+        const modelName =
+          activeEngine.kind === "translategemma"
+            ? "TranslateGemma"
+            : activeEngine.kind === "m2m100"
+              ? "M2M100"
+              : "SMaLL-100";
+        throw new TranslationOutputError(
+          `${modelName}이 올바른 번역 결과를 만들지 못했습니다.`
+        );
+      }
+      return result;
+    },
+    isCancelled
+  );
   return translated.join(" ").trim();
 }
 
@@ -1259,6 +1322,48 @@ async function clearSelectedModelCache(
   includeTts: boolean,
   includeTranslation: boolean
 ): Promise<void> {
+  if (includeTts) {
+    await ttsEngineTeardown.run(() => clearSelectedModelCacheWithTts(
+      preference,
+      includeTranslation
+    ));
+    return;
+  }
+
+  await runtimeQueue.run(() => clearSelectedModelCacheAfterTtsSettled(
+    preference,
+    false,
+    includeTranslation
+  ));
+}
+
+async function clearSelectedModelCacheWithTts(
+  preference: ModelPreference | undefined,
+  includeTranslation: boolean
+): Promise<void> {
+  stopSpeech({ broadcast: false });
+  const pendingLoad = ttsEnginePromise;
+  ttsEngineLoadGeneration += 1;
+  ttsEngineAbortController?.abort();
+  ttsEngineAbortController = null;
+
+  // A load can still be waiting for a serialized ORT session create/release.
+  // Wait outside runtimeQueue so teardown can use that queue without a cycle.
+  await pendingLoad?.catch(() => undefined);
+  ttsEnginePromise = null;
+
+  await runtimeQueue.run(() => clearSelectedModelCacheAfterTtsSettled(
+    preference,
+    true,
+    includeTranslation
+  ));
+}
+
+async function clearSelectedModelCacheAfterTtsSettled(
+  preference: ModelPreference | undefined,
+  includeTts: boolean,
+  includeTranslation: boolean
+): Promise<void> {
   const selectedIds = !includeTranslation
     ? []
     : preference
@@ -1282,14 +1387,19 @@ async function clearSelectedModelCache(
       .map((request) => cache.delete(request)));
   }
   if (includeTts) {
-    stopSpeech({ broadcast: false });
-    if (ttsEngine) await ttsEngine.release();
+    const engineToRelease = ttsEngine;
     ttsEngine = null;
-    ttsEnginePromise = null;
+    let releaseError: unknown;
+    try {
+      await engineToRelease?.release();
+    } catch (error) {
+      releaseError = error;
+    }
     forceTtsWasm = false;
     ttsStatus = { state: "idle", modelId: TTS_MODEL_ID };
     await clearSupertonicModelCache();
     broadcastTtsStatus();
+    if (releaseError) throw releaseError;
   }
   translationCache.clear();
 }

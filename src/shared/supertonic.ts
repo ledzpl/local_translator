@@ -83,28 +83,33 @@ export class SupertonicEngine {
     modelBaseUrl: string;
     voiceStyleUrl: string;
     device: SupertonicDevice;
+    signal?: AbortSignal;
     onProgress?: (progress: SupertonicLoadProgress) => void;
     runSessionCreate?: (
       task: () => Promise<ort.InferenceSession>
     ) => Promise<ort.InferenceSession>;
+    runSessionRelease?: (task: () => Promise<void>) => Promise<void>;
   }): Promise<SupertonicEngine> {
     const {
       modelBaseUrl,
       voiceStyleUrl,
       device,
+      signal,
       onProgress,
-      runSessionCreate
+      runSessionCreate,
+      runSessionRelease
     } = options;
     const [config, indexer, style] = await Promise.all([
-      fetchJson<SupertonicConfig>(`${modelBaseUrl}/tts.json`),
-      fetchJson<number[]>(`${modelBaseUrl}/unicode_indexer.json`),
-      loadStyle(voiceStyleUrl)
+      fetchJson<SupertonicConfig>(`${modelBaseUrl}/tts.json`, signal),
+      fetchJson<number[]>(`${modelBaseUrl}/unicode_indexer.json`, signal),
+      loadStyle(voiceStyleUrl, signal)
     ]);
     validateConfig(config);
 
     const sessions: ort.InferenceSession[] = [];
     try {
       for (let index = 0; index < MODEL_FILES.length; index += 1) {
+        throwIfAborted(signal);
         const [filename, label] = MODEL_FILES[index]!;
         onProgress?.({
           file: label,
@@ -112,7 +117,8 @@ export class SupertonicEngine {
           total: MODEL_FILES.length
         });
         const modelBytes = await fetchModelBytes(
-          `${modelBaseUrl}/${filename}`
+          `${modelBaseUrl}/${filename}`,
+          signal
         );
         const createSession = () => ort.InferenceSession.create(
           modelBytes,
@@ -129,6 +135,7 @@ export class SupertonicEngine {
           )
         );
       }
+      throwIfAborted(signal);
       onProgress?.({
         file: "음성 모델 준비 완료",
         current: MODEL_FILES.length,
@@ -145,7 +152,13 @@ export class SupertonicEngine {
         sessions[3]!
       );
     } catch (error) {
-      await Promise.allSettled(sessions.map((session) => session.release()));
+      const releaseSessions = async () => {
+        await releaseSupertonicSessions(sessions);
+      };
+      await (runSessionRelease
+        ? runSessionRelease(releaseSessions)
+        : releaseSessions()
+      ).catch(() => undefined);
       throw error;
     }
   }
@@ -253,12 +266,26 @@ export class SupertonicEngine {
   }
 
   async release(): Promise<void> {
-    await Promise.all([
-      this.durationPredictor.release(),
-      this.textEncoder.release(),
-      this.vectorEstimator.release(),
-      this.vocoder.release()
+    await releaseSupertonicSessions([
+      this.durationPredictor,
+      this.textEncoder,
+      this.vectorEstimator,
+      this.vocoder
     ]);
+  }
+}
+
+export async function releaseSupertonicSessions(
+  sessions: readonly Pick<ort.InferenceSession, "release">[]
+): Promise<void> {
+  const results = await Promise.allSettled(
+    sessions.map((session) => session.release())
+  );
+  const errors = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : []
+  );
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "Supertonic 3 세션을 모두 해제하지 못했습니다.");
   }
 }
 
@@ -315,8 +342,11 @@ function createGaussianNoise(length: number): Float32Array {
   return output;
 }
 
-async function loadStyle(url: string): Promise<SupertonicStyle> {
-  const serialized = await fetchJson<SerializedStyle>(url);
+async function loadStyle(
+  url: string,
+  signal?: AbortSignal
+): Promise<SupertonicStyle> {
+  const serialized = await fetchJson<SerializedStyle>(url, signal);
   return {
     ttl: deserializeTensor(serialized.style_ttl, "style_ttl"),
     dp: deserializeTensor(serialized.style_dp, "style_dp")
@@ -363,37 +393,53 @@ function flattenNumbers(values: unknown[]): number[] {
   return output;
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const bytes = await fetchModelBytes(url);
+async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const bytes = await fetchModelBytes(url, signal);
   return JSON.parse(new TextDecoder().decode(bytes)) as T;
 }
 
-async function fetchModelBytes(url: string): Promise<ArrayBuffer> {
+async function fetchModelBytes(
+  url: string,
+  signal?: AbortSignal
+): Promise<ArrayBuffer> {
+  throwIfAborted(signal);
   const cache = await caches.open(MODEL_CACHE_NAME);
   const cached = await cache.match(url);
   if (cached) {
     const bytes = await cached.arrayBuffer();
+    throwIfAborted(signal);
     if (bytes.byteLength > 0) return bytes;
     await cache.delete(url);
   }
 
-  const response = await fetch(url);
+  const response = await fetch(url, { signal });
   if (!response.ok) {
     throw new Error(
       `Supertonic 3 파일을 받지 못했습니다 (${response.status}): ${url}`
     );
   }
-  const cacheResponse = response.clone();
-  const cacheWrite = cache.put(url, cacheResponse).catch(() => undefined);
-  const [bytes] = await Promise.all([
+  const cacheWrite = cache.put(url, response.clone()).catch(() => undefined);
+  // Wait for both branches even when reading the aborted response fails.
+  // Otherwise cache.put() can outlive the rejected load and race a cache clear
+  // that is waiting for the load promise to settle.
+  const [bytesResult] = await Promise.allSettled([
     response.arrayBuffer(),
     cacheWrite
   ]);
+  if (bytesResult.status === "rejected") throw bytesResult.reason;
+  const bytes = bytesResult.value;
+  throwIfAborted(signal);
   if (bytes.byteLength === 0) {
     await cache.delete(url);
     throw new Error(`Supertonic 3 파일이 비어 있습니다: ${url}`);
   }
   return bytes;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new DOMException("음성 모델 준비를 취소했습니다.", "AbortError");
+  }
 }
 
 export async function clearSupertonicModelCache(): Promise<void> {

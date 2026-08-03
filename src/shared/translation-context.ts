@@ -14,9 +14,13 @@ export function extractContextualTranslation(
   hasContext: boolean
 ): string | null {
   if (!hasContext) return translated.trim();
-  const markerIndex = translated.toUpperCase().lastIndexOf(TRANSLATION_CONTEXT_MARKER);
-  if (markerIndex < 0) return null;
-  return translated.slice(markerIndex + TRANSLATION_CONTEXT_MARKER.length).trim();
+  const markerPattern = new RegExp(TRANSLATION_CONTEXT_MARKER, "giu");
+  let lastMatch: RegExpExecArray | null = null;
+  for (let match = markerPattern.exec(translated); match; match = markerPattern.exec(translated)) {
+    lastMatch = match;
+  }
+  if (!lastMatch) return null;
+  return translated.slice(lastMatch.index + lastMatch[0].length).trim();
 }
 
 export function createCaptionContext(

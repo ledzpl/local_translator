@@ -17,6 +17,7 @@ import {
   type SpeakResponse,
   type TtsStatus,
   type TranslationOrigin,
+  type TranslationJobActionResponse,
   type TranslationJobState,
   type TranslationResponse,
   type UiTranslationJobMessage,
@@ -40,6 +41,7 @@ import {
   normalizeText
 } from "../shared/text";
 import { shouldMarkSpeechIdle } from "../shared/tts";
+import { TranslationJobCoordinator } from "../shared/translation-job";
 
 let creatingOffscreen: Promise<void> | null = null;
 let recoveringOffscreen: Promise<void> | null = null;
@@ -52,6 +54,11 @@ let latestSpeechStartId: string | null = null;
 const WEBGPU_FALLBACK_REASON_KEY = "runtimeWebGpuFallbackReason";
 const TRANSLATION_JOB_KEY = "activeTranslationJob";
 const cancelledTranslationRequests = new Set<string>();
+const translationJobs = new TranslationJobCoordinator({
+  read: getStoredTranslationJob,
+  write: setStoredTranslationJob,
+  clear: clearStoredTranslationJob
+});
 
 chrome.runtime.onInstalled.addListener(() => {
   void chrome.contextMenus.removeAll().then(() => {
@@ -101,12 +108,14 @@ chrome.runtime.onMessage.addListener(
       .then(sendResponse)
       .catch(async (error) => {
         const response = createBackgroundErrorResponse(message, error);
-        if (message.type === "TRANSLATE" && message.origin === "popup") {
+        if (message.type === "TRANSLATE") {
           cancelledTranslationRequests.delete(message.requestId);
-          await completeTranslationJob(
-            message.requestId,
-            response as TranslationResponse
-          ).catch(() => undefined);
+          if (message.origin === "popup") {
+            await translationJobs.complete(
+              message.requestId,
+              response as TranslationResponse
+            ).catch(() => undefined);
+          }
         }
         sendResponse(response);
       });
@@ -144,8 +153,16 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
       const sourceLanguage = await resolveSourceLanguage(text, message.sourceLanguage);
       if (message.origin === "popup") {
         cancelledTranslationRequests.delete(message.requestId);
-        const existingJob = await getTranslationJob();
-        if (existingJob?.state === "running" && existingJob.requestId !== message.requestId) {
+        const startedAt = Date.now();
+        const claim = await translationJobs.start({
+          requestId: message.requestId,
+          state: "running",
+          text,
+          sourceLanguage,
+          startedAt,
+          updatedAt: startedAt
+        });
+        if (!claim.changed) {
           return {
             ok: false,
             requestId: message.requestId,
@@ -153,14 +170,6 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
             error: "이미 진행 중인 번역이 있습니다. 작업공간에서 완료하거나 취소해 주세요."
           } satisfies TranslationResponse;
         }
-        await setTranslationJob({
-          requestId: message.requestId,
-          state: "running",
-          text,
-          sourceLanguage,
-          startedAt: Date.now(),
-          updatedAt: Date.now()
-        });
       }
       const glossaryValue = await chrome.storage.local.get(GLOSSARY_STORAGE_KEY);
       const glossary = normalizeGlossaryEntries(glossaryValue[GLOSSARY_STORAGE_KEY]);
@@ -191,9 +200,9 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
         );
       }
       if (message.origin === "popup") {
-        const completed = await completeTranslationJob(message.requestId, response);
-        cancelledTranslationRequests.delete(message.requestId);
-        if (!completed) {
+        const completed = await translationJobs.complete(message.requestId, response);
+        if (!completed.changed) {
+          cancelledTranslationRequests.delete(message.requestId);
           return {
             ok: false,
             requestId: message.requestId,
@@ -202,6 +211,7 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
           } satisfies TranslationResponse;
         }
       }
+      cancelledTranslationRequests.delete(message.requestId);
       return response;
     }
     case "GET_ACTIVE_SELECTION": {
@@ -249,34 +259,58 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
         displayMode: message.displayMode
       });
     case "GET_TRANSLATION_JOB":
-      return getTranslationJob();
+      return translationJobs.get();
     case "CANCEL_TRANSLATION_JOB": {
-      const job = await getTranslationJob();
-      if (job?.requestId !== message.requestId || job.state !== "running") return job;
-      cancelledTranslationRequests.add(message.requestId);
-      const cancelled: TranslationJobState = {
-        ...job,
-        state: "cancelled",
-        updatedAt: Date.now(),
-        response: {
-          ok: false,
-          requestId: job.requestId,
-          code: "TRANSLATION_CANCELLED",
-          error: "번역을 취소했습니다."
-        }
+      const cancelledResponse: TranslationResponse = {
+        ok: false,
+        requestId: message.requestId,
+        code: "TRANSLATION_CANCELLED",
+        error: "번역을 취소했습니다."
       };
-      await setTranslationJob(cancelled);
+      // Mark the request before entering the serialized state transition. An
+      // offscreen completion can otherwise slip between the cancelled job
+      // write and this tombstone, leaving a stale cancellation behind.
+      cancelledTranslationRequests.add(message.requestId);
+      const cancelled = await translationJobs.cancel(
+        message.requestId,
+        cancelledResponse
+      );
+      if (cancelled.changed) {
+        await sendToExistingOffscreen({
+          target: "offscreen",
+          type: "CANCEL_TRANSLATION_OFFSCREEN",
+          requestId: message.requestId
+        }).catch(() => undefined);
+      } else {
+        cancelledTranslationRequests.delete(message.requestId);
+      }
+      return {
+        ok: cancelled.changed || cancelled.job?.requestId === message.requestId,
+        job: cancelled.job,
+        error:
+          cancelled.changed || cancelled.job?.requestId === message.requestId
+            ? undefined
+            : "취소할 번역 작업이 이미 변경됐습니다."
+      } satisfies TranslationJobActionResponse;
+    }
+    case "CLEAR_TRANSLATION_JOB": {
+      const cleared = await translationJobs.clear(message.requestId);
+      return {
+        ok: cleared.changed,
+        job: cleared.job,
+        error: cleared.changed
+          ? undefined
+          : "실행 중이거나 더 최근인 번역 작업은 지울 수 없습니다."
+      } satisfies TranslationJobActionResponse;
+    }
+    case "CANCEL_TRANSLATION_REQUEST":
+      cancelledTranslationRequests.add(message.requestId);
       await sendToExistingOffscreen({
         target: "offscreen",
         type: "CANCEL_TRANSLATION_OFFSCREEN",
         requestId: message.requestId
       }).catch(() => undefined);
-      return cancelled;
-    }
-    case "CLEAR_TRANSLATION_JOB":
-      await chrome.storage.session.remove(TRANSLATION_JOB_KEY);
-      broadcastTranslationJob(null);
-      return null;
+      return { ok: true, requestId: message.requestId };
     case "PREPARE_MODEL": {
       const settings = await getSettings();
       if (!hasPrivacyConsent(settings)) {
@@ -707,12 +741,23 @@ function createBackgroundErrorResponse(
     case "GET_ACTIVE_SELECTION":
       return { text: "" };
     case "GET_TRANSLATION_JOB":
+      return null;
     case "CANCEL_TRANSLATION_JOB":
     case "CLEAR_TRANSLATION_JOB":
-      return null;
+      return {
+        ok: false,
+        job: null,
+        error: errorMessage
+      } satisfies TranslationJobActionResponse;
+    case "CANCEL_TRANSLATION_REQUEST":
+      return { ok: false, requestId: message.requestId, error: errorMessage };
     case "GET_MODEL_CACHE_STATUS":
     case "CLEAR_MODEL_CACHE":
-      return { cachedModelIds: [], ttsCached: false } satisfies ModelCacheStatus;
+      return {
+        cachedModelIds: [],
+        ttsCached: false,
+        error: errorMessage
+      } satisfies ModelCacheStatus;
   }
 }
 
@@ -754,30 +799,20 @@ async function sendPageCommand(
   }
 }
 
-async function getTranslationJob(): Promise<TranslationJobState | null> {
+async function getStoredTranslationJob(): Promise<TranslationJobState | null> {
   const stored = await chrome.storage.session.get(TRANSLATION_JOB_KEY);
   const value = stored[TRANSLATION_JOB_KEY];
   return value && typeof value === "object" ? value as TranslationJobState : null;
 }
 
-async function setTranslationJob(job: TranslationJobState): Promise<void> {
+async function setStoredTranslationJob(job: TranslationJobState): Promise<void> {
   await chrome.storage.session.set({ [TRANSLATION_JOB_KEY]: job });
   broadcastTranslationJob(job);
 }
 
-async function completeTranslationJob(
-  requestId: string,
-  response: TranslationResponse
-): Promise<boolean> {
-  const current = await getTranslationJob();
-  if (current?.requestId !== requestId || current.state !== "running") return false;
-  await setTranslationJob({
-    ...current,
-    state: response.ok ? "complete" : "error",
-    response,
-    updatedAt: Date.now()
-  });
-  return true;
+async function clearStoredTranslationJob(): Promise<void> {
+  await chrome.storage.session.remove(TRANSLATION_JOB_KEY);
+  broadcastTranslationJob(null);
 }
 
 function broadcastTranslationJob(job: TranslationJobState | null): void {

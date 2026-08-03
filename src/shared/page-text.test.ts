@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  canAttemptPageTranslation,
   getPageTranslationTerminalState,
+  getTrackedPageTranslationCounts,
   getPageTranslationText,
   getPageTranslationTexts,
   isLikelyProsePreformatted,
@@ -84,5 +86,19 @@ describe("page translation text selection", () => {
       source,
       "A replacement paragraph rendered by the SPA."
     )).toBe(false);
+  });
+
+  it("allows one bounded retry instead of permanently losing or looping a block", () => {
+    expect(canAttemptPageTranslation(0)).toBe(true);
+    expect(canAttemptPageTranslation(1)).toBe(true);
+    expect(canAttemptPageTranslation(2)).toBe(false);
+  });
+
+  it("counts a pending retry as one logical block when discarding a SPA snapshot", () => {
+    expect(getTrackedPageTranslationCounts({
+      chunkIndexes: [0, 1],
+      completedChunkIndexes: [0],
+      failedChunkIndexes: [1]
+    })).toEqual({ total: 2, completed: 1, failed: 1 });
   });
 });

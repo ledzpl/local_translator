@@ -14,6 +14,7 @@ import {
   type PageTranslationStatus,
   type SpeakResponse,
   type TtsStatus,
+  type TranslationJobActionResponse,
   type TranslationResponse,
   type TranslationJobState,
   type UiTranslationJobMessage,
@@ -31,7 +32,14 @@ import {
   CURRENT_PRIVACY_CONSENT_VERSION,
   hasPrivacyConsent
 } from "../shared/privacy";
-import { shouldApplyInitialSelection } from "../shared/popup-state";
+import {
+  shouldApplyInitialSelection,
+  shouldApplyRuntimeSnapshot,
+  shouldApplyTranslationJobAction,
+  shouldApplyTrackedTranslationResponse,
+  shouldApplyUntrackedTranslationResponse,
+  shouldLockModelControls
+} from "../shared/popup-state";
 import { RevisionedCommitter } from "../shared/revisioned-committer";
 import { isSpeechStatusFor } from "../shared/tts";
 import {
@@ -319,12 +327,21 @@ let currentTranslationJob: TranslationJobState | null = null;
 let glossaryEntries: GlossaryEntry[] = [];
 let modelPreparationInFlight = false;
 let modelCacheActionInFlight = false;
+let modelSettingsUpdateInFlight = false;
+let persistedModelPreference: ModelPreference = DEFAULT_SETTINGS.modelPreference;
+let persistedDevicePreference: DevicePreference = DEFAULT_SETTINGS.devicePreference;
 let currentEngineStatus: EngineStatus = { state: "idle", modelId: MODEL_ID };
 let currentTtsStatus: TtsStatus = { state: "idle", modelId: TTS_MODEL_ID };
 let currentSpeechId: string | null = null;
 let translationInFlight = false;
 let sourceEditRevision = 0;
-const subtitleSizeCommitter = new RevisionedCommitter(saveSettingsSafely);
+let engineStatusRevision = 0;
+let ttsStatusRevision = 0;
+let translationJobRevision = 0;
+let pageStatusRevision = 0;
+let privacyConsentAccepted = false;
+let settingsRevision = 0;
+const subtitleSizeCommitter = new RevisionedCommitter(saveSubtitleSizeSafely);
 
 for (const language of LANGUAGE_OPTIONS) {
   const option = document.createElement("option");
@@ -340,8 +357,6 @@ elements.privacyConsentButton.addEventListener("click", () => {
   void acceptPrivacyDisclosure();
 });
 
-void initialize();
-
 async function initialize(): Promise<void> {
   if (!isExtensionRuntime) {
     const previewSettings: ExtensionSettings = {
@@ -356,7 +371,7 @@ async function initialize(): Promise<void> {
     return;
   }
 
-  const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS) as ExtensionSettings;
+  const settings = await readStableSettings();
   applySettings(settings);
   updatePrivacyGate(settings);
   if (!hasPrivacyConsent(settings)) {
@@ -371,6 +386,10 @@ async function initialize(): Promise<void> {
 
 async function loadRuntimeState(): Promise<void> {
   const sourceRevisionAtRequest = sourceEditRevision;
+  const engineRevisionAtRequest = engineStatusRevision;
+  const ttsRevisionAtRequest = ttsStatusRevision;
+  const jobRevisionAtRequest = translationJobRevision;
+  const pageRevisionAtRequest = pageStatusRevision;
   const [selection, status, pageStatus, ttsStatus, job] = await Promise.all([
     chrome.runtime.sendMessage({
       target: "background",
@@ -404,18 +423,26 @@ async function loadRuntimeState(): Promise<void> {
     elements.source.value = initialSelectionText;
     updateCharacterCount();
   }
-  updateEngineStatus(normalizeEngineStatus(status));
-  const normalizedTtsStatus = normalizeTtsStatus(ttsStatus);
-  currentSpeechId = isTtsActive(normalizedTtsStatus)
-    ? normalizedTtsStatus.speechId ?? null
-    : null;
-  updateTtsStatus(
-    currentSpeechId
-      ? normalizedTtsStatus
-      : { state: "idle", modelId: TTS_MODEL_ID }
-  );
-  updatePageStatus(normalizePageStatus(pageStatus, EXTENSION_RELOAD_MESSAGE));
-  applyTranslationJob(job as TranslationJobState | null);
+  if (shouldApplyRuntimeSnapshot(engineRevisionAtRequest, engineStatusRevision)) {
+    updateEngineStatus(normalizeEngineStatus(status));
+  }
+  if (shouldApplyRuntimeSnapshot(ttsRevisionAtRequest, ttsStatusRevision)) {
+    const normalizedTtsStatus = normalizeTtsStatus(ttsStatus);
+    currentSpeechId = isTtsActive(normalizedTtsStatus)
+      ? normalizedTtsStatus.speechId ?? null
+      : null;
+    updateTtsStatus(
+      currentSpeechId
+        ? normalizedTtsStatus
+        : { state: "idle", modelId: TTS_MODEL_ID }
+    );
+  }
+  if (shouldApplyRuntimeSnapshot(pageRevisionAtRequest, pageStatusRevision)) {
+    updatePageStatus(normalizePageStatus(pageStatus, EXTENSION_RELOAD_MESSAGE));
+  }
+  if (shouldApplyRuntimeSnapshot(jobRevisionAtRequest, translationJobRevision)) {
+    applyTranslationJob(job as TranslationJobState | null);
+  }
   await Promise.all([loadGlossary(), refreshDeviceAndStorageStatus()]);
 }
 
@@ -424,18 +451,12 @@ async function acceptPrivacyDisclosure(): Promise<void> {
   elements.privacyConsentButton.disabled = true;
   elements.privacyConsentError.hidden = true;
   try {
-    const current = await chrome.storage.sync.get(DEFAULT_SETTINGS) as ExtensionSettings;
-    const accepted: ExtensionSettings = {
-      ...current,
-      privacyConsentVersion: CURRENT_PRIVACY_CONSENT_VERSION,
-      youtubeEnabled: false,
-      autoEnableCaptions: false
-    };
     await chrome.storage.sync.set({
       privacyConsentVersion: CURRENT_PRIVACY_CONSENT_VERSION,
       youtubeEnabled: false,
       autoEnableCaptions: false
     });
+    const accepted = await readStableSettings();
     applySettings(accepted);
     updatePrivacyGate(accepted);
     await loadRuntimeState();
@@ -449,6 +470,7 @@ async function acceptPrivacyDisclosure(): Promise<void> {
 
 function updatePrivacyGate(settings: ExtensionSettings): void {
   const accepted = hasPrivacyConsent(settings);
+  privacyConsentAccepted = accepted;
   elements.privacyOnboarding.hidden = accepted;
   elements.productUi.hidden = !accepted;
 }
@@ -470,11 +492,26 @@ elements.pageTranslate.addEventListener("click", () => void handlePageTranslatio
 elements.pageRestore.addEventListener("click", () => void restorePageTranslation());
 elements.extensionReload.addEventListener("click", () => chrome.runtime.reload());
 
-elements.youtubeEnabled.addEventListener("change", () => void saveSettingsSafely());
-elements.autoCaptions.addEventListener("change", () => void saveSettingsSafely());
-elements.showOriginal.addEventListener("change", () => void saveSettingsSafely());
-elements.youtubeTranslationMode.addEventListener("change", () => void saveSettingsSafely());
-elements.pageContinuous.addEventListener("change", () => void saveSettingsSafely());
+elements.youtubeEnabled.addEventListener("change", () => void saveSettingSafely(
+  "youtubeEnabled",
+  elements.youtubeEnabled.checked
+));
+elements.autoCaptions.addEventListener("change", () => void saveSettingSafely(
+  "autoEnableCaptions",
+  elements.autoCaptions.checked
+));
+elements.showOriginal.addEventListener("change", () => void saveSettingSafely(
+  "showOriginalCaptions",
+  elements.showOriginal.checked
+));
+elements.youtubeTranslationMode.addEventListener("change", () => void saveSettingSafely(
+  "youtubeTranslationMode",
+  elements.youtubeTranslationMode.value as ExtensionSettings["youtubeTranslationMode"]
+));
+elements.pageContinuous.addEventListener("change", () => void saveSettingSafely(
+  "pageContinuous",
+  elements.pageContinuous.checked
+));
 elements.pageDisplayMode.addEventListener("change", () => void changePageDisplayMode());
 elements.subtitleSize.addEventListener("input", () => {
   elements.subtitleSizeValue.textContent = `${elements.subtitleSize.value}px`;
@@ -482,9 +519,18 @@ elements.subtitleSize.addEventListener("input", () => {
 });
 elements.subtitleSize.addEventListener("change", commitSubtitleSize);
 window.addEventListener("pagehide", flushSubtitleSizeOnPageHide);
-elements.sourceLanguage.addEventListener("change", () => void saveSettingsSafely());
-elements.modelPreference.addEventListener("change", () => void resetEngineForSettings());
-elements.devicePreference.addEventListener("change", () => void resetEngineForSettings());
+elements.sourceLanguage.addEventListener("change", () => void saveSettingSafely(
+  "sourceLanguage",
+  elements.sourceLanguage.value
+));
+elements.modelPreference.addEventListener("change", () => void resetEngineForSettings(
+  "modelPreference",
+  elements.modelPreference.value as ModelPreference
+));
+elements.devicePreference.addEventListener("change", () => void resetEngineForSettings(
+  "devicePreference",
+  elements.devicePreference.value as DevicePreference
+));
 elements.prepareModel.addEventListener("click", () => void prepareSelectedModel());
 elements.clearModel.addEventListener("click", () => void clearSelectedModel(false));
 elements.clearTts.addEventListener("click", () => void clearSelectedModel(true));
@@ -498,12 +544,24 @@ if (isExtensionRuntime) {
     message: UiProgressMessage | UiTtsProgressMessage | UiTranslationJobMessage
   ) => {
     if (message?.target === "ui" && message.type === "ENGINE_PROGRESS") {
+      engineStatusRevision += 1;
       updateEngineStatus(message.status);
     } else if (message?.target === "ui" && message.type === "TTS_PROGRESS") {
+      ttsStatusRevision += 1;
       handleTtsProgress(message.status);
     } else if (message?.target === "ui" && message.type === "TRANSLATION_JOB_UPDATED") {
+      translationJobRevision += 1;
       applyTranslationJob(message.job);
     }
+  });
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "sync") return;
+    settingsRevision += 1;
+    if (changes.privacyConsentVersion) {
+      void synchronizeExternalPrivacyConsent();
+      return;
+    }
+    applyExternalSettingChanges(changes);
   });
   window.setInterval(() => {
     if (elements.pageTranslate.dataset.active === "true") {
@@ -512,7 +570,28 @@ if (isExtensionRuntime) {
   }, 900);
 }
 
+void initialize();
+
+async function synchronizeExternalPrivacyConsent(): Promise<void> {
+  const settings = await readStableSettings();
+  const wasAccepted = privacyConsentAccepted;
+  applySettings(settings);
+  updatePrivacyGate(settings);
+  if (!wasAccepted && privacyConsentAccepted) await loadRuntimeState();
+}
+
+async function readStableSettings(): Promise<ExtensionSettings> {
+  while (true) {
+    const revisionAtRequest = settingsRevision;
+    const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS) as ExtensionSettings;
+    if (shouldApplyRuntimeSnapshot(revisionAtRequest, settingsRevision)) {
+      return settings;
+    }
+  }
+}
+
 async function handlePageTranslation(): Promise<void> {
+  const actionRevision = ++pageStatusRevision;
   if (!isExtensionRuntime) {
     updatePageStatus({
       ...idlePageStatus(),
@@ -538,24 +617,35 @@ async function handlePageTranslation(): Promise<void> {
   })
     .catch(() => null);
   elements.pageTranslate.disabled = false;
-  updatePageStatus(normalizePageStatus(status, EXTENSION_RELOAD_MESSAGE));
+  if (shouldApplyRuntimeSnapshot(actionRevision, pageStatusRevision)) {
+    updatePageStatus(normalizePageStatus(status, EXTENSION_RELOAD_MESSAGE));
+  }
 }
 
 async function restorePageTranslation(): Promise<void> {
   if (!isExtensionRuntime) return;
+  const actionRevision = ++pageStatusRevision;
   const status = await chrome.runtime.sendMessage({
     target: "background",
     type: "RESTORE_PAGE_TRANSLATION"
   }).catch(() => idlePageStatus());
-  updatePageStatus(normalizePageStatus(status));
+  if (shouldApplyRuntimeSnapshot(actionRevision, pageStatusRevision)) {
+    updatePageStatus(normalizePageStatus(status));
+  }
 }
 
 async function refreshPageStatus(): Promise<void> {
+  const requestRevision = ++pageStatusRevision;
   const status = await chrome.runtime.sendMessage({
     target: "background",
     type: "GET_PAGE_TRANSLATION_STATUS"
   }).catch(() => null);
-  if (status) updatePageStatus(status as PageTranslationStatus);
+  if (
+    status &&
+    shouldApplyRuntimeSnapshot(requestRevision, pageStatusRevision)
+  ) {
+    updatePageStatus(status as PageTranslationStatus);
+  }
 }
 
 async function translate(): Promise<void> {
@@ -569,6 +659,10 @@ async function translate(): Promise<void> {
   }
 
   const requestId = createRequestId();
+  const jobRequestIdAtStart = currentTranslationJob?.requestId ?? null;
+  // Invalidate an initial GET_TRANSLATION_JOB snapshot immediately. The
+  // background's running-job broadcast can arrive slightly after this click.
+  const jobRevisionAtRequest = ++translationJobRevision;
   translationInFlight = true;
   setBusy(true);
   currentTranslation = "";
@@ -594,9 +688,10 @@ async function translate(): Promise<void> {
       origin: "popup"
     }) as TranslationResponse;
 
-    if (currentTranslationJob?.requestId === requestId) {
+    const trackedJob = currentTranslationJob;
+    if (shouldApplyTrackedTranslationResponse(requestId, trackedJob) && trackedJob) {
       applyTranslationJob({
-        ...currentTranslationJob,
+        ...trackedJob,
         state: response.ok
           ? "complete"
           : response.code === "TRANSLATION_CANCELLED"
@@ -607,6 +702,13 @@ async function translate(): Promise<void> {
       });
       return;
     }
+    if (currentTranslationJob?.requestId === requestId) return;
+    if (!shouldApplyUntrackedTranslationResponse({
+      requestRevision: jobRevisionAtRequest,
+      currentRevision: translationJobRevision,
+      jobRequestIdAtStart,
+      currentJobRequestId: currentTranslationJob?.requestId ?? null
+    })) return;
     elements.resultText.className = response.ok ? "result-text" : "result-text error";
     if (response.ok) {
       currentTranslation = response.translation;
@@ -628,6 +730,12 @@ async function translate(): Promise<void> {
           : "엔진 설정이나 인터넷 연결을 확인해 주세요.";
     }
   } catch (error) {
+    if (!shouldApplyUntrackedTranslationResponse({
+      requestRevision: jobRevisionAtRequest,
+      currentRevision: translationJobRevision,
+      jobRequestIdAtStart,
+      currentJobRequestId: currentTranslationJob?.requestId ?? null
+    })) return;
     elements.resultText.className = "result-text error";
     elements.resultText.textContent = formatUiError(error);
     elements.resultMeta.textContent = "확장 프로그램을 새로고침한 뒤 다시 시도해 주세요.";
@@ -646,7 +754,16 @@ function applyTranslationJob(job: TranslationJobState | null): void {
   setBusy(running);
   elements.translationCancel.hidden = !running;
   elements.translationClear.hidden = !job || running;
-  if (!job) return;
+  if (!job) {
+    currentTranslation = "";
+    elements.resultCard.hidden = true;
+    elements.resultText.className = "result-text";
+    elements.resultText.textContent = "";
+    elements.resultMeta.textContent = "";
+    elements.copy.disabled = true;
+    elements.speak.disabled = true;
+    return;
+  }
 
   if (!elements.source.value || sourceEditRevision === 0) {
     elements.source.value = job.text;
@@ -691,28 +808,83 @@ function applyTranslationJob(job: TranslationJobState | null): void {
 
 async function cancelTranslationJob(): Promise<void> {
   if (!isExtensionRuntime || currentTranslationJob?.state !== "running") return;
-  const job = await chrome.runtime.sendMessage({
-    target: "background",
-    type: "CANCEL_TRANSLATION_JOB",
-    requestId: currentTranslationJob.requestId
-  }).catch(() => null) as TranslationJobState | null;
-  applyTranslationJob(job);
+  const requestId = currentTranslationJob.requestId;
+  const jobRevisionAtRequest = translationJobRevision;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      target: "background",
+      type: "CANCEL_TRANSLATION_JOB",
+      requestId
+    }) as TranslationJobActionResponse;
+    if (!shouldApplyRuntimeSnapshot(jobRevisionAtRequest, translationJobRevision)) {
+      return;
+    }
+    // Runtime broadcasts are the live source of truth. If this panel already
+    // moved to another/cleared job, a late action ACK must not rewind it.
+    if (!shouldApplyTranslationJobAction(
+      requestId,
+      currentTranslationJob,
+      response.job
+    )) return;
+    if (response.job) applyTranslationJob(response.job);
+    if (!response.ok) {
+      elements.resultMeta.textContent = response.error ?? "번역을 취소하지 못했습니다.";
+    }
+  } catch (error) {
+    if (
+      shouldApplyRuntimeSnapshot(jobRevisionAtRequest, translationJobRevision) &&
+      shouldApplyTranslationJobAction(requestId, currentTranslationJob, null)
+    ) {
+      elements.resultMeta.textContent = `번역을 취소하지 못했습니다: ${formatUiError(error)}`;
+    }
+  }
 }
 
 async function clearTranslationJob(): Promise<void> {
-  if (isExtensionRuntime) {
-    await chrome.runtime.sendMessage({
-      target: "background",
-      type: "CLEAR_TRANSLATION_JOB"
-    }).catch(() => undefined);
+  const requestId = currentTranslationJob?.requestId;
+  const speechId = currentSpeechId ?? currentTtsStatus.speechId ?? null;
+  const jobRevisionAtRequest = translationJobRevision;
+  if (!requestId) return;
+  if (!isExtensionRuntime) {
+    applyTranslationJob(null);
+    return;
   }
-  currentTranslationJob = null;
-  currentTranslation = "";
-  elements.resultCard.hidden = true;
-  elements.translationCancel.hidden = true;
-  elements.translationClear.hidden = true;
-  elements.copy.disabled = true;
-  elements.speak.disabled = true;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      target: "background",
+      type: "CLEAR_TRANSLATION_JOB",
+      requestId
+    }) as TranslationJobActionResponse;
+    if (!response.ok) {
+      if (!shouldApplyRuntimeSnapshot(jobRevisionAtRequest, translationJobRevision)) {
+        return;
+      }
+      if (!shouldApplyTranslationJobAction(
+        requestId,
+        currentTranslationJob,
+        response.job
+      )) return;
+      if (response.job) applyTranslationJob(response.job);
+      elements.resultMeta.textContent = response.error ?? "번역 기록을 지우지 못했습니다.";
+      return;
+    }
+    await stopSpeech(speechId);
+    // Do not erase a newer job that another workspace started while this
+    // request was in flight. Its broadcast is authoritative for this panel.
+    if (
+      shouldApplyRuntimeSnapshot(jobRevisionAtRequest, translationJobRevision) &&
+      (!currentTranslationJob || currentTranslationJob.requestId === requestId)
+    ) {
+      applyTranslationJob(response.job);
+    }
+  } catch (error) {
+    if (
+      shouldApplyRuntimeSnapshot(jobRevisionAtRequest, translationJobRevision) &&
+      shouldApplyTranslationJobAction(requestId, currentTranslationJob, null)
+    ) {
+      elements.resultMeta.textContent = `번역 기록을 지우지 못했습니다: ${formatUiError(error)}`;
+    }
+  }
 }
 
 async function toggleSpeech(): Promise<void> {
@@ -753,8 +925,10 @@ async function toggleSpeech(): Promise<void> {
   }
 }
 
-async function stopSpeech(): Promise<void> {
-  const speechId = currentSpeechId ?? currentTtsStatus.speechId ?? null;
+async function stopSpeech(requestedSpeechId?: string | null): Promise<void> {
+  const speechId = requestedSpeechId === undefined
+    ? currentSpeechId ?? currentTtsStatus.speechId ?? null
+    : requestedSpeechId;
   if (
     !isExtensionRuntime ||
     !speechId ||
@@ -885,24 +1059,39 @@ async function copyResult(): Promise<void> {
 }
 
 async function changePageDisplayMode(): Promise<void> {
-  await saveSettingsSafely();
+  const actionRevision = ++pageStatusRevision;
+  const saved = await saveSettingSafely(
+    "pageDisplayMode",
+    elements.pageDisplayMode.value as PageDisplayMode
+  );
+  if (!saved) return;
   if (!isExtensionRuntime) return;
   const status = await chrome.runtime.sendMessage({
     target: "background",
     type: "SET_PAGE_DISPLAY_MODE",
     displayMode: elements.pageDisplayMode.value as PageDisplayMode
   }).catch(() => null);
-  if (status) updatePageStatus(normalizePageStatus(status));
+  if (
+    status &&
+    shouldApplyRuntimeSnapshot(actionRevision, pageStatusRevision)
+  ) {
+    updatePageStatus(normalizePageStatus(status));
+  }
 }
 
 async function prepareSelectedModel(): Promise<void> {
-  if (!isExtensionRuntime || modelPreparationInFlight || modelCacheActionInFlight) return;
+  if (
+    !isExtensionRuntime ||
+    modelPreparationInFlight ||
+    modelCacheActionInFlight ||
+    modelSettingsUpdateInFlight
+  ) return;
   modelPreparationInFlight = true;
+  engineStatusRevision += 1;
   updateModelActionAvailability();
   elements.prepareModel.textContent = "모델 준비 중…";
   elements.modelCenterStatus.textContent = "선택한 모델을 브라우저 캐시에 준비하고 있습니다.";
   try {
-    await saveSettings();
     const status = await chrome.runtime.sendMessage({
       target: "background",
       type: "PREPARE_MODEL"
@@ -926,6 +1115,7 @@ async function clearSelectedModel(ttsOnly: boolean): Promise<void> {
     !isExtensionRuntime ||
     modelPreparationInFlight ||
     modelCacheActionInFlight ||
+    modelSettingsUpdateInFlight ||
     (!ttsOnly && currentEngineStatus.state === "loading") ||
     (ttsOnly && isTtsActive(currentTtsStatus))
   ) return;
@@ -941,7 +1131,7 @@ async function clearSelectedModel(ttsOnly: boolean): Promise<void> {
     ? "음성 모델 캐시를 삭제하고 있습니다."
     : "선택한 번역 모델 캐시를 삭제하고 있습니다.";
   try {
-    await chrome.runtime.sendMessage({
+    const cacheStatus = await chrome.runtime.sendMessage({
       target: "background",
       type: "CLEAR_MODEL_CACHE",
       modelPreference: ttsOnly
@@ -949,7 +1139,10 @@ async function clearSelectedModel(ttsOnly: boolean): Promise<void> {
         : elements.modelPreference.value as ModelPreference,
       includeTts: ttsOnly,
       includeTranslation: !ttsOnly
-    });
+    }) as ModelCacheStatus | null;
+    if (!cacheStatus || cacheStatus.error) {
+      throw new Error(cacheStatus?.error ?? "모델 캐시 삭제 응답이 올바르지 않습니다.");
+    }
     elements.modelCenterStatus.textContent = ttsOnly
       ? "음성 모델을 삭제했습니다. 다음 듣기 때 다시 받습니다."
       : "선택한 번역 모델을 삭제했습니다. 다음 사용 때 다시 받습니다.";
@@ -963,15 +1156,19 @@ async function clearSelectedModel(ttsOnly: boolean): Promise<void> {
 }
 
 function updateModelActionAvailability(): void {
-  const modelControlsLocked = modelPreparationInFlight || modelCacheActionInFlight;
+  const modelControlsLocked = shouldLockModelControls({
+    preparing: modelPreparationInFlight,
+    clearingCache: modelCacheActionInFlight,
+    updatingSettings: modelSettingsUpdateInFlight
+  });
   elements.modelPreference.disabled = modelControlsLocked;
   elements.devicePreference.disabled =
     modelControlsLocked || elements.modelPreference.value === "small100";
-  elements.prepareModel.disabled = modelPreparationInFlight || modelCacheActionInFlight;
+  elements.prepareModel.disabled = modelControlsLocked;
   elements.clearModel.disabled =
-    modelPreparationInFlight || modelCacheActionInFlight || currentEngineStatus.state === "loading";
+    modelControlsLocked || currentEngineStatus.state === "loading";
   elements.clearTts.disabled =
-    modelCacheActionInFlight || isTtsActive(currentTtsStatus);
+    modelControlsLocked || isTtsActive(currentTtsStatus);
 }
 
 async function refreshDeviceAndStorageStatus(): Promise<void> {
@@ -1000,6 +1197,11 @@ async function updateDeviceAndStorageStatus(
     }
   } catch {
     // Some extension test contexts do not expose storage estimates.
+  }
+  if (cacheStatus?.error) {
+    elements.storageStatus.textContent =
+      `${storageText} · 캐시 상태 확인 실패: ${cacheStatus.error}`;
+    return;
   }
   const cachedCount = cacheStatus?.cachedModelIds.length ?? 0;
   const ttsText = cacheStatus?.ttsCached ? "음성 캐시 있음" : "음성 캐시 없음";
@@ -1131,29 +1333,87 @@ function applySettings(settings: ExtensionSettings): void {
   elements.sourceLanguage.value = settings.sourceLanguage;
   elements.modelPreference.value = settings.modelPreference;
   elements.devicePreference.value = settings.devicePreference;
+  persistedModelPreference = settings.modelPreference;
+  persistedDevicePreference = settings.devicePreference;
   updateModelSettingDetail();
 }
 
-async function saveSettings(): Promise<void> {
-  const settings: ExtensionSettings = {
-    privacyConsentVersion: CURRENT_PRIVACY_CONSENT_VERSION,
-    youtubeEnabled: elements.youtubeEnabled.checked,
-    autoEnableCaptions: elements.autoCaptions.checked,
-    showOriginalCaptions: elements.showOriginal.checked,
-    subtitleSize: Number(elements.subtitleSize.value),
-    youtubeTranslationMode: elements.youtubeTranslationMode.value as ExtensionSettings["youtubeTranslationMode"],
-    pageContinuous: elements.pageContinuous.checked,
-    pageDisplayMode: elements.pageDisplayMode.value as PageDisplayMode,
-    sourceLanguage: elements.sourceLanguage.value,
-    modelPreference: elements.modelPreference.value as ModelPreference,
-    devicePreference: elements.devicePreference.value as DevicePreference
-  };
-  if (isExtensionRuntime) await chrome.storage.sync.set(settings);
+function applyExternalSettingChanges(
+  changes: Record<string, chrome.storage.StorageChange>
+): void {
+  if (changes.youtubeEnabled) {
+    elements.youtubeEnabled.checked = Boolean(
+      changes.youtubeEnabled.newValue ?? DEFAULT_SETTINGS.youtubeEnabled
+    );
+  }
+  if (changes.autoEnableCaptions) {
+    elements.autoCaptions.checked = Boolean(
+      changes.autoEnableCaptions.newValue ?? DEFAULT_SETTINGS.autoEnableCaptions
+    );
+  }
+  if (changes.showOriginalCaptions) {
+    elements.showOriginal.checked = Boolean(
+      changes.showOriginalCaptions.newValue ?? DEFAULT_SETTINGS.showOriginalCaptions
+    );
+  }
+  // A sync notification from an earlier range commit can arrive after the
+  // user has already dragged to a newer value. Keep the local in-progress
+  // edit authoritative until its own commit/flush finishes.
+  if (changes.subtitleSize && !subtitleSizeCommitter.isDirty()) {
+    const value = Number(changes.subtitleSize.newValue ?? DEFAULT_SETTINGS.subtitleSize);
+    elements.subtitleSize.value = String(value);
+    elements.subtitleSizeValue.textContent = `${value}px`;
+  }
+  if (changes.youtubeTranslationMode) {
+    elements.youtubeTranslationMode.value = String(
+      changes.youtubeTranslationMode.newValue ?? DEFAULT_SETTINGS.youtubeTranslationMode
+    );
+  }
+  if (changes.pageContinuous) {
+    elements.pageContinuous.checked = Boolean(
+      changes.pageContinuous.newValue ?? DEFAULT_SETTINGS.pageContinuous
+    );
+  }
+  if (changes.pageDisplayMode) {
+    elements.pageDisplayMode.value = String(
+      changes.pageDisplayMode.newValue ?? DEFAULT_SETTINGS.pageDisplayMode
+    );
+  }
+  if (changes.sourceLanguage) {
+    elements.sourceLanguage.value = String(
+      changes.sourceLanguage.newValue ?? DEFAULT_SETTINGS.sourceLanguage
+    );
+  }
+  if (changes.modelPreference) {
+    persistedModelPreference = String(
+      changes.modelPreference.newValue ?? DEFAULT_SETTINGS.modelPreference
+    ) as ModelPreference;
+    elements.modelPreference.value = persistedModelPreference;
+  }
+  if (changes.devicePreference) {
+    persistedDevicePreference = String(
+      changes.devicePreference.newValue ?? DEFAULT_SETTINGS.devicePreference
+    ) as DevicePreference;
+    elements.devicePreference.value = persistedDevicePreference;
+  }
+  if (changes.modelPreference || changes.devicePreference) {
+    updateModelSettingDetail();
+  }
 }
 
-async function saveSettingsSafely(): Promise<boolean> {
+async function saveSetting<Key extends keyof ExtensionSettings>(
+  key: Key,
+  value: ExtensionSettings[Key]
+): Promise<void> {
+  if (isExtensionRuntime) await chrome.storage.sync.set({ [key]: value });
+}
+
+async function saveSettingSafely<Key extends keyof ExtensionSettings>(
+  key: Key,
+  value: ExtensionSettings[Key]
+): Promise<boolean> {
   try {
-    await saveSettings();
+    await saveSetting(key, value);
     return true;
   } catch (error) {
     updateEngineStatus({
@@ -1165,6 +1425,10 @@ async function saveSettingsSafely(): Promise<boolean> {
     });
     return false;
   }
+}
+
+function saveSubtitleSizeSafely(): Promise<boolean> {
+  return saveSettingSafely("subtitleSize", Number(elements.subtitleSize.value));
 }
 
 function commitSubtitleSize(): void {
@@ -1183,10 +1447,17 @@ function flushSubtitleSizeOnPageHide(): void {
   }).catch(() => undefined);
 }
 
-async function resetEngineForSettings(): Promise<void> {
+async function resetEngineForSettings<
+  Key extends "modelPreference" | "devicePreference"
+>(key: Key, value: ExtensionSettings[Key]): Promise<void> {
+  if (modelSettingsUpdateInFlight) return;
+  modelSettingsUpdateInFlight = true;
+  engineStatusRevision += 1;
   updateModelSettingDetail();
+  let settingSaved = false;
   try {
-    await saveSettings();
+    await saveSetting(key, value);
+    settingSaved = true;
     if (isExtensionRuntime) {
       const status = await chrome.runtime.sendMessage({
         target: "background",
@@ -1203,6 +1474,11 @@ async function resetEngineForSettings(): Promise<void> {
       ].id
     });
   } catch (error) {
+    if (!settingSaved) {
+      elements.modelPreference.value = persistedModelPreference;
+      elements.devicePreference.value = persistedDevicePreference;
+      updateModelSettingDetail();
+    }
     updateEngineStatus({
       state: "error",
       modelId: MODEL_DEFINITIONS[
@@ -1210,14 +1486,16 @@ async function resetEngineForSettings(): Promise<void> {
       ].id,
       error: formatUiError(error)
     });
+  } finally {
+    modelSettingsUpdateInFlight = false;
+    updateModelActionAvailability();
   }
 }
 
 function updateModelSettingDetail(): void {
   const preference = elements.modelPreference.value as ModelPreference;
   const definition = MODEL_DEFINITIONS[preference];
-  const usesSmall100 = preference === "small100";
-  elements.devicePreference.disabled = usesSmall100;
+  updateModelActionAvailability();
   const automaticFallbackNote =
     preference === "m2m100"
       ? " · 자동 폴백 시 최대 약 1.4GB 전송"

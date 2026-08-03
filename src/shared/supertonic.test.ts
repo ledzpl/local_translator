@@ -1,9 +1,49 @@
 import { describe, expect, it } from "vitest";
 import {
+  SupertonicEngine,
   encodeSupertonicText,
   preprocessSupertonicText,
+  releaseSupertonicSessions,
   shouldRefreshSupertonicCache
 } from "./supertonic";
+
+describe("SupertonicEngine loading", () => {
+  it("stops before cache or network work when the load was invalidated", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(SupertonicEngine.load({
+      modelBaseUrl: "https://example.invalid/onnx",
+      voiceStyleUrl: "https://example.invalid/M1.json",
+      device: "wasm",
+      signal: controller.signal
+    })).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("waits for every session release before reporting a cleanup failure", async () => {
+    let finishSlowRelease!: () => void;
+    let slowReleaseFinished = false;
+    const slowRelease = new Promise<void>((resolve) => {
+      finishSlowRelease = () => {
+        slowReleaseFinished = true;
+        resolve();
+      };
+    });
+    const release = releaseSupertonicSessions([
+      { release: async () => { throw new Error("release failed"); } },
+      { release: () => slowRelease }
+    ]);
+    let rejected = false;
+    void release.catch(() => {
+      rejected = true;
+    });
+
+    await Promise.resolve();
+    expect(rejected).toBe(false);
+    finishSlowRelease();
+    await expect(release).rejects.toBeInstanceOf(AggregateError);
+    expect(slowReleaseFinished).toBe(true);
+  });
+});
 
 describe("preprocessSupertonicText", () => {
   it("한국어를 NFKD로 정규화하고 언어 태그를 붙인다", () => {

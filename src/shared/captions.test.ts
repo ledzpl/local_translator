@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   captionStillMatches,
   captionTranslationKey,
+  decideCaptionRetry,
   isYoutubeCaptionWindowVisible,
   joinCaptionSegments,
   shouldRequestPendingCaption
@@ -99,5 +100,20 @@ describe("YouTube caption helpers", () => {
       currentRequestKey: requestKey,
       generationChanged: false
     })).toBe(false);
+  });
+
+  it("does not hide a newer cached cue when an older request fails", () => {
+    expect(decideCaptionRetry({
+      generationChanged: false,
+      currentCaption: "new cached cue",
+      sourceText: "old request",
+      nextAttempt: 1
+    })).toBe("stale");
+    expect(decideCaptionRetry({
+      generationChanged: false,
+      currentCaption: "current cue",
+      sourceText: "current cue",
+      nextAttempt: 3
+    })).toBe("exhausted");
   });
 });

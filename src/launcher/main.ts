@@ -9,6 +9,7 @@ import {
   type UiTranslationJobMessage
 } from "../shared/protocol";
 import { hasPrivacyConsent } from "../shared/privacy";
+import { shouldApplyRuntimeSnapshot } from "../shared/popup-state";
 
 const app = document.querySelector<HTMLElement>("#app");
 if (!app) throw new Error("앱 루트를 찾을 수 없습니다.");
@@ -52,31 +53,70 @@ const elements = {
 let settings: ExtensionSettings = { ...DEFAULT_SETTINGS };
 let engineStatus: EngineStatus = { state: "idle", modelId: MODEL_ID };
 let translationJob: TranslationJobState | null = null;
+let engineStatusRevision = 0;
+let translationJobRevision = 0;
+let settingsRevision = 0;
 
 elements.open.addEventListener("click", () => void openWorkspace());
 elements.quickPage.addEventListener("click", () => void startPageTranslation());
 
 chrome.runtime.onMessage.addListener((message: UiProgressMessage | UiTranslationJobMessage) => {
   if (message?.target !== "ui") return;
-  if (message.type === "ENGINE_PROGRESS") engineStatus = message.status;
-  if (message.type === "TRANSLATION_JOB_UPDATED") translationJob = message.job;
+  if (message.type === "ENGINE_PROGRESS") {
+    engineStatusRevision += 1;
+    engineStatus = message.status;
+  }
+  if (message.type === "TRANSLATION_JOB_UPDATED") {
+    translationJobRevision += 1;
+    translationJob = message.job;
+  }
+  renderStatus();
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "sync") return;
+  settingsRevision += 1;
+  for (const key of Object.keys(DEFAULT_SETTINGS) as Array<keyof ExtensionSettings>) {
+    if (!changes[key]) continue;
+    Object.assign(settings, {
+      [key]: changes[key].newValue ?? DEFAULT_SETTINGS[key]
+    });
+  }
   renderStatus();
 });
 
 void initialize();
 
 async function initialize(): Promise<void> {
+  const engineRevisionAtRequest = engineStatusRevision;
+  const jobRevisionAtRequest = translationJobRevision;
   const [storedSettings, status, job] = await Promise.all([
-    chrome.storage.sync.get(DEFAULT_SETTINGS as unknown as Record<string, unknown>),
+    readStableSettings(),
     chrome.runtime.sendMessage({ target: "background", type: "GET_ENGINE_STATUS" })
       .catch(() => ({ state: "idle", modelId: MODEL_ID })),
     chrome.runtime.sendMessage({ target: "background", type: "GET_TRANSLATION_JOB" })
       .catch(() => null)
   ]);
-  settings = storedSettings as unknown as ExtensionSettings;
-  engineStatus = status as EngineStatus;
-  translationJob = job as TranslationJobState | null;
+  settings = storedSettings;
+  if (shouldApplyRuntimeSnapshot(engineRevisionAtRequest, engineStatusRevision)) {
+    engineStatus = status as EngineStatus;
+  }
+  if (shouldApplyRuntimeSnapshot(jobRevisionAtRequest, translationJobRevision)) {
+    translationJob = job as TranslationJobState | null;
+  }
   renderStatus();
+}
+
+async function readStableSettings(): Promise<ExtensionSettings> {
+  while (true) {
+    const revisionAtRequest = settingsRevision;
+    const stored = await chrome.storage.sync.get(
+      DEFAULT_SETTINGS as unknown as Record<string, unknown>
+    );
+    if (shouldApplyRuntimeSnapshot(revisionAtRequest, settingsRevision)) {
+      return stored as unknown as ExtensionSettings;
+    }
+  }
 }
 
 async function openWorkspace(): Promise<void> {

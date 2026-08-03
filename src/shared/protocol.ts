@@ -173,9 +173,16 @@ export interface TranslationJobState {
   updatedAt: number;
 }
 
+export interface TranslationJobActionResponse {
+  ok: boolean;
+  job: TranslationJobState | null;
+  error?: string;
+}
+
 export interface ModelCacheStatus {
   cachedModelIds: string[];
   ttsCached: boolean;
+  error?: string;
 }
 
 export type BackgroundMessage =
@@ -198,7 +205,8 @@ export type BackgroundMessage =
     }
   | { target: "background"; type: "GET_TRANSLATION_JOB" }
   | { target: "background"; type: "CANCEL_TRANSLATION_JOB"; requestId: string }
-  | { target: "background"; type: "CLEAR_TRANSLATION_JOB" }
+  | { target: "background"; type: "CLEAR_TRANSLATION_JOB"; requestId: string }
+  | { target: "background"; type: "CANCEL_TRANSLATION_REQUEST"; requestId: string }
   | { target: "background"; type: "PREPARE_MODEL" }
   | { target: "background"; type: "GET_MODEL_CACHE_STATUS" }
   | {

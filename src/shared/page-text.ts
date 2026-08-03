@@ -21,6 +21,29 @@ export function pageTranslationSourceStillMatches(
   return isConnected && normalizeText(currentText) === sourceSnapshot;
 }
 
+export function canAttemptPageTranslation(
+  failureCount: number,
+  maxAttempts = 2
+): boolean {
+  return failureCount < maxAttempts;
+}
+
+export function getTrackedPageTranslationCounts(options: {
+  chunkIndexes: Iterable<number>;
+  completedChunkIndexes: Iterable<number>;
+  failedChunkIndexes: Iterable<number>;
+}): { total: number; completed: number; failed: number } {
+  const chunks = new Set(options.chunkIndexes);
+  const completed = new Set(options.completedChunkIndexes);
+  const failed = new Set(options.failedChunkIndexes);
+  for (const chunkIndex of failed) chunks.add(chunkIndex);
+  return {
+    total: chunks.size,
+    completed: completed.size,
+    failed: failed.size
+  };
+}
+
 export function getPageTranslationText(text: string): string | null {
   const normalized = normalizeText(text);
   if (

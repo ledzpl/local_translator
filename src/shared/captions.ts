@@ -64,3 +64,23 @@ export function shouldRequestPendingCaption(options: {
     )
   );
 }
+
+export type CaptionRetryDecision = "scheduled" | "stale" | "exhausted";
+
+export function decideCaptionRetry(options: {
+  generationChanged: boolean;
+  currentCaption: string;
+  sourceText: string;
+  nextAttempt: number;
+  maxAttempts?: number;
+}): CaptionRetryDecision {
+  if (
+    options.generationChanged ||
+    !captionStillMatches(options.currentCaption, options.sourceText)
+  ) {
+    return "stale";
+  }
+  return options.nextAttempt > (options.maxAttempts ?? 2)
+    ? "exhausted"
+    : "scheduled";
+}

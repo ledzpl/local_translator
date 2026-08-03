@@ -20,6 +20,13 @@ describe("subtitle translation context", () => {
     expect(extractContextualTranslation("경계가 사라진 결과", true)).toBeNull();
   });
 
+  it("uses the marker's original index when earlier Unicode changes case length", () => {
+    expect(extractContextualTranslation(
+      `ßßß ${TRANSLATION_CONTEXT_MARKER.toLowerCase()} 현재 문장`,
+      true
+    )).toBe("현재 문장");
+  });
+
   it("deduplicates recent captions and excludes the current caption", () => {
     expect(createCaptionContext(["first", "first", "second", "current"], "current"))
       .toBe("first second");

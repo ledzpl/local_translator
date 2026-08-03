@@ -107,8 +107,25 @@ try {
   if (await popup.locator("#product-ui").isVisible()) {
     throw new Error("데이터 처리 안내 확인 전에 번역 UI가 활성화됐습니다.");
   }
+  const consentWorkspace = await context.newPage();
+  await consentWorkspace.goto(`chrome-extension://${extensionId}/sidepanel.html`);
+  await consentWorkspace.locator("#privacy-onboarding").waitFor({ state: "visible" });
+  const consentLauncher = await context.newPage();
+  await consentLauncher.goto(`chrome-extension://${extensionId}/popup.html`);
+  await consentLauncher.locator("#quick-page").waitFor({ state: "attached" });
+  if (!await consentLauncher.locator("#quick-page").isDisabled()) {
+    throw new Error("동의 전 런처의 빠른 페이지 번역이 활성화됐습니다.");
+  }
   await popup.locator("#privacy-consent-check").check();
   await popup.getByRole("button", { name: "동의하고 시작" }).click();
+
+  await consentWorkspace.locator("#product-ui").waitFor({ state: "visible" });
+  await consentLauncher.waitForFunction(() => {
+    const button = document.querySelector("#quick-page");
+    return button instanceof HTMLButtonElement && !button.disabled;
+  });
+  await Promise.all([consentWorkspace.close(), consentLauncher.close()]);
+  console.log("MULTI_PANEL_CONSENT_SYNC=PASS");
 
   await popup.getByRole("heading", { name: "온글." }).waitFor();
   await popup.getByRole("heading", { name: "페이지 안에서 번역" }).waitFor();
@@ -165,6 +182,58 @@ try {
   );
   console.log("VNEXT_SETTINGS_PERSISTENCE=PASS");
 
+  await popup.evaluate(async () => {
+    await chrome.storage.sync.set({ pageDisplayMode: "hover" });
+  });
+  await popup.locator("#show-original").uncheck();
+  await popup.waitForFunction(async () => {
+    const settings = await chrome.storage.sync.get([
+      "pageDisplayMode",
+      "showOriginalCaptions"
+    ]);
+    return settings.pageDisplayMode === "hover" &&
+      settings.showOriginalCaptions === false;
+  });
+  await popup.locator("#show-original").check();
+  await popup.evaluate(async () => {
+    await chrome.storage.sync.set({ pageDisplayMode: "bilingual" });
+  });
+  console.log("UNRELATED_SETTING_WRITE_GUARD=PASS");
+
+  if (!withModel && !withTts) {
+    const settingsPeer = await context.newPage();
+    await settingsPeer.goto(`chrome-extension://${extensionId}/sidepanel.html`);
+    await settingsPeer.locator("#model-preference").waitFor({ state: "attached" });
+    await Promise.all([
+      popup.locator("#model-preference").evaluate((element) => {
+        const select = /** @type {HTMLSelectElement} */ (element);
+        select.value = "m2m100";
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      }),
+      settingsPeer.locator("#device-preference").evaluate((element) => {
+        const select = /** @type {HTMLSelectElement} */ (element);
+        select.value = "wasm";
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      })
+    ]);
+    await popup.waitForFunction(async () => {
+      const settings = await chrome.storage.sync.get([
+        "modelPreference",
+        "devicePreference"
+      ]);
+      return settings.modelPreference === "m2m100" &&
+        settings.devicePreference === "wasm";
+    });
+    await popup.evaluate(async ({ modelPreference, devicePreference }) => {
+      await chrome.storage.sync.set({ modelPreference, devicePreference });
+    }, {
+      modelPreference: requestedModel,
+      devicePreference: requestedDevice
+    });
+    await settingsPeer.close();
+    console.log("MULTI_PANEL_MODEL_SETTING_GUARD=PASS");
+  }
+
   await popup.locator("#youtube-enabled").check({ force: true });
   await popup.locator("#auto-captions").check();
   await popup.waitForFunction(async () => {
@@ -191,6 +260,14 @@ try {
   const initialSubtitleSize = Number(
     await popup.locator("#subtitle-size").inputValue()
   );
+  // Defaults do not need to be materialized by unrelated partial setting
+  // writes. Establish an explicit baseline for the commit-count probe.
+  await popup.evaluate(async (value) => {
+    await chrome.storage.sync.set({ subtitleSize: value });
+  }, initialSubtitleSize);
+  await serviceWorker.evaluate(() => {
+    globalThis.__ongeulSubtitleSizeWriteCount = 0;
+  });
   const nextSubtitleSize =
     initialSubtitleSize === 42 ? initialSubtitleSize - 1 : initialSubtitleSize + 1;
   await popup.locator("#subtitle-size").evaluate((element, nextValue) => {
@@ -308,8 +385,9 @@ try {
         type: "GET_TRANSLATION_JOB"
       }) === null
     );
+    await popup.locator("#result-card").waitFor({ state: "hidden" });
     await recoveredWorkspace.close();
-    console.log("TRANSLATION_JOB_RECOVERY_CLEAR=PASS");
+    console.log("TRANSLATION_JOB_RECOVERY_CLEAR_BROADCAST=PASS");
   }
 
   if (withModel) {
