@@ -60,6 +60,7 @@ let translationJob: TranslationJobState | null = null;
 let engineStatusRevision = 0;
 let translationJobRevision = 0;
 let settingsRevision = 0;
+let privacyConsentRevision = 0;
 
 elements.open.addEventListener("click", () => void openWorkspace());
 elements.quickPage.addEventListener("click", () => void startPageTranslation());
@@ -80,6 +81,7 @@ chrome.runtime.onMessage.addListener((message: UiProgressMessage | UiTranslation
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "sync") return;
   settingsRevision += 1;
+  if (changes.privacyConsentVersion) privacyConsentRevision += 1;
   settings = applyExtensionSettingChanges(settings, changes);
   renderStatus();
 });
@@ -140,6 +142,7 @@ async function startPageTranslation(): Promise<void> {
     await openWorkspace();
     return;
   }
+  const privacyRevisionAtRequest = privacyConsentRevision;
   elements.quickPage.disabled = true;
   const status = await chrome.runtime.sendMessage({
     target: "background",
@@ -147,6 +150,13 @@ async function startPageTranslation(): Promise<void> {
     continuous: settings.pageContinuous,
     displayMode: settings.pageDisplayMode
   }).catch(() => null);
+  if (
+    privacyRevisionAtRequest !== privacyConsentRevision ||
+    !hasPrivacyConsent(settings)
+  ) {
+    renderStatus();
+    return;
+  }
   elements.quickPage.disabled = false;
   if (!status || status.state === "error") {
     elements.detail.textContent = status?.error ?? "현재 페이지 번역을 시작하지 못했습니다.";

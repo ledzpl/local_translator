@@ -186,6 +186,66 @@ try {
   if (!Array.isArray(cacheStatus?.cachedModelIds) || typeof cacheStatus?.ttsCached !== "boolean") {
     throw new Error(`모델 캐시 상태 응답이 올바르지 않습니다: ${JSON.stringify(cacheStatus)}`);
   }
+  const actionLauncher = await context.newPage();
+  await actionLauncher.goto(`chrome-extension://${extensionId}/popup.html`);
+  await actionLauncher.waitForFunction(() => {
+    const button = document.querySelector("#quick-page");
+    return button instanceof HTMLButtonElement && !button.disabled;
+  });
+  await actionLauncher.evaluate(() => {
+    const originalSendMessage = chrome.runtime.sendMessage;
+    let releaseStartPage;
+    const delayedStartPage = new Promise((resolve) => {
+      releaseStartPage = resolve;
+    });
+    globalThis.__ongeulOriginalLauncherSendMessage = originalSendMessage;
+    globalThis.__ongeulStartPageRequestReached = false;
+    globalThis.__ongeulReleaseStartPageRequest = () => releaseStartPage({
+      state: "complete",
+      total: 1,
+      completed: 1,
+      failed: 0
+    });
+    chrome.runtime.sendMessage = function (message, ...args) {
+      if (message?.target === "background" && message?.type === "START_PAGE_TRANSLATION") {
+        globalThis.__ongeulStartPageRequestReached = true;
+        return delayedStartPage;
+      }
+      return originalSendMessage.call(chrome.runtime, message, ...args);
+    };
+  });
+  await actionLauncher.locator("#quick-page").click();
+  await actionLauncher.waitForFunction(() =>
+    globalThis.__ongeulStartPageRequestReached === true
+  );
+  await popup.evaluate(async () => {
+    await chrome.storage.sync.set({ privacyConsentVersion: 0 });
+  });
+  await actionLauncher.locator("#launcher-title").filter({
+    hasText: "첫 설정이 필요해요"
+  }).waitFor();
+  await actionLauncher.evaluate(() => {
+    globalThis.__ongeulReleaseStartPageRequest();
+    delete globalThis.__ongeulReleaseStartPageRequest;
+  });
+  await actionLauncher.waitForTimeout(120);
+  if (
+    !await actionLauncher.locator("#quick-page").isDisabled() ||
+    (await actionLauncher.locator("#launcher-title").innerText()).trim() !==
+      "첫 설정이 필요해요"
+  ) {
+    throw new Error("늦은 페이지 번역 응답이 철회된 런처 동의 상태를 덮어썼습니다.");
+  }
+  await actionLauncher.evaluate(() => {
+    chrome.runtime.sendMessage = globalThis.__ongeulOriginalLauncherSendMessage;
+    delete globalThis.__ongeulOriginalLauncherSendMessage;
+  });
+  await popup.evaluate(async () => {
+    await chrome.storage.sync.set({ privacyConsentVersion: 4 });
+  });
+  await popup.locator("#product-ui").waitFor({ state: "visible" });
+  await actionLauncher.close();
+  console.log("LAUNCHER_PAGE_ACTION_CONSENT_GUARD=PASS");
   await popup.evaluate(async () => {
     await chrome.storage.local.remove("glossaryEntries");
   });
@@ -913,6 +973,101 @@ try {
   });
   console.log("YOUTUBE_AUTO_CAPTION_CANCEL_GUARD=PASS");
 
+  if (!withModel) {
+    const youtubeTabId = await popup.evaluate(async (pageUrl) => {
+      const tabs = await chrome.tabs.query({});
+      const tab = tabs.find((candidate) => candidate.url === pageUrl);
+      if (!tab?.id) throw new Error("YouTube 취소 테스트 탭을 찾지 못했습니다.");
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: "ISOLATED",
+        func: () => {
+          const originalSendMessage = chrome.runtime.sendMessage;
+          let resolveTranslation;
+          globalThis.__ongeulOriginalYoutubeSendMessage = originalSendMessage;
+          globalThis.__ongeulYoutubePendingRequestId = null;
+          globalThis.__ongeulYoutubeCancelledRequestId = null;
+          chrome.runtime.sendMessage = function (message, ...args) {
+            if (
+              message?.target === "background" &&
+              message?.type === "TRANSLATE" &&
+              message?.origin === "youtube" &&
+              message?.text === "Cancel this obsolete caption request."
+            ) {
+              globalThis.__ongeulYoutubePendingRequestId = message.requestId;
+              return new Promise((resolve) => {
+                resolveTranslation = resolve;
+              });
+            }
+            if (
+              message?.target === "background" &&
+              message?.type === "CANCEL_TRANSLATION_REQUEST" &&
+              message?.requestId === globalThis.__ongeulYoutubePendingRequestId
+            ) {
+              globalThis.__ongeulYoutubeCancelledRequestId = message.requestId;
+              resolveTranslation?.({
+                ok: false,
+                requestId: message.requestId,
+                code: "TRANSLATION_CANCELLED",
+                error: "번역을 취소했습니다."
+              });
+              return Promise.resolve({ ok: true, requestId: message.requestId });
+            }
+            return originalSendMessage.call(chrome.runtime, message, ...args);
+          };
+        }
+      });
+      return tab.id;
+    }, mockYoutube.url());
+    await mockYoutube.evaluate(() => {
+      const segment = document.querySelector(".ytp-caption-segment");
+      if (segment) segment.textContent = "Cancel this obsolete caption request.";
+    });
+    await popup.waitForFunction(async (tabId) => {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "ISOLATED",
+        func: () => globalThis.__ongeulYoutubePendingRequestId
+      });
+      return Boolean(result?.result);
+    }, youtubeTabId);
+    await popup.evaluate(async () => {
+      await chrome.storage.sync.set({ youtubeEnabled: false });
+    });
+    await popup.waitForFunction(async (tabId) => {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "ISOLATED",
+        func: () => ({
+          pending: globalThis.__ongeulYoutubePendingRequestId,
+          cancelled: globalThis.__ongeulYoutubeCancelledRequestId
+        })
+      });
+      return Boolean(
+        result?.result?.pending &&
+        result.result.pending === result.result.cancelled
+      );
+    }, youtubeTabId);
+    await popup.evaluate(async (tabId) => {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "ISOLATED",
+        func: () => {
+          chrome.runtime.sendMessage = globalThis.__ongeulOriginalYoutubeSendMessage;
+          delete globalThis.__ongeulOriginalYoutubeSendMessage;
+          delete globalThis.__ongeulYoutubePendingRequestId;
+          delete globalThis.__ongeulYoutubeCancelledRequestId;
+        }
+      });
+      await chrome.storage.sync.set({ youtubeEnabled: true });
+    }, youtubeTabId);
+    await mockYoutube.evaluate(() => {
+      const segment = document.querySelector(".ytp-caption-segment");
+      if (segment) segment.textContent = "브라우저 로컬 번역";
+    });
+    console.log("YOUTUBE_STALE_REQUEST_CANCEL_GUARD=PASS");
+  }
+
   if (withModel && requestedModel === "m2m100") {
     assertSemanticTranslation({
       id: "private_local_caption",
@@ -1178,6 +1333,20 @@ try {
     throw new Error(`동적 페이지 주입에 실패했습니다: ${JSON.stringify(started)}`);
   }
 
+  await serviceWorker.evaluate(() => {
+    globalThis.__ongeulCancelledContentRequests = [];
+    if (globalThis.__ongeulContentCancelObserverInstalled) return;
+    globalThis.__ongeulContentCancelObserverInstalled = true;
+    chrome.runtime.onMessage.addListener((message) => {
+      if (
+        message?.target === "background" &&
+        message?.type === "CANCEL_TRANSLATION_REQUEST"
+      ) {
+        globalThis.__ongeulCancelledContentRequests.push(message.requestId);
+      }
+    });
+  });
+
   const selectionRaceResult = await popup.evaluate(async (pageUrl) => {
     const tabs = await chrome.tabs.query({});
     const tab = tabs.find((candidate) => candidate.url === pageUrl);
@@ -1241,6 +1410,18 @@ try {
       JSON.stringify(selectionOverlay)
     );
   }
+  await serviceWorker.evaluate(async () => {
+    const deadline = Date.now() + 2_000;
+    while (
+      !globalThis.__ongeulCancelledContentRequests.includes("selection-old") &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    if (!globalThis.__ongeulCancelledContentRequests.includes("selection-old")) {
+      throw new Error("새 선택이 이전 선택 번역 요청을 취소하지 않았습니다.");
+    }
+  });
   console.log("SELECTION_LATEST_REQUEST_GUARD=PASS");
 
   await popup.evaluate(async (pageUrl) => {
@@ -1263,6 +1444,18 @@ try {
   if (!dismissedWhileLoading) {
     throw new Error("선택 번역 로딩 오버레이를 닫지 못했습니다.");
   }
+  await serviceWorker.evaluate(async () => {
+    const deadline = Date.now() + 2_000;
+    while (
+      !globalThis.__ongeulCancelledContentRequests.includes("selection-dismissed") &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    if (!globalThis.__ongeulCancelledContentRequests.includes("selection-dismissed")) {
+      throw new Error("닫은 선택 번역 요청이 백그라운드에서 취소되지 않았습니다.");
+    }
+  });
   await popup.evaluate(async (pageUrl) => {
     const tabs = await chrome.tabs.query({});
     const tab = tabs.find((candidate) => candidate.url === pageUrl);
@@ -1285,6 +1478,7 @@ try {
     throw new Error("닫은 선택 번역 오버레이가 완료 응답 뒤 다시 나타났습니다.");
   }
   console.log("SELECTION_DISMISS_GUARD=PASS");
+  console.log("SELECTION_STALE_REQUEST_CANCEL_GUARD=PASS");
 
   await popup.evaluate(async (pageUrl) => {
     const tabs = await chrome.tabs.query({});

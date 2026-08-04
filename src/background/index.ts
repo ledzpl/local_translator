@@ -64,6 +64,7 @@ let latestSpeechStartId: string | null = null;
 const WEBGPU_FALLBACK_REASON_KEY = "runtimeWebGpuFallbackReason";
 const TRANSLATION_JOB_KEY = "activeTranslationJob";
 const cancelledTranslationRequests = new Set<string>();
+const activeTranslationRequests = new Set<string>();
 const translationJobs = new TranslationJobCoordinator({
   read: getStoredTranslationJob,
   write: setStoredTranslationJob,
@@ -119,6 +120,7 @@ chrome.runtime.onMessage.addListener(
       .catch(async (error) => {
         const response = createBackgroundErrorResponse(message, error);
         if (message.type === "TRANSLATE") {
+          activeTranslationRequests.delete(message.requestId);
           cancelledTranslationRequests.delete(message.requestId);
           if (message.origin === "popup") {
             await translationJobs.complete(
@@ -156,8 +158,11 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
         } satisfies TranslationResponse;
       }
 
+      activeTranslationRequests.add(message.requestId);
       const settings = await getSettings();
       if (!hasPrivacyConsent(settings)) {
+        activeTranslationRequests.delete(message.requestId);
+        cancelledTranslationRequests.delete(message.requestId);
         return consentRequiredTranslation(message.requestId);
       }
       const sourceLanguage = await resolveSourceLanguage(text, message.sourceLanguage);
@@ -173,6 +178,8 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
           updatedAt: startedAt
         });
         if (!claim.changed) {
+          activeTranslationRequests.delete(message.requestId);
+          cancelledTranslationRequests.delete(message.requestId);
           return {
             ok: false,
             requestId: message.requestId,
@@ -212,6 +219,7 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
       if (message.origin === "popup") {
         const completed = await translationJobs.complete(message.requestId, response);
         if (!completed.changed) {
+          activeTranslationRequests.delete(message.requestId);
           cancelledTranslationRequests.delete(message.requestId);
           return {
             ok: false,
@@ -221,6 +229,7 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
           } satisfies TranslationResponse;
         }
       }
+      activeTranslationRequests.delete(message.requestId);
       cancelledTranslationRequests.delete(message.requestId);
       return response;
     }
@@ -319,14 +328,18 @@ async function handleBackgroundMessage(message: BackgroundMessage): Promise<unkn
           : "실행 중이거나 더 최근인 번역 작업은 지울 수 없습니다."
       } satisfies TranslationJobActionResponse;
     }
-    case "CANCEL_TRANSLATION_REQUEST":
+    case "CANCEL_TRANSLATION_REQUEST": {
+      if (!activeTranslationRequests.has(message.requestId)) {
+        return { ok: true, accepted: false, requestId: message.requestId };
+      }
       cancelledTranslationRequests.add(message.requestId);
       await sendToExistingOffscreen({
         target: "offscreen",
         type: "CANCEL_TRANSLATION_OFFSCREEN",
         requestId: message.requestId
       }).catch(() => undefined);
-      return { ok: true, requestId: message.requestId };
+      return { ok: true, accepted: true, requestId: message.requestId };
+    }
     case "PREPARE_MODEL": {
       const settings = await getSettings();
       if (!hasPrivacyConsent(settings)) {
@@ -1109,6 +1122,7 @@ async function translateAndDisplay(
   if (!text) return;
   const sourcePreview = createTextPreview(text);
   const displayRequestId = createRequestId();
+  activeTranslationRequests.add(displayRequestId);
   try {
     await ensureContentScript(tabId);
     await chrome.tabs.sendMessage(tabId, {
@@ -1162,5 +1176,8 @@ async function translateAndDisplay(
       sourceText: sourcePreview,
       response
     } satisfies ContentMessage).catch(() => undefined);
+  } finally {
+    activeTranslationRequests.delete(displayRequestId);
+    cancelledTranslationRequests.delete(displayRequestId);
   }
 }

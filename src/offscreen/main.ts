@@ -675,7 +675,7 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
     );
     let translation = await translateTextWithDeviceRecovery(
       activeEngine,
-      contextualInput,
+      contextualInput.text,
       request
     );
     if (translationRequestRegistry.isCancelled(request.requestId)) {
@@ -683,7 +683,7 @@ async function translate(request: TranslateOffscreenRequest): Promise<Translatio
     }
     const contextualResult = extractContextualTranslation(
       translation,
-      Boolean(request.context?.trim())
+      contextualInput.marker
     );
     if (contextualResult === null) {
       if (translationRequestRegistry.isCancelled(request.requestId)) {

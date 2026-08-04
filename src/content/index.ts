@@ -139,14 +139,30 @@ function getSelectedText(): string {
   return normalizeText(window.getSelection()?.toString() ?? "");
 }
 
+function cancelBackgroundTranslation(requestId: string): void {
+  void chrome.runtime.sendMessage({
+    target: "background",
+    type: "CANCEL_TRANSLATION_REQUEST",
+    requestId
+  }).catch(() => undefined);
+}
+
 class OverlayView {
   private selectionHost: HTMLElement | null = null;
   private subtitleHost: HTMLElement | null = null;
   private hideTimer: number | null = null;
   private latestSelectionRequestId: string | null = null;
+  private pendingSelectionRequestId: string | null = null;
 
   showSelectionLoading(requestId: string, sourceText: string): void {
+    if (
+      this.pendingSelectionRequestId &&
+      this.pendingSelectionRequestId !== requestId
+    ) {
+      cancelBackgroundTranslation(this.pendingSelectionRequestId);
+    }
     this.latestSelectionRequestId = requestId;
+    this.pendingSelectionRequestId = requestId;
     if (this.hideTimer) {
       window.clearTimeout(this.hideTimer);
       this.hideTimer = null;
@@ -170,6 +186,9 @@ class OverlayView {
     response: TranslationResponse
   ): void {
     if (requestId !== this.latestSelectionRequestId) return;
+    if (this.pendingSelectionRequestId === requestId) {
+      this.pendingSelectionRequestId = null;
+    }
     const body = this.ensureSelectionCard();
     const result = response.ok ? response.translation : response.error;
     const closeButton = this.createCloseButton(requestId);
@@ -307,6 +326,10 @@ class OverlayView {
   private dismissSelection(requestId: string): void {
     if (this.latestSelectionRequestId !== requestId) return;
     this.latestSelectionRequestId = null;
+    if (this.pendingSelectionRequestId === requestId) {
+      this.pendingSelectionRequestId = null;
+      cancelBackgroundTranslation(requestId);
+    }
     if (this.hideTimer !== null) {
       window.clearTimeout(this.hideTimer);
       this.hideTimer = null;
@@ -1098,6 +1121,7 @@ class YouTubeCaptionTranslator {
   private settingsGeneration = 0;
   private settingsRevision = 0;
   private navigationUrl = location.href;
+  private activeTranslationRequestId: string | null = null;
   private readonly cache = new LruCache<string>(180);
   private readonly retryAttempts = new Map<string, number>();
   private recentCaptions: string[] = [];
@@ -1160,6 +1184,7 @@ class YouTubeCaptionTranslator {
       if (this.navigationUrl === location.href) return;
       this.navigationUrl = location.href;
       this.settingsGeneration += 1;
+      this.cancelActiveTranslation();
       this.lastRequestedKey = "";
       this.currentCaption = "";
       this.pendingCaption = "";
@@ -1178,6 +1203,7 @@ class YouTubeCaptionTranslator {
   }
 
   private suspend(): void {
+    this.cancelActiveTranslation();
     if (this.observer) {
       this.observer.disconnect();
       this.observer = null;
@@ -1282,11 +1308,13 @@ class YouTubeCaptionTranslator {
   ): Promise<void> {
     this.translationInFlight = true;
     const generation = this.settingsGeneration;
+    const requestId = createRequestId();
+    this.activeTranslationRequestId = requestId;
     try {
       const response = await chrome.runtime.sendMessage({
         target: "background",
         type: "TRANSLATE",
-        requestId: createRequestId(),
+        requestId,
         text: sourceText,
         sourceLanguage: "auto",
         context: context || undefined,
@@ -1325,28 +1353,31 @@ class YouTubeCaptionTranslator {
         this.applyOriginalCaptionVisibility(false);
       }
     } finally {
-      this.translationInFlight = false;
-      const pending = this.pendingCaption;
-      this.pendingCaption = "";
-      const currentRequestKey = pending
-        ? captionTranslationKey(
-            pending,
-            this.settings,
-            this.settings.youtubeTranslationMode === "context"
-              ? createCaptionContext(this.recentCaptions, pending)
-              : ""
-          )
-        : "";
-      if (shouldRequestPendingCaption({
-        pendingCaption: pending,
-        currentCaption: this.currentCaption,
-        sourceText,
-        requestKey,
-        currentRequestKey,
-        generationChanged: generation !== this.settingsGeneration
-      })) {
-        this.lastRequestedKey = "";
-        this.scan();
+      if (this.activeTranslationRequestId === requestId) {
+        this.activeTranslationRequestId = null;
+        this.translationInFlight = false;
+        const pending = this.pendingCaption;
+        this.pendingCaption = "";
+        const currentRequestKey = pending
+          ? captionTranslationKey(
+              pending,
+              this.settings,
+              this.settings.youtubeTranslationMode === "context"
+                ? createCaptionContext(this.recentCaptions, pending)
+                : ""
+            )
+          : "";
+        if (shouldRequestPendingCaption({
+          pendingCaption: pending,
+          currentCaption: this.currentCaption,
+          sourceText,
+          requestKey,
+          currentRequestKey,
+          generationChanged: generation !== this.settingsGeneration
+        })) {
+          this.lastRequestedKey = "";
+          this.scan();
+        }
       }
     }
   }
@@ -1383,6 +1414,7 @@ class YouTubeCaptionTranslator {
 
   private invalidateTranslations(): void {
     this.settingsGeneration += 1;
+    this.cancelActiveTranslation();
     this.cache.clear();
     this.retryAttempts.clear();
     this.lastRequestedKey = "";
@@ -1400,6 +1432,7 @@ class YouTubeCaptionTranslator {
   }
 
   private resetHiddenCaptionState(clearContext = false): void {
+    if (this.cancelActiveTranslation()) this.settingsGeneration += 1;
     this.lastRequestedKey = "";
     this.currentCaption = "";
     this.pendingCaption = "";
@@ -1409,6 +1442,15 @@ class YouTubeCaptionTranslator {
     }
     this.clearRetry();
     this.view.hideSubtitle();
+  }
+
+  private cancelActiveTranslation(): boolean {
+    const requestId = this.activeTranslationRequestId;
+    if (!requestId) return false;
+    this.activeTranslationRequestId = null;
+    this.translationInFlight = false;
+    cancelBackgroundTranslation(requestId);
+    return true;
   }
 
   private rememberCaption(caption: string): void {
