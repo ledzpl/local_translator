@@ -48,7 +48,7 @@ export function protectGlossaryTerms(
   // both replacements. A namespace that does not occur in the source also
   // keeps literal token-looking user text from being restored accidentally.
   const tokenNamespace = createTokenNamespace(text);
-  const tokens = new Map<GlossaryEntry, string>();
+  const tokens = new Map<GlossaryEntry, Map<string, string>>();
   const pattern = new RegExp(
     ordered.map((entry) => escapeRegExp(entry.source)).join("|"),
     "giu"
@@ -58,13 +58,22 @@ export function protectGlossaryTerms(
       new RegExp(`^(?:${escapeRegExp(candidate.source)})$`, "iu").test(matched)
     );
     if (!entry) return matched;
-    const existing = tokens.get(entry);
+    let entryTokens = tokens.get(entry);
+    if (!entryTokens) {
+      entryTokens = new Map<string, string>();
+      tokens.set(entry, entryTokens);
+    }
+    // A preserved term must keep the spelling from each actual occurrence.
+    // Reusing one token for a case-insensitive match changed `WEBGPU` and
+    // `webgpu` into the glossary entry's canonical `WebGPU` spelling.
+    const replacementKey = entry.mode === "preserve" ? matched : "translate";
+    const existing = entryTokens.get(replacementKey);
     if (existing) return existing;
     const token = `ZXQONGEULGLOSSARY${tokenNamespace}TERM${replacements.length}QXZ`;
-    tokens.set(entry, token);
+    entryTokens.set(replacementKey, token);
     replacements.push({
       token,
-      value: entry.mode === "preserve" ? entry.source : entry.target
+      value: entry.mode === "preserve" ? matched : entry.target
     });
     return token;
   });

@@ -38,6 +38,16 @@ describe("local glossary", () => {
       .toBe(`오픈AI ${literal}`);
   });
 
+  it("preserves the exact spelling of every case-insensitive match", () => {
+    const source = "WebGPU webgpu WEBGPU";
+    const protectedValue = protectGlossaryTerms(source, [
+      { id: "1", source: "WebGPU", target: "WebGPU", mode: "preserve" }
+    ]);
+
+    expect(restoreGlossaryTerms(protectedValue.text, protectedValue.replacements))
+      .toBe(source);
+  });
+
   it("restores replacement values without interpreting dollar substitutions", () => {
     const protectedValue = protectGlossaryTerms("OpenAI", [
       { id: "1", source: "OpenAI", target: "$& $` $'", mode: "translate" }

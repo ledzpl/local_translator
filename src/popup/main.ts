@@ -331,6 +331,7 @@ const elements = {
 let currentTranslation = "";
 let currentTranslationJob: TranslationJobState | null = null;
 let glossaryEntries: GlossaryEntry[] = [];
+let glossaryRevision = 0;
 let modelPreparationInFlight = false;
 let modelCacheActionInFlight = false;
 let modelSettingsUpdateInFlight = false;
@@ -563,6 +564,7 @@ if (isExtensionRuntime) {
   });
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === "local" && changes[GLOSSARY_STORAGE_KEY]) {
+      glossaryRevision += 1;
       glossaryEntries = normalizeGlossaryEntries(
         changes[GLOSSARY_STORAGE_KEY].newValue
       );
@@ -1239,10 +1241,14 @@ async function loadGlossary(): Promise<void> {
     renderGlossary();
     return;
   }
+  const revisionAtRequest = glossaryRevision;
   const response = await chrome.runtime.sendMessage({
     target: "background",
     type: "GET_GLOSSARY_ENTRIES"
   }) as GlossaryActionResponse;
+  // chrome.storage.onChanged is the live source of truth. A delayed initial
+  // read must not overwrite a newer glossary update from another workspace.
+  if (!shouldApplyRuntimeSnapshot(revisionAtRequest, glossaryRevision)) return;
   if (!response?.ok) {
     throw new Error(response?.error ?? "용어집을 불러오지 못했습니다.");
   }
@@ -1271,6 +1277,7 @@ async function addGlossaryEntry(): Promise<void> {
     target,
     mode: preserve ? "preserve" : "translate"
   };
+  const revisionAtRequest = glossaryRevision;
   const response = isExtensionRuntime
     ? await chrome.runtime.sendMessage({
         target: "background",
@@ -1283,7 +1290,14 @@ async function addGlossaryEntry(): Promise<void> {
       response?.error ?? "용어를 저장하지 못했습니다.";
     return;
   }
-  glossaryEntries = normalizeGlossaryEntries(response.entries);
+  if (
+    !isExtensionRuntime ||
+    shouldApplyRuntimeSnapshot(revisionAtRequest, glossaryRevision)
+  ) {
+    // The response can arrive after another workspace has already committed
+    // a newer list. In that case its storage notification remains authoritative.
+    glossaryEntries = normalizeGlossaryEntries(response.entries);
+  }
   elements.glossarySource.value = "";
   elements.glossaryTarget.value = "";
   elements.glossaryStatus.textContent = "용어를 이 기기에 저장했습니다.";
@@ -1291,6 +1305,7 @@ async function addGlossaryEntry(): Promise<void> {
 }
 
 async function removeGlossaryEntry(id: string): Promise<void> {
+  const revisionAtRequest = glossaryRevision;
   const response = isExtensionRuntime
     ? await chrome.runtime.sendMessage({
         target: "background",
@@ -1304,7 +1319,12 @@ async function removeGlossaryEntry(id: string): Promise<void> {
   if (!response?.ok) {
     throw new Error(response?.error ?? "용어를 삭제하지 못했습니다.");
   }
-  glossaryEntries = normalizeGlossaryEntries(response.entries);
+  if (
+    !isExtensionRuntime ||
+    shouldApplyRuntimeSnapshot(revisionAtRequest, glossaryRevision)
+  ) {
+    glossaryEntries = normalizeGlossaryEntries(response.entries);
+  }
   elements.glossaryStatus.textContent = "용어를 삭제했습니다.";
   renderGlossary();
 }

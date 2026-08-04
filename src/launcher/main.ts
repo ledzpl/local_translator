@@ -37,7 +37,7 @@ app.innerHTML = `
   <button id="open-workspace" class="primary" type="button">
     <span>번역 작업공간 열기</span><span aria-hidden="true">→</span>
   </button>
-  <button id="quick-page" class="secondary" type="button">
+  <button id="quick-page" class="secondary" type="button" disabled>
     현재 페이지 번역 시작
   </button>
   <footer>
@@ -89,14 +89,20 @@ void initialize();
 async function initialize(): Promise<void> {
   const engineRevisionAtRequest = engineStatusRevision;
   const jobRevisionAtRequest = translationJobRevision;
-  const [storedSettings, status, job] = await Promise.all([
-    readStableSettings(),
-    chrome.runtime.sendMessage({ target: "background", type: "GET_ENGINE_STATUS" })
-      .catch(() => ({ state: "idle", modelId: MODEL_ID })),
-    chrome.runtime.sendMessage({ target: "background", type: "GET_TRANSLATION_JOB" })
-      .catch(() => null)
-  ]);
-  settings = storedSettings;
+  const statusPromise = chrome.runtime.sendMessage({
+    target: "background",
+    type: "GET_ENGINE_STATUS"
+  }).catch(() => ({ state: "idle", modelId: MODEL_ID }));
+  const jobPromise = chrome.runtime.sendMessage({
+    target: "background",
+    type: "GET_TRANSLATION_JOB"
+  }).catch(() => null);
+
+  // Apply the stable settings snapshot immediately. Waiting for unrelated
+  // runtime requests before assigning it allowed a later storage.onChanged
+  // update to be overwritten by this older snapshot.
+  settings = await readStableSettings();
+  const [status, job] = await Promise.all([statusPromise, jobPromise]);
   if (shouldApplyRuntimeSnapshot(engineRevisionAtRequest, engineStatusRevision)) {
     engineStatus = status as EngineStatus;
   }

@@ -110,9 +110,40 @@ try {
   const consentWorkspace = await context.newPage();
   await consentWorkspace.goto(`chrome-extension://${extensionId}/sidepanel.html`);
   await consentWorkspace.locator("#privacy-onboarding").waitFor({ state: "visible" });
+  await serviceWorker.evaluate(() => {
+    const originalGet = chrome.storage.session.get;
+    let releaseDelayedGet;
+    const delayedGet = new Promise((resolve) => {
+      releaseDelayedGet = resolve;
+    });
+    globalThis.__ongeulDelayedJobGetReached = false;
+    globalThis.__ongeulReleaseDelayedJobGet = () => {
+      chrome.storage.session.get = originalGet;
+      releaseDelayedGet();
+    };
+    chrome.storage.session.get = async function (keys) {
+      const result = await originalGet.call(chrome.storage.session, keys);
+      const includesJob = keys === "activeTranslationJob" ||
+        Array.isArray(keys) && keys.includes("activeTranslationJob");
+      if (!globalThis.__ongeulDelayedJobGetReached && includesJob) {
+        globalThis.__ongeulDelayedJobGetReached = true;
+        await delayedGet;
+      }
+      return result;
+    };
+  });
   const consentLauncher = await context.newPage();
   await consentLauncher.goto(`chrome-extension://${extensionId}/popup.html`);
   await consentLauncher.locator("#quick-page").waitFor({ state: "attached" });
+  await serviceWorker.evaluate(async () => {
+    const deadline = Date.now() + 2_000;
+    while (!globalThis.__ongeulDelayedJobGetReached && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    if (!globalThis.__ongeulDelayedJobGetReached) {
+      throw new Error("런처 작업 스냅샷 지연 주입에 실패했습니다.");
+    }
+  });
   if (!await consentLauncher.locator("#quick-page").isDisabled()) {
     throw new Error("동의 전 런처의 빠른 페이지 번역이 활성화됐습니다.");
   }
@@ -124,8 +155,17 @@ try {
     const button = document.querySelector("#quick-page");
     return button instanceof HTMLButtonElement && !button.disabled;
   });
+  await serviceWorker.evaluate(() => {
+    globalThis.__ongeulReleaseDelayedJobGet();
+    delete globalThis.__ongeulReleaseDelayedJobGet;
+  });
+  await consentLauncher.waitForTimeout(120);
+  if (await consentLauncher.locator("#quick-page").isDisabled()) {
+    throw new Error("늦은 런처 초기 스냅샷이 최신 동의 설정을 덮어썼습니다.");
+  }
   await Promise.all([consentWorkspace.close(), consentLauncher.close()]);
   console.log("MULTI_PANEL_CONSENT_SYNC=PASS");
+  console.log("LAUNCHER_SETTINGS_SNAPSHOT_GUARD=PASS");
 
   await popup.getByRole("heading", { name: "온글." }).waitFor();
   await popup.getByRole("heading", { name: "페이지 안에서 번역" }).waitFor();
@@ -164,10 +204,36 @@ try {
   await popup.locator("#glossary-target").fill("온글검증용어A");
   await glossaryPeer.locator("#glossary-source").fill("OngeulSmokeTermB");
   await glossaryPeer.locator("#glossary-target").fill("온글검증용어B");
-  await Promise.all([
-    popup.locator("#glossary-add").click(),
-    glossaryPeer.locator("#glossary-add").click()
-  ]);
+  await popup.evaluate(() => {
+    const originalSendMessage = chrome.runtime.sendMessage;
+    let releaseDelayedResponse;
+    const delayedResponse = new Promise((resolve) => {
+      releaseDelayedResponse = resolve;
+    });
+    globalThis.__ongeulDelayedGlossaryResponseReached = false;
+    globalThis.__ongeulReleaseDelayedGlossaryResponse = () => {
+      releaseDelayedResponse();
+    };
+    globalThis.__ongeulOriginalRuntimeSendMessage = originalSendMessage;
+    chrome.runtime.sendMessage = async function (message, ...args) {
+      const response = await originalSendMessage.call(chrome.runtime, message, ...args);
+      if (
+        !globalThis.__ongeulDelayedGlossaryResponseReached &&
+        message?.target === "background" &&
+        message?.type === "UPSERT_GLOSSARY_ENTRY" &&
+        message.entry?.source === "OngeulSmokeTermA"
+      ) {
+        globalThis.__ongeulDelayedGlossaryResponseReached = true;
+        await delayedResponse;
+      }
+      return response;
+    };
+  });
+  await popup.locator("#glossary-add").click();
+  await popup.waitForFunction(() =>
+    globalThis.__ongeulDelayedGlossaryResponseReached === true
+  );
+  await glossaryPeer.locator("#glossary-add").click();
   await popup.waitForFunction(async () => {
     const stored = await chrome.storage.local.get("glossaryEntries");
     const sources = stored.glossaryEntries?.map((entry) => entry.source).sort();
@@ -175,6 +241,18 @@ try {
       "OngeulSmokeTermA",
       "OngeulSmokeTermB"
     ]);
+  });
+  await popup.evaluate(() => {
+    globalThis.__ongeulReleaseDelayedGlossaryResponse();
+    delete globalThis.__ongeulReleaseDelayedGlossaryResponse;
+  });
+  await popup.waitForFunction(() =>
+    document.querySelector("#glossary-source")?.value === "" &&
+    document.querySelector("#glossary-status")?.textContent?.includes("저장")
+  );
+  await popup.evaluate(() => {
+    chrome.runtime.sendMessage = globalThis.__ongeulOriginalRuntimeSendMessage;
+    delete globalThis.__ongeulOriginalRuntimeSendMessage;
   });
   await Promise.all([
     popup.waitForFunction(() =>
@@ -195,6 +273,7 @@ try {
   });
   await glossaryPeer.close();
   console.log("MULTI_PANEL_GLOSSARY_SERIALIZATION=PASS");
+  console.log("GLOSSARY_STALE_RESPONSE_GUARD=PASS");
 
   await popup.locator("#youtube-translation-mode").selectOption("context");
   await popup.waitForFunction(async () =>
