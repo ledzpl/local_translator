@@ -24,6 +24,13 @@ import {
 import { LruCache } from "../shared/cache";
 import { supportsTranslateGemmaLanguage } from "../shared/languages";
 import {
+  ALL_TRANSLATION_MODEL_IDS,
+  liveTranslationModelIds,
+  selectedTranslationModelIdsForClear,
+  shouldResetEngineForModelCacheClear,
+  translationModelIdForPreference
+} from "../shared/model-cache";
+import {
   M2M100_REVISION,
   M2M100_MODEL_ID,
   SMALL100_MODEL_ID,
@@ -37,6 +44,7 @@ import {
 import { SerialTaskQueue } from "../shared/serial-queue";
 import { AsyncTeardownBarrier } from "../shared/async-teardown";
 import {
+  MODEL_CACHE_NAME as SUPERTONIC_MODEL_CACHE_NAME,
   SupertonicEngine,
   clearSupertonicModelCache,
   configureSupertonicRuntime,
@@ -938,12 +946,7 @@ async function getEngine(
   loadedDevicePreference = devicePreference;
   loadedRuntimeDevice = runtimeDevice;
   loadedModelPreference = modelPreference;
-  const modelId =
-    modelPreference === "small100"
-      ? SMALL100_MODEL_ID
-      : modelPreference === "translategemma"
-        ? TRANSLATEGEMMA_MODEL_ID
-        : M2M100_MODEL_ID;
+  const modelId = translationModelIdForPreference(modelPreference);
   status = {
     state: "loading",
     modelId,
@@ -1033,19 +1036,21 @@ async function loadRequestedEngine(
     return await loadSmall100();
   } catch (error) {
     const fallbackReason = friendlyError(error);
+    // SMaLL-100 is a WASM-only preference, so getEngine always keys its cached
+    // engine on "wasm". Loading the fallback on WebGPU instead left that key
+    // permanently mismatched, which tore down and re-downloaded M2M100 on every
+    // later request.
+    const fallbackDevice: RuntimeDevice = "wasm";
     status = {
       state: "loading",
       modelId: M2M100_MODEL_ID,
-      device: chooseDevice(devicePreference),
+      device: fallbackDevice,
       progress: 0,
       file: "SMaLL-100을 사용할 수 없어 M2M100으로 전환 중",
       fallbackFromModelId: SMALL100_MODEL_ID,
       fallbackReason
     };
     broadcastStatus();
-    const fallbackDevice =
-      runtimeDeviceOverride ?? chooseDevice(devicePreference);
-    loadedRuntimeDevice = fallbackDevice;
     return loadM2m100(
       fallbackDevice,
       SMALL100_MODEL_ID,
@@ -1308,18 +1313,18 @@ async function getModelCacheStatus(): Promise<ModelCacheStatus> {
   const cachedModelIds = new Set<string>();
   const cacheNames = await caches.keys();
   for (const cacheName of cacheNames) {
-    if (cacheName === "ongeul-supertonic-model-v1") continue;
+    if (cacheName === SUPERTONIC_MODEL_CACHE_NAME) continue;
     const cache = await caches.open(cacheName);
     const requests = await cache.keys();
     for (const request of requests) {
-      for (const modelId of allTranslationModelIds()) {
+      for (const modelId of ALL_TRANSLATION_MODEL_IDS) {
         if (request.url.includes(`/${modelId}/resolve/`)) cachedModelIds.add(modelId);
       }
     }
   }
   return {
     cachedModelIds: [...cachedModelIds],
-    ttsCached: cacheNames.includes("ongeul-supertonic-model-v1")
+    ttsCached: cacheNames.includes(SUPERTONIC_MODEL_CACHE_NAME)
   };
 }
 
@@ -1370,20 +1375,19 @@ async function clearSelectedModelCacheAfterTtsSettled(
   includeTts: boolean,
   includeTranslation: boolean
 ): Promise<void> {
-  const selectedIds = !includeTranslation
-    ? []
-    : preference
-      ? [modelIdForPreference(preference)]
-      : allTranslationModelIds();
-  if (
-    includeTranslation && (!preference ||
-    (loadedModelPreference !== null && selectedIds.includes(modelIdForPreference(loadedModelPreference)))
-    )
-  ) {
+  const selectedIds = selectedTranslationModelIdsForClear({
+    preference,
+    includeTranslation
+  });
+  if (shouldResetEngineForModelCacheClear({
+    preference,
+    includeTranslation,
+    liveModelIds: currentLiveTranslationModelIds()
+  })) {
     await resetEngine();
   }
   for (const cacheName of await caches.keys()) {
-    if (cacheName === "ongeul-supertonic-model-v1") continue;
+    if (cacheName === SUPERTONIC_MODEL_CACHE_NAME) continue;
     const cache = await caches.open(cacheName);
     const requests = await cache.keys();
     await Promise.all(requests
@@ -1410,14 +1414,11 @@ async function clearSelectedModelCacheAfterTtsSettled(
   translationCache.clear();
 }
 
-function allTranslationModelIds(): string[] {
-  return [TRANSLATEGEMMA_MODEL_ID, M2M100_MODEL_ID, SMALL100_MODEL_ID];
-}
-
-function modelIdForPreference(preference: ModelPreference): string {
-  return preference === "translategemma"
-    ? TRANSLATEGEMMA_MODEL_ID
-    : preference === "m2m100"
-      ? M2M100_MODEL_ID
-      : SMALL100_MODEL_ID;
+function currentLiveTranslationModelIds(): string[] {
+  return liveTranslationModelIds({
+    loadedModelPreference,
+    engineKind: engine?.kind ?? null,
+    loadInFlight: Boolean(engine || enginePromise),
+    statusModelId: status.modelId ?? null
+  });
 }

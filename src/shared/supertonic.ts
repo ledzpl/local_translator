@@ -54,7 +54,10 @@ const MODEL_FILES = [
 
 const TOTAL_STEPS = 8;
 const SPEECH_SPEED = 1.05;
-const MODEL_CACHE_NAME = "ongeul-supertonic-model-v1";
+// Exported so translation-cache maintenance can skip the TTS cache by the same
+// name this module reads and deletes, instead of a duplicated literal that a
+// revision bump would silently desynchronize.
+export const MODEL_CACHE_NAME = "ongeul-supertonic-model-v1";
 
 export function configureSupertonicRuntime(wasmBaseUrl: string): void {
   ort.env.wasm.wasmPaths = wasmBaseUrl;
